@@ -359,6 +359,51 @@ CREDIT → income account (e.g. "Product Sales", "Other Income")
 
 ---
 
+## How Analytic Lines Are Created — By Transaction Type
+
+Every posted journal entry with `analytic_distribution` on a move line creates `account.analytic.line` records. But **which GL account the line uses** determines whether the analytic entry affects budgets, reports, and what sign it carries.
+
+### Quick Reference: Analytic Effect by Transaction Type
+
+| Transaction | GL Account Type | Analytic Line Created? | Amount Sign | Visible in Expense Budget? | Visible in Analytic Items? |
+|---|---|---|---|---|---|
+| Vendor bill (expense account) | `expense_*` | YES | negative | YES (flipped to positive) | YES |
+| Vendor bill (fixed asset account) | `asset_fixed` | YES | negative | NO (asset type excluded) | YES |
+| Customer invoice (income account) | `income_*` | YES | positive | NO | YES |
+| Depreciation entry — expense line | `expense_*` | YES | negative | YES (flipped to positive) | YES |
+| Depreciation entry — asset line | `asset_fixed` | YES | positive | NO (asset type excluded) | YES |
+| Payment (bank account) | `asset_cash` | NO (typically no analytic) | — | NO | — |
+| Payable line on bill | `liability_payable` | NO (typically no analytic) | — | NO | — |
+
+### The Asset Depreciation Flow — Why Analytic Looks "Delayed"
+
+When a vendor bill uses a **Fixed Asset** account with analytic distribution:
+
+```
+STEP 1: Bill posted (e.g., laptop $1,400 on "Fixed Asset" account)
+  → Analytic line created: amount = -$1,400, GL type = asset_fixed
+  → Shows in Analytic Items list: YES
+  → Counts toward expense budget: NO (asset type excluded by budget SQL filter)
+
+STEP 2: Depreciation entry posted (e.g., $984 depreciation)
+  → TWO analytic lines created:
+     a) Fixed Asset account: +$984 (offsets part of Step 1)
+     b) Expense account:    -$984 (the real cost recognition)
+  → Line (b) counts toward expense budget: YES
+
+STEP 3: After ALL depreciation entries post:
+  → Fixed Asset analytic lines net to $0 (-1400 + 1400 = 0)
+  → Expense analytic lines total -$1,400 (the full cost, now on expense)
+```
+
+**Key insight:** The bill's analytic on the asset account is a "parking" entry. It gets fully offset by depreciation entries. The real analytic cost only appears on the **expense account** as each depreciation posts.
+
+**If using 1-month depreciation** (immediate expense): both steps happen quickly, so the delay is minimal. With multi-month depreciation, the analytic cost is spread across months — matching the accounting treatment.
+
+**Practical consequence:** If you set an analytic account on a vendor bill that auto-creates an asset, the analytic cost does NOT appear in expense budgets at bill time. It appears gradually as depreciation entries post.
+
+---
+
 ## Project Integration
 
 > [`enterprise/project_account_budget/models/project_project.py`](../enterprise/project_account_budget/models/project_project.py)

@@ -23,6 +23,7 @@ Before diving in, here are the key terms you will see throughout this document.
 | Account Group | A folder that organizes accounts by code prefix range | All accounts starting with 15xx go into the "Fixed Assets" group |
 | Balance Sheet | Financial report showing what the company owns (assets), owes (liabilities), and is worth (equity) at a point in time | A snapshot of the company's financial position on Dec 31 |
 | Profit & Loss (P&L) | Financial report showing income minus expenses over a period | How much the company earned/lost during the year |
+| Stock Variation | The difference between physical inventory value and what the accounting ledger shows | You have $10,000 of goods in the warehouse but the books say $9,500 — the $500 gap is stock variation |
 
 ---
 
@@ -342,6 +343,27 @@ These accounts **carry their balance forward** every fiscal year — they repres
 | `asset_prepayments` | "Prepayments" | Optional | Costs paid in advance for future periods (prepaid insurance, prepaid rent). | "Prepaid Expenses 1300" |
 | `asset_fixed` | "Fixed Assets" | Optional | Property, plant, equipment. Used by `account_asset` module for depreciation. | "Equipment 1500" |
 
+> **Beginner note — Current vs Non-current vs Fixed Assets**
+>
+> | Category | Rule of thumb | Examples | Odoo account type |
+> |---|---|---|---|
+> | **Current Assets** | Can be converted to cash **within 1 year** | Cash, inventory, customer invoices (receivables), VAT refunds, prepaid rent | `asset_cash`, `asset_receivable`, `asset_current`, `asset_prepayments` |
+> | **Non-current Assets** | Kept **longer than 1 year**, not physical equipment | Long-term deposits, goodwill, deferred tax assets, long-term investments | `asset_non_current` |
+> | **Fixed Assets** | **Physical things** you use in operations (not sell), that **depreciate** over time | Trucks, machines, office furniture, computers, buildings | `asset_fixed` |
+>
+> The hierarchy: Non-current Assets is the broad parent category for anything held >1 year.
+> Fixed Assets is a **subset** of non-current — specifically the tangible, depreciable items.
+> Odoo's `account_asset` module only auto-creates depreciation boards for accounts typed `asset_fixed`.
+>
+> ```
+> All Assets
+> ├── Current Assets        (cash, inventory, receivables — < 1 year)
+> └── Non-Current Assets    (everything long-term — > 1 year)
+>     ├── Fixed Assets      (physical: trucks, machines — depreciated)
+>     ├── Intangible Assets (patents, software — amortized, use asset_non_current)
+>     └── Financial Assets  (long-term investments — use asset_non_current)
+> ```
+
 #### Liabilities
 
 | `account_type` value | UI label | `reconcile` default | When to use | Real example |
@@ -460,6 +482,42 @@ Source: [`_compute_placeholder_code()`](../addons/account/models/account_account
 
 ---
 
+## Account Hierarchy — Three Layers
+
+Odoo's Chart of Accounts uses three distinct layers to organize accounts into a hierarchy. All three are **code-driven and automatic** — you never manually set parent-child links.
+
+```
+LAYER 1: account.root (virtual, no DB table)
+  Purpose: search panel filter in COA list view
+  How: first 2 chars of account code
+  Parent logic: "12" -> parent "1" (trim last char)
+
+LAYER 2: account.group (real DB model)
+  Purpose: hierarchical grouping for reports & UI
+  How: code prefix range (code_prefix_start / code_prefix_end)
+  Parent logic: auto-resolved — shortest enclosing prefix range
+
+LAYER 3: account.account -> group_id (computed link)
+  Purpose: assign each account to its most specific group
+  How: longest matching prefix range wins
+```
+
+### Full hierarchy example
+
+```
+account.root "1"                         (virtual: code[:2])
+  account.root "10"                      (virtual: code[:2], parent = "1")
+    account.group "Assets" (1-1)         (real: prefix range)
+      account.group "Current Assets" (10-10)
+        account.group "Cash" (101-101)
+          account.account 101000 "Cash"  (group_id -> "Cash 101-101")
+          account.account 101001 "Petty" (group_id -> "Cash 101-101")
+```
+
+Each layer serves a different purpose. `account.root` is the quick search filter. `account.group` is the reporting hierarchy. `group_id` on the account is the leaf-to-group link.
+
+---
+
 ## Account Groups (`account.group`)
 
 > [`models/account_account.py:1484`](../addons/account/models/account_account.py#L1484)
@@ -533,12 +591,25 @@ Non-current Assets (15-19)
 
 This is why you never manually set `parent_id` — Odoo computes it from prefix nesting.
 
+### Deleting a group
+
+When a group is deleted, its children are **re-parented** to the deleted group's parent ([`unlink()`](../addons/account/models/account_account.py#L1581)):
+
+```
+Before delete:  Assets (1-1) -> Current (10-10) -> Cash (101-101)
+Delete "Current (10-10)":
+After:          Assets (1-1) -> Cash (101-101)
+```
+
+The hierarchy is never left with orphaned children.
+
 ### Constraints
 
 - Groups at the same **prefix length** cannot have overlapping ranges. For example, you cannot have Group A = `150-159` and Group B = `155-164` because account `1550` would match both.
 - Source: [`_constraint_prefix_overlap()`](../addons/account/models/account_account.py#L1536)
 - `code_prefix_start` and `code_prefix_end` must have the same length.
 - Source: `_check_length_prefix` constraint on the model.
+- `parent_id` cannot be circular — [`_check_parent_not_circular()`](../addons/account/models/account_account.py#L1564) uses `_has_cycle()` check.
 
 ---
 
@@ -555,8 +626,40 @@ For code `4100`, the root is `41`. For code `41`, the root is still `41`.
 **Purpose:** provides a grouping node for the left-side search panel in the COA list view.
 Users can click `41` to filter all 41xx accounts.
 
+### Fields
+
+| Field | Type | How it's computed |
+|---|---|---|
+| `id` | `Char` (string-based) | First 2 chars of account code — e.g. `"41"` |
+| `name` | `Char` (computed) | Same as `id` — [`account_root.py:38`](../addons/account/models/account_root.py#L38) |
+| `parent_id` | `Many2one` `account.root` (computed) | `id[:-1]` — trim last character. `"41"` -> parent `"4"`, `"4"` -> `False` (no parent) — [`account_root.py:39`](../addons/account/models/account_root.py#L39) |
+
+### Parent-child logic
+
+The parent chain is built by progressively trimming the last character of the root ID:
+
+```
+"41" -> parent "4" -> parent False (top level)
+"10" -> parent "1" -> parent False (top level)
+```
+
+This creates a virtual 2-level tree (single digit -> two digits) used solely for the search panel `child_of` filtering.
+
+### Search restrictions
+
+`_search()` only supports two domain forms ([`account_root.py:24-30`](../addons/account/models/account_root.py#L24-L30)):
+- `('id', 'in', ids)` — exact match
+- `('id', 'parent_of', ids)` — returns all prefixes of the given IDs using `accumulate()`. E.g., `parent_of ['41']` returns `{'4', '41'}`.
+
+Any other domain raises `UserError`.
+
+### How accounts link to roots
+
 `account.root._from_account_code(code)` returns `self.browse(code[:2])`.
 Source: [`account_root.py:33`](../addons/account/models/account_root.py#L33)
+
+Each `account.account` has a computed `root_id` field that calls this method on its `placeholder_code`.
+Source: [`_compute_account_root()`](../addons/account/models/account_account.py#L380)
 
 ---
 
@@ -994,6 +1097,227 @@ User enters opening balances on each account (writes to account_opening_move_id)
     v
 User posts opening entry -> accounting is live
 ```
+
+---
+
+## Stock Variation Account (`account_stock_variation_id`)
+
+> Added by **`stock_account`** module
+> Field defined at: [`stock_account/models/account_account.py:7`](../addons/stock_account/models/account_account.py#L7)
+
+### What it is
+
+A field on `account.account` that points to another account used as the counterpart when recording inventory value adjustments at period close.
+
+```python
+account_stock_variation_id = fields.Many2one(
+    'account.account', string='Variation Account',
+    help="At closing, register the inventory variation of the period into a specific account")
+```
+
+There is also a companion field on the same model:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `account_stock_variation_id` | `Many2one` `account.account` | Counterpart for inventory value adjustments (stock variation) |
+| `account_stock_expense_id` | `Many2one` `account.account` | Counterpart for continental perpetual accounting adjustments |
+
+Source: [`stock_account/models/account_account.py:7-12`](../addons/stock_account/models/account_account.py#L7-L12)
+
+### The problem it solves
+
+During a fiscal period, stock moves create journal entries hitting the **Stock Valuation Account** (e.g., `1400 - Stock Valuation`). At period close, there can be a gap between:
+
+- **Inventory system value** — what the WMS/stock module says the inventory is worth (based on `product.total_value`)
+- **Accounting ledger value** — sum of all posted `account.move.line.balance` on the stock valuation account
+
+This gap is the **stock variation**. Causes include: timing differences (goods received but not yet invoiced), rounding, manual adjustments, inventory adjustments (shrinkage, damage), or cost method differences. The variation account is where Odoo records the adjustment entry to bring the books in line with actual inventory.
+
+### Where it's configured
+
+The variation account is set **on the stock valuation account itself**, not on the product or category. The chain:
+
+```
+Product Category (product.category)
+  -> property_stock_valuation_account_id  (e.g. "1400 Stock Valuation")
+       -> account_stock_variation_id      (e.g. "6100 Stock Variation")
+```
+
+The product category also exposes it as a related field for convenience:
+Source: [`stock_account/models/product.py:521-523`](../addons/stock_account/models/product.py#L521-L523)
+
+```python
+# on product.category
+account_stock_variation_id = fields.Many2one(
+    'account.account', string="Stock Variation Account",
+    related="property_stock_valuation_account_id.account_stock_variation_id")
+```
+
+### Company-level settings involved
+
+These are on `res.company`, added by `stock_account`:
+
+| Field | UI Label | Purpose |
+|---|---|---|
+| `account_stock_journal_id` | "Stock Journal" | The journal where closing entries are posted |
+| `account_stock_valuation_id` | "Stock Valuation Account" | Company-level fallback valuation account |
+| `inventory_period` | "Inventory Period" | `manual` / `daily` / `monthly` — controls auto-close cron |
+| `inventory_valuation` | "Valuation" | `periodic` (at closing) / `real_time` (at invoicing) |
+| `cost_method` | "Cost Method" | `standard` / `fifo` / `average` |
+
+Source: [`stock_account/models/res_company.py:12-47`](../addons/stock_account/models/res_company.py#L12-L47)
+
+### The full closing flow — step by step
+
+When you click **"Close Inventory Valuation"** (or the cron runs), the method `action_close_stock_valuation()` executes:
+
+Source: [`stock_account/models/res_company.py:49`](../addons/stock_account/models/res_company.py#L49)
+
+```
+1. _get_accounts_by_product()
+   Loads all storable products, gets each product's:
+     - valuation account (from product category -> property_stock_valuation_account_id)
+     - variation account (from valuation account -> account_stock_variation_id)
+     - expense account  (from product -> _get_product_accounts()['expense'])
+
+2. _get_location_valuation_vals()           [STEP A: Location reclassification]
+   For products with PERIODIC valuation only.
+   Reads stock.move records since last closing.
+   If stock locations have their own valuation_account_id,
+   moves value from that location account to the product's stock valuation account.
+   This handles multi-warehouse scenarios where goods move between locations
+   that use different valuation accounts.
+
+3. _get_stock_valuation_account_vals()      [STEP B: Global stock variation]
+   Compares:
+     inventory_value = sum of product.total_value per valuation account
+     accounting_value = sum of posted journal lines on the valuation account
+   Difference goes to the variation account.
+   Fallback: company.expense_account_id if no variation account set.
+
+4. _get_continental_realtime_variation_vals() [STEP C: Continental perpetual]
+   Only applies when inventory_valuation = 'real_time' (perpetual).
+   Computes the accounting value change over the fiscal period
+   (today vs fiscal year start date).
+   Posts variation between account_stock_variation_id and account_stock_expense_id.
+
+5. Creates a single account.move in the Stock Journal with all lines.
+   If triggered by cron (auto_post=True), posts automatically.
+```
+
+### Real-world example — periodic valuation (standard cost)
+
+**Setup:**
+- Company uses periodic valuation with standard costing
+- Product "Laptop" — standard price $500, category "Electronics"
+- Electronics category: `property_stock_valuation_account_id` = `1400 Stock Valuation`
+- Account `1400` has: `account_stock_variation_id` = `6100 Stock Variation`
+
+**During the month:**
+1. Receive 100 laptops from vendor (PO receipt) — stock module records 100 units
+2. Ship 20 laptops to customers (delivery orders) — stock module records 80 units remaining
+3. Inventory adjustment: 2 laptops damaged — stock module records 78 units remaining
+
+**At month-end closing:**
+
+| Source | Value |
+|---|---|
+| Inventory system (`product.total_value`) | 78 units x $500 = **$39,000** |
+| Accounting ledger (sum of posted lines on `1400`) | Maybe **$38,500** (due to timing of invoice postings) |
+| **Gap** | **$500** |
+
+Odoo creates:
+
+```
+Stock Closing Journal Entry (in Stock Journal):
+  Debit   1400 Stock Valuation     $500
+  Credit  6100 Stock Variation     $500
+  Ref: "Closing: Stock Variation Global for company [My Company]"
+```
+
+After posting, the ledger on `1400` now shows $39,000 — matching inventory.
+
+### Real-world example — continental perpetual (real-time)
+
+**Setup:**
+- Company uses perpetual/real-time valuation (European/Continental style)
+- Same product category, but `inventory_valuation = 'real_time'`
+- Account `1400` also has: `account_stock_expense_id` = `6000 Operating Expenses`
+
+**During the month:**
+- Every stock move (receipt, delivery, adjustment) already creates journal entries in real-time
+- But the **variation** (difference between expenses recognized and inventory movement) is NOT posted during the period
+
+**At month-end closing:**
+
+Odoo computes:
+```
+accounting_value_today       = sum of posted lines on 1400 as of today
+accounting_value_fiscal_start = sum of posted lines on 1400 as of Jan 1
+variation_over_period        = today - fiscal_start + existing_variation_balance
+```
+
+If variation is non-zero:
+
+```
+Stock Closing Journal Entry:
+  Debit   6000 Operating Expenses    $300
+  Credit  6100 Stock Variation       $300
+  Ref: "Closing: Stock Variation Over Period"
+```
+
+Note: in continental mode, both `account_stock_variation_id` AND `account_stock_expense_id` must be set on the valuation account. If either is missing, the account is silently skipped.
+Source: [`stock_account/models/res_company.py:276`](../addons/stock_account/models/res_company.py#L276)
+
+### Automatic closing via cron
+
+Source: [`stock_account/models/res_company.py:136`](../addons/stock_account/models/res_company.py#L136)
+
+The cron `_cron_post_stock_valuation()` runs for companies where:
+- `inventory_period = 'daily'` and `inventory_valuation != 'real_time'` — runs every day
+- `inventory_period = 'monthly'` — runs only on the last day of the month
+
+It calls `action_close_stock_valuation(auto_post=True)`, which creates AND posts the closing entry automatically.
+
+### In the generic COA
+
+| What | Value | Source |
+|---|---|---|
+| Account record | `6100 - Stock Variation`, type `expense` | [`generic_coa.csv:34`](../addons/account/data/template/account.account-generic_coa.csv#L34) |
+| Company field | `account_stock_variation_id` -> `stock_variation` | [`template_generic_coa.py:60`](../addons/account/models/template_generic_coa.py#L60) |
+
+### How the balance calculation works in code
+
+Source: [`stock_account/models/res_company.py:85-115`](../addons/stock_account/models/res_company.py#L85-L115)
+
+```python
+# Inventory value: from stock module (product quantities x cost)
+def stock_value(self, accounts_by_product, at_date):
+    for product, accounts in accounts_by_product.items():
+        account = accounts['valuation']
+        product_value = product.with_context(to_date=at_date).total_value
+        value_by_account[account] += product_value
+
+# Accounting value: from posted journal entries
+def stock_accounting_value(self, accounts_by_product, at_date):
+    # SELECT account_id, SUM(balance)
+    # FROM account_move_line
+    # WHERE account_id IN (valuation_accounts) AND state = 'posted'
+    amls_group = self.env['account.move.line']._read_group(
+        domain, ['account_id'], ['balance:sum']
+    )
+```
+
+The variation = `stock_value() - stock_accounting_value()`. If positive, inventory is worth more than the books show (increase valuation). If negative, inventory is worth less (shrinkage/loss).
+
+### Summary table — which accounts are involved
+
+| Account | Role | Example code | Where configured |
+|---|---|---|---|
+| Stock Valuation | Holds inventory value on balance sheet | `1400` | Product Category > `property_stock_valuation_account_id` |
+| Stock Variation | Receives the closing adjustment (counterpart) | `6100` | On the valuation account > `account_stock_variation_id` |
+| Stock Expense | Continental perpetual expense counterpart | `6000` | On the valuation account > `account_stock_expense_id` |
+| Stock Journal | Journal where closing entries are posted | `STJ` | Settings > `account_stock_journal_id` |
 
 ---
 
