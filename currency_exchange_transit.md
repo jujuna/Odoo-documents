@@ -70,11 +70,47 @@ If any of these is missing when Odoo tries to create an exchange difference entr
 
 ### 3. Outstanding Payment Accounts
 
-Each bank journal has **Outstanding Receipts** and **Outstanding Payments** accounts on its payment method lines. These are auto-created by the chart template ([chart_template.py:914-928](../addons/account/models/chart_template.py#L914-L928)).
+Each bank journal has **Outstanding Receipts** and **Outstanding Payments** accounts on its payment method lines.
 
-**Where to check:** Open a bank journal > "Incoming Payments" / "Outgoing Payments" tabs > the `payment_account_id` column on each payment method line.
+**Where to check:** Accounting > Configuration > Journals > open a bank journal > "Incoming Payments" / "Outgoing Payments" tabs > the `payment_account_id` column on each payment method line.
 
-If `payment_account_id` is empty on a payment method line, Odoo falls back to the transit account (`company.transfer_account_id`) via [`_get_outstanding_account()`](../addons/account/models/account_payment.py#L881-L890).
+The chart template creates these accounts during installation ([chart_template.py:914-928](../addons/account/models/chart_template.py#L914-L928)):
+- **101403 Outstanding Receipts** (for inbound payments)
+- **101404 Outstanding Payments** (for outbound payments)
+
+**But the accounts are NOT auto-assigned to payment method lines.** The `payment_account_id` field on `account.payment.method.line` is left **empty by default** in enterprise. This is intentional -- see the next section.
+
+If `payment_account_id` is empty on a payment method line, Odoo falls back to the transit account (`company.transfer_account_id`) via [`_get_outstanding_account()`](../addons/account/models/account_payment.py#L881-L890). But this fallback only triggers in community edition or when `force_payment_move` context is set.
+
+### 4. Community vs Enterprise: Payment Journal Entry Behavior
+
+This is a critical difference that affects how payments, transfers, and reconciliation work.
+
+**The code** ([account_payment.py:853-860](../addons/account/models/account_payment.py#L853-L860)):
+```python
+accounting_installed = self.env['account.move']._get_invoice_in_payment_state() == 'in_payment'
+
+if (not accounting_installed and not pay.outstanding_account_id):
+    outstanding_account = pay._get_outstanding_account(pay.payment_type)
+    pay.outstanding_account_id = outstanding_account.id
+```
+
+| | Community (`account` only) | Enterprise (`account_accountant` installed) |
+|---|---|---|
+| `accounting_installed` | `False` | `True` |
+| `payment_account_id` on method line | Empty (default) | Empty (default) |
+| Auto-sets `outstanding_account_id`? | **Yes** -- forces it to Outstanding Receipts/Payments account | **No** -- leaves it empty |
+| Payment creates journal entry? | **Yes** -- immediately on confirm | **No** -- payment is just a record, no journal entry |
+| When does the journal entry get created? | On payment confirmation | During **bank statement reconciliation** (the bank reconciliation widget creates the entry) |
+| Has bank reconciliation widget? | **No** | **Yes** |
+
+**Why enterprise leaves it empty:** Enterprise has the bank reconciliation widget. The design is: register the payment first (as a record), then import bank statements, then match the statement line with the payment in the reconciliation widget. The journal entry is created at that point, giving the user full control over amounts and matching.
+
+**If you want enterprise to behave like community** (payments create journal entries immediately): manually set `payment_account_id` on your bank journal's payment method lines:
+1. Accounting > Configuration > Journals > open "BANK EUR"
+2. "Incoming Payments" tab > "Manual Payment" line > set account to **Outstanding Receipts** (101403)
+3. "Outgoing Payments" tab > "Manual Payment" line > set account to **Outstanding Payments** (101404)
+4. Repeat for all bank journals
 
 ---
 
@@ -113,7 +149,9 @@ Open the bill > click **Register Payment**.
 | Date | February 10 |
 | Journal | USD Bank |
 
-Click **Create Payment**. Odoo creates:
+Click **Create Payment**.
+
+**In community edition**, Odoo immediately creates a journal entry:
 
 | Account | Debit (GEL) | Credit (GEL) | Currency | Amount |
 |---|---|---|---|---|
@@ -121,6 +159,8 @@ Click **Create Payment**. Odoo creates:
 | Outstanding Payments | | 13,750 | USD | -$5,000 |
 
 Why 13,750 GEL? Because $5,000 x 2.75 = 13,750 GEL (rate changed).
+
+**In enterprise edition**, the payment is created as a record (no journal entry). The journal entry is created when you match the bank statement line with the payment in the bank reconciliation widget. The accounting result is the same -- the entry is just created at a different point in the workflow.
 
 ### Step 3: Reconciliation (Automatic)
 
@@ -147,93 +187,88 @@ From [`_get_exchange_account()`](../addons/account/models/account_move_line.py#L
 
 ---
 
-## Real-World Example 2: Internal Transfer USD to EUR (Company Currency = GEL)
+## Real-World Example 2: Internal Transfer USD to EUR (Company Currency = USD)
 
-**Scenario:** Your company (GEL) needs to move $10,000 from the USD bank account to the EUR bank account. The bank gives you EUR 9,200. Today's rates: 1 USD = 2.70 GEL, 1 EUR = 2.94 GEL.
+**Scenario:** Your company (USD) needs to move $138.66 from the USD bank to the EUR bank. The bank gives you EUR 120. Today's rate: 1 EUR = 1.1555 USD.
 
-### Important: Odoo 19 Change
+### Important: Odoo 19 Changes
 
-In Odoo 17/18, clicking "Internal Transfer" auto-created a paired payment on the destination journal. **In Odoo 19, this auto-pairing was removed.** The `is_internal_transfer` field and `destination_journal_id` field no longer exist on `account.payment`. You create each side manually or through bank statement reconciliation.
+Two key differences from v17/v18:
 
-The `paired_internal_transfer_payment_id` field still exists ([account_payment.py:67](../addons/account/models/account_payment.py#L67)) but no code in v19 auto-populates it.
+1. **No auto-paired transfers.** In v17/v18, clicking "Internal Transfer" auto-created a paired payment on the destination journal. In v19, the `is_internal_transfer` field, `destination_journal_id` field, and `_create_paired_internal_transfer_payment()` method are all removed. The `paired_internal_transfer_payment_id` field still exists ([account_payment.py:67](../addons/account/models/account_payment.py#L67)) but no code auto-populates it.
 
-### Method A: Two Payments (Simplest)
+2. **Enterprise payments don't create journal entries.** With `account_accountant` installed, `payment_account_id` is empty on payment method lines by default. Payments are just records -- the journal entry is created during bank statement reconciliation (see Section 4 above).
 
-#### Step 1: Create the Outbound Payment (USD Side)
+**Result:** You must create both sides manually via bank statement lines.
 
-Go to Accounting > Dashboard > USD Bank card > click the vertical dots menu > **Internal Transfer**.
+### Method A: Bank Statement Reconciliation (Enterprise Flow)
 
-This opens a payment form with partner pre-set to your own company ([account_journal_dashboard.py:1082-1086](../addons/account/models/account_journal_dashboard.py#L1082-L1086)).
+This is what you'll actually do in enterprise v19. Tested and verified.
 
-| Field | Value |
-|---|---|
-| Payment Type | Send Money |
-| Partner | Your Company (auto-filled) |
-| Amount | 10,000 |
-| Currency | USD |
-| Date | March 23, 2026 |
-| Journal | USD Bank |
+#### Step 1: Create Bank Statement Line on EUR Bank (Money Arrives)
 
-Click **Confirm**. Journal entry created:
-
-| Account | Debit (GEL) | Credit (GEL) | Currency | Amount |
-|---|---|---|---|---|
-| Outstanding Payments | | 27,000 | USD | -$10,000 |
-| Destination Account (*) | 27,000 | | USD | $10,000 |
-
-(*) The destination account depends on `partner_type`: if `customer` it's the company's Receivable; if `supplier` it's the company's Payable.
-
-$10,000 x 2.70 = 27,000 GEL.
-
-#### Step 2: Create the Inbound Payment (EUR Side)
-
-Go to Accounting > Dashboard > EUR Bank card > create a new payment (or use "Internal Transfer" and switch to "Receive Money").
+Go to Accounting > Dashboard > **BANK EUR** card > click to open > **New Transaction**.
 
 | Field | Value |
 |---|---|
-| Payment Type | Receive Money |
-| Partner | Your Company |
-| Amount | 9,200 |
-| Currency | EUR |
 | Date | March 23, 2026 |
-| Journal | EUR Bank |
+| Label | "Internal transfer from USD Bank" |
+| Amount | **120.00** (positive = money coming in) |
 
-Click **Confirm**. Journal entry created:
+When Odoo opens the **reconciliation widget**, choose the transit account (101701 Liquidity Transfer) as the counterpart. Validate.
 
-| Account | Debit (GEL) | Credit (GEL) | Currency | Amount |
+Odoo creates journal entry (e.g., BNK2/2026/00002):
+
+| Account | Debit (USD) | Credit (USD) | Currency | Amount |
 |---|---|---|---|---|
-| Outstanding Receipts | 27,048 | | EUR | EUR 9,200 |
-| Destination Account (*) | | 27,048 | EUR | -EUR 9,200 |
+| Bank EUR (101405) | 138.66 | | EUR | 120.00 |
+| Liquidity Transfer (101701) | | 138.66 | EUR | -120.00 |
 
-EUR 9,200 x 2.94 = 27,048 GEL.
+EUR 120 x 1.1555 = $138.66.
 
-#### Step 3: Reconcile the Destination Account Lines
+#### Step 2: Create Bank Statement Line on USD Bank (Money Leaves)
 
-Both payments posted to the same destination account (the company's Receivable or Payable). Go to Accounting > Accounting > Reconciliation, or use the "Payment Matching" button on the payment form (enterprise).
+Go to Accounting > Dashboard > **Bank** (USD) card > click to open > **New Transaction**.
 
-Match the two destination account lines:
-- Line 1: 27,000 GEL debit (from USD payment)
-- Line 2: 27,048 GEL credit (from EUR payment)
-- **Difference: 48 GEL**
+| Field | Value |
+|---|---|
+| Date | March 23, 2026 |
+| Label | "Internal transfer to EUR Bank" |
+| Amount | **-138.66** (negative = money going out) |
 
-Odoo auto-creates an exchange difference entry:
+In the reconciliation widget, match with the transit account (101701). Odoo will suggest the open transit line from Step 1. Validate.
 
-| Account | Debit (GEL) | Credit (GEL) |
-|---|---|---|
-| Destination Account | 48 | |
-| Exchange Gain Account | | 48 |
+Odoo creates journal entry (e.g., BNK1/2026/00011):
 
-(It's a gain because converting $10,000 -> EUR 9,200 at today's rates results in more GEL on the EUR side.)
+| Account | Debit (USD) | Credit (USD) | Currency | Amount |
+|---|---|---|---|---|
+| Liquidity Transfer (101701) | 138.66 | | EUR | 120.00 |
+| Bank USD (101401) | | 138.66 | USD | -138.66 |
 
-#### Step 4: Match with Bank Statements
+#### Step 3: Transit Account Auto-Reconciles
 
-When you import bank statements:
-- USD bank statement shows -$10,000 outflow -> match with Payment 1's Outstanding Payments line
-- EUR bank statement shows +EUR 9,200 inflow -> match with Payment 2's Outstanding Receipts line
+After Step 2, the transit account has two lines that Odoo reconciles:
 
-### Method B: Manual Journal Entry (More Control)
+| Entry | Account | Debit | Credit | Reconciled |
+|---|---|---|---|---|
+| BNK2/2026/00002 (EUR Bank) | Liquidity Transfer (101701) | | $138.66 | Yes |
+| BNK1/2026/00011 (USD Bank) | Liquidity Transfer (101701) | $138.66 | | Yes |
 
-If you want to use the transit account directly:
+Transit balance = $138.66 - $138.66 = **$0**. Fully reconciled.
+
+**No exchange difference** in this case because both entries used the same date = same rate. If the dates differed and the EUR/USD rate changed, Odoo would auto-create an exchange gain/loss entry for the difference.
+
+#### What It Looks Like End-to-End
+
+```
+USD Bank (101401)  ──$138.66──>  Transit (101701)  ──$138.66──>  EUR Bank (101405)
+  Credit $138.66                  Debit + Credit                  Debit $138.66
+  (money left)                    = $0 (reconciled)               (money arrived)
+```
+
+### Method B: Manual Journal Entries (More Control)
+
+If you want to skip bank statements and create the accounting entries directly:
 
 #### Step 1: Journal Entry on USD Bank Journal
 
@@ -241,15 +276,15 @@ Go to Accounting > Accounting > Journal Entries > Create.
 
 | Field | Value |
 |---|---|
-| Journal | USD Bank |
+| Journal | Bank (USD) |
 | Date | March 23, 2026 |
 
 Lines:
 
 | Account | Debit | Credit | Currency | Amount |
 |---|---|---|---|---|
-| Transit Account (1017) | 27,000 | | USD | $10,000 |
-| USD Bank Account | | 27,000 | USD | -$10,000 |
+| Liquidity Transfer (101701) | 138.66 | | EUR | 120.00 |
+| Bank USD (101401) | | 138.66 | USD | -138.66 |
 
 #### Step 2: Journal Entry on EUR Bank Journal
 
@@ -257,29 +292,34 @@ Create another journal entry:
 
 | Field | Value |
 |---|---|
-| Journal | EUR Bank |
+| Journal | BANK EUR |
 | Date | March 23, 2026 |
 
 Lines:
 
 | Account | Debit | Credit | Currency | Amount |
 |---|---|---|---|---|
-| EUR Bank Account | 27,048 | | EUR | EUR 9,200 |
-| Transit Account (1017) | | 27,048 | EUR | -EUR 9,200 |
+| Bank EUR (101405) | 138.66 | | EUR | 120.00 |
+| Liquidity Transfer (101701) | | 138.66 | EUR | -120.00 |
 
 #### Step 3: Reconcile the Transit Account
 
-Go to Accounting > Accounting > Reconciliation. Filter for the transit account. Match the two lines:
+Go to Accounting > Accounting > Reconciliation. Filter for the transit account (101701). Match the two lines:
 
-- Transit debit: 27,000 GEL (USD side)
-- Transit credit: 27,048 GEL (EUR side)
-- Difference: 48 GEL -> auto-booked to exchange gain/loss
+- Transit debit: $138.66 (from USD bank entry)
+- Transit credit: $138.66 (from EUR bank entry)
 
-**Result:** Transit account is fully reconciled (balance = 0). The 48 GEL exchange gain appears in P&L.
+If dates differ and rate changed, Odoo auto-books the difference to exchange gain/loss.
 
-### Method C: Bank Statement Reconciliation
+**Result:** Transit account fully reconciled (balance = 0).
 
-If you import bank statements for both banks, Odoo can help you match the lines during reconciliation. Create the payments first (or let the bank statement wizard create them), then match the transit/destination lines.
+### Method C: "Internal Transfer" Button + Bank Statements
+
+The dashboard "Internal Transfer" button ([account_journal_dashboard.py:1082-1086](../addons/account/models/account_journal_dashboard.py#L1082-L1086)) creates a payment record (no journal entry in enterprise). You still need to:
+1. Import or create bank statement lines for both banks
+2. Match each statement line in the reconciliation widget
+
+This method adds a payment record for tracking but does not save any steps compared to Method A.
 
 ---
 
@@ -296,20 +336,289 @@ If you import bank statements for both banks, Odoo can help you match the lines 
 
 ---
 
-## How Exchange Differences Are Created (Technical)
+## Exchange Gain/Loss -- Deep Dive
 
-When Odoo reconciles journal item lines, it calls [`_prepare_exchange_difference_move_vals()`](../addons/account/models/account_move_line.py#L2854-L2940). This method:
+### What Is It?
 
-1. Checks if there's a residual `amount_residual` (company currency difference) after matching
-2. If the residual is zero -> no exchange entry needed
-3. If non-zero -> creates a 2-line journal entry:
+Exchange gain/loss is an accounting adjustment that Odoo creates **automatically** when the exchange rate changes between two dates: the date you recorded a transaction and the date you settled it.
+
+There are two types:
+
+| Type | When Created | Permanent? | Who Creates It |
+|---|---|---|---|
+| **Realized** | When reconciling (payment matches invoice) | Yes -- stays forever | Automatic during reconciliation ([account_move_line.py:2295-2365](../addons/account/models/account_move_line.py#L2295)) |
+| **Unrealized** | At period-end (month/quarter close) | No -- reversed next day | Manual via Multicurrency Revaluation Report (enterprise only) ([multicurrency_revaluation.py:169-179](../enterprise/account_reports/wizard/multicurrency_revaluation.py#L169)) |
+
+---
+
+### Why Does It Exist?
+
+Every foreign-currency transaction in Odoo is stored in **two amounts**:
+
+1. `amount_currency` -- the original foreign currency amount (e.g., $5,000)
+2. `balance` (debit/credit) -- the company-currency equivalent at the transaction date (e.g., 13,500 GEL)
+
+When you pay that $5,000 invoice later, the rate may have changed. The payment is $5,000 in foreign currency (same), but 13,750 GEL in company currency (different). The Receivable/Payable account now has:
+
+- 13,500 GEL from the invoice
+- 13,750 GEL from the payment
+
+These don't cancel out. The 250 GEL difference must go somewhere. That is the exchange gain or loss.
+
+---
+
+### Realized Gain/Loss (Automatic on Reconciliation)
+
+#### When It Triggers
+
+Every time Odoo reconciles two journal item lines (matching a payment to an invoice, matching transit account lines, etc.), it checks: **is there a company-currency mismatch after the foreign currency amounts are fully matched?**
+
+This check happens inside [`_prepare_reconciliation_single_partial()`](../addons/account/models/account_move_line.py#L2295). It can be skipped with context flags `no_exchange_difference` or `no_exchange_difference_no_recursive`.
+
+#### Two Scenarios
+
+**Scenario 1: Reconciliation currency = Company currency** ([lines 2300-2312](../addons/account/models/account_move_line.py#L2300))
+
+Both lines are denominated in company currency for the reconciliation. The exchange difference is on the **foreign currency side** (`amount_residual_currency`). This happens when one of the lines is in company currency and the other in a foreign currency.
+
+**Scenario 2: Reconciliation currency != Company currency** ([lines 2314-2355](../addons/account/models/account_move_line.py#L2314))
+
+Both lines share a foreign reconciliation currency. The exchange difference is on the **company currency side** (`amount_residual`). This is the most common case -- e.g., a USD invoice reconciled with a USD payment when the company currency is GEL.
+
+Two sub-cases:
+- **Fully matched line:** Exchange amount = remaining company-currency balance after subtracting what was reconciled
+- **Partially matched line:** Exchange amount = difference between what was actually debited/credited in company currency vs. what the reconciliation "consumed" -- ensures the rate between `amount_currency` and `balance` stays consistent on the remaining residual
+
+#### What Odoo Creates
+
+A journal entry with exactly **two lines per exchange difference** ([`_prepare_exchange_difference_move_vals()`](../addons/account/models/account_move_line.py#L2854)):
+
+| Line | Account | Purpose |
+|---|---|---|
+| 1. Adjustment | Same as original line (e.g., Accounts Payable) | Fixes the company-currency balance so it reconciles to zero |
+| 2. Counterpart | Exchange Gain or Exchange Loss account | Records the impact on P&L |
+
+The entry is posted to the **Exchange Gain or Loss Journal** (`currency_exchange_journal_id`).
+
+#### How Odoo Decides Gain vs Loss
+
+From [`_get_exchange_account()`](../addons/account/models/account_move_line.py#L2849):
+
+```python
+def _get_exchange_account(self, company, amount):
+    if amount > 0.0:
+        return company.expense_currency_exchange_account_id   # Loss
+    return company.income_currency_exchange_account_id         # Gain
+```
+
+| `amount_residual_to_fix` | Meaning | Account Used |
+|---|---|---|
+| > 0 (positive) | You owe more in company currency than expected | **Loss** (`expense_currency_exchange_account_id`) |
+| < 0 (negative) | You owe less in company currency than expected | **Gain** (`income_currency_exchange_account_id`) |
+
+#### Concrete Example: Loss
+
+Invoice: $5,000 at rate 2.70 = 13,500 GEL (Payable credit).
+Payment: $5,000 at rate 2.75 = 13,750 GEL (Payable debit).
+
+Payable has: 13,750 debit - 13,500 credit = **250 GEL residual** (positive).
+Positive residual = **Loss**. Odoo creates:
+
+| Account | Debit (GEL) | Credit (GEL) |
+|---|---|---|
+| Exchange Loss | 250 | |
+| Accounts Payable | | 250 |
+
+Now Payable: 13,750 debit - 13,500 credit - 250 credit = **0**. Fully reconciled.
+The 250 GEL shows as an expense in your Profit & Loss.
+
+#### Concrete Example: Gain
+
+Invoice: $5,000 at rate 2.75 = 13,750 GEL (Payable credit).
+Payment: $5,000 at rate 2.70 = 13,500 GEL (Payable debit).
+
+Payable has: 13,500 debit - 13,750 credit = **-250 GEL residual** (negative).
+Negative residual = **Gain**. Odoo creates:
+
+| Account | Debit (GEL) | Credit (GEL) |
+|---|---|---|
+| Accounts Payable | 250 | |
+| Exchange Gain | | 250 |
+
+Now Payable: 13,500 debit + 250 debit - 13,750 credit = **0**. Fully reconciled.
+The 250 GEL shows as income in your Profit & Loss.
+
+#### When NO Exchange Difference Occurs
+
+- Invoice and payment on the **same date** (same rate)
+- Both lines in **company currency** (no foreign currency involved)
+- The company-currency amounts happen to **match exactly** despite different dates (rare but possible)
+
+---
+
+### Unrealized Gain/Loss (Period-End Revaluation -- Enterprise Only)
+
+#### What Problem It Solves
+
+At month-end, you have open invoices in foreign currencies. The rates have changed since you recorded them. Your balance sheet shows these receivables/payables at the **old rate**, which no longer reflects reality.
+
+Accounting standards (IAS 21, ASC 830) often require you to **revalue** these open balances at the current rate and show the difference as a provisional gain or loss.
+
+#### Where to Find It
+
+Accounting > Reporting > Multicurrency Revaluation
+
+Module: `account_reports` (enterprise). Model: [`account.multicurrency.revaluation.report.handler`](../enterprise/account_reports/models/account_multicurrency_revaluation_report.py#L11)
+
+#### What It Shows
+
+For each account + currency combination with an open balance:
+
+| Column | Meaning |
+|---|---|
+| Balance in Foreign Currency | Open amount in the foreign currency (e.g., $5,000) |
+| Balance at Operation Rate | Company-currency value at the rate when the transaction was recorded |
+| Balance at Current Rate | Company-currency value at today's rate |
+| Adjustment | Difference = Balance at Current Rate - Balance at Operation Rate |
+
+The adjustment formula ([line 248-252](../enterprise/account_reports/models/account_multicurrency_revaluation_report.py#L248)):
+```
+adjustment = (amount_currency / current_rate) - (amount_currency / operation_rate)
+```
+
+#### Which Accounts Are Included
+
+The report includes accounts where ([lines 305-312](../enterprise/account_reports/models/account_multicurrency_revaluation_report.py#L305)):
+- Account has a **non-company currency** set, OR
+- Account is **Receivable/Payable** and the journal item has a foreign currency
+
+It excludes:
+- Income, expense, and off-balance accounts
+- Accounts the user has manually excluded via the "Excluded Accounts" toggle
+- Lines from exchange difference moves themselves (prevents double-counting)
+
+#### How to Create Revaluation Entries
+
+1. Open the Multicurrency Revaluation report
+2. Review adjustments per account + currency
+3. Click **Adjustment Entry** button
+4. Fill the wizard:
+
+| Field | Purpose |
+|---|---|
+| `journal_id` | Journal for the revaluation entry (stored on `res.company` as `account_revaluation_journal_id`, [res_company.py:35](../enterprise/account_reports/models/res_company.py#L35)) |
+| `expense_provision_account_id` | Where negative adjustments go ("Expense Provision Account", [res_company.py:36](../enterprise/account_reports/models/res_company.py#L36)) |
+| `income_provision_account_id` | Where positive adjustments go ("Income Provision Account", [res_company.py:37](../enterprise/account_reports/models/res_company.py#L37)) |
+| `date` | Revaluation date (typically month-end) |
+| `reversal_date` | Auto-reversal date (typically next day) |
+
+5. Click **Create Entry**
+
+#### What It Creates
+
+The wizard ([`create_entries()`](../enterprise/account_reports/wizard/multicurrency_revaluation.py#L169)) does two things:
+
+1. **Posts the revaluation entry** with lines for each account + currency:
 
 | Line | Account | Amount |
 |---|---|---|
-| Counterpart | Same account as the original line (e.g., Receivable) | The residual difference |
-| Exchange | Exchange Gain or Loss account | Opposite of the residual |
+| Adjustment | Original account (e.g., Receivable) | The adjustment amount |
+| Provision | Expense/Income Provision account | Opposite of adjustment |
 
-The entry is posted to the **Exchange Gain or Loss Journal** (`currency_exchange_journal_id`). Created and posted via [`_create_exchange_difference_moves()`](../addons/account/models/account_move_line.py#L2942).
+2. **Immediately creates and posts a reversal** dated `reversal_date` (typically the next day)
+
+This is the key difference from realized gain/loss: **the revaluation is temporary**. It appears in reports for the period-end, then reverses itself. When the invoice is actually paid, the realized gain/loss takes over.
+
+#### Realized vs Unrealized -- Side by Side
+
+| Aspect | Realized | Unrealized |
+|---|---|---|
+| **Trigger** | Payment reconciled with invoice | Manual period-end action |
+| **Automatic?** | Yes -- happens during reconciliation | No -- user must run the report and click |
+| **Permanent?** | Yes | No -- auto-reversed next period |
+| **Accounts** | Exchange Gain/Loss (P&L) | Provision accounts (can be P&L or Balance Sheet) |
+| **When rate changes after?** | No further effect -- settled | Next period-end creates new revaluation |
+| **Open invoices affected?** | Only the one being paid | All open balances in that currency |
+
+#### Example: Unrealized Loss
+
+March 1: Invoice $10,000 at rate 2.70 = 27,000 GEL.
+March 31 (month-end): Rate is now 2.80. At current rate, $10,000 = 28,000 GEL.
+Adjustment = 28,000 - 27,000 = **1,000 GEL** (you'd need to pay more GEL now).
+
+Revaluation entry (March 31):
+
+| Account | Debit (GEL) | Credit (GEL) |
+|---|---|---|
+| Accounts Payable | 1,000 | |
+| Expense Provision | | 1,000 |
+
+Reversal entry (April 1):
+
+| Account | Debit (GEL) | Credit (GEL) |
+|---|---|---|
+| Expense Provision | 1,000 | |
+| Accounts Payable | | 1,000 |
+
+When the invoice is actually paid in April, the real exchange difference is captured as a realized gain/loss through normal reconciliation.
+
+---
+
+### Exchange Gain/Loss on Internal Transfers
+
+When you transfer money between banks in different currencies via the transit account:
+
+- **Same date, same rate:** Transit lines match exactly. No exchange difference. This is the typical case.
+- **Different dates:** If you record the outgoing side on Monday and the incoming side on Wednesday, and the rate changed, the transit account lines will have different company-currency amounts. Odoo creates an exchange gain/loss entry when reconciling the transit lines.
+- **Bank rate differs from Odoo rate:** If your bank gave you EUR 73.50 for $80, but Odoo's rate would have given EUR 73.48, the difference is captured through the transit account reconciliation as an exchange gain/loss.
+
+---
+
+### How Exchange Differences Are Created (Technical Flow)
+
+```
+reconcile() called on two journal items
+    |
+    v
+_prepare_reconciliation_single_partial()
+    |-- Computes partial amounts in both currencies
+    |-- Checks: is there a company-currency mismatch?
+    |-- If yes: prepares exchange_values via
+    |       _prepare_exchange_difference_move_vals()
+    |           |-- Determines gain vs loss (_get_exchange_account())
+    |           |-- Builds 2-line journal entry values
+    |           |-- Returns {move_values, to_reconcile}
+    v
+_reconcile_plan_with_sync()
+    |-- Collects all exchange_values from all partials
+    |-- Calls _create_exchange_difference_moves()
+    |       |-- Validates: journal + accounts configured? (UserError if not)
+    |       |-- Creates moves with context(no_exchange_difference=True)
+    |       |-- Posts the moves
+    |       |-- Returns exchange_moves recordset
+    |-- Links each exchange_move to its partial via exchange_move_id
+    v
+Done. Exchange entries posted and linked.
+```
+
+#### Unlinking / Unreconciling
+
+When a partial reconciliation is deleted ([`account_partial_reconcile.py:104-146`](../addons/account/models/account_partial_reconcile.py#L104)):
+
+1. Collects `exchange_move_id` from each partial being deleted
+2. If exchange move is **posted**: creates a reversal entry (cancellation)
+3. If exchange move is **draft**: deletes it directly
+4. Removes the `full_reconcile_id` link
+5. Updates matching numbers
+
+This ensures exchange entries are always cleaned up when you undo a reconciliation.
+
+#### Context Flags
+
+| Flag | Where Set | Purpose |
+|---|---|---|
+| `no_exchange_difference` | [`account_move_line.py:2983`](../addons/account/models/account_move_line.py#L2983) | Prevents recursive exchange difference when creating/posting exchange moves |
+| `no_exchange_difference_no_recursive` | [`account_move_line.py:2297`](../addons/account/models/account_move_line.py#L2297) | Controls whether cash basis tax moves also get exchange differences |
 
 ---
 
@@ -323,8 +632,11 @@ The entry is posted to the **Exchange Gain or Loss Journal** (`currency_exchange
 | Exchange Gain | Accounting Settings > Default Accounts > Exchange difference entries | `income_currency_exchange_account_id` | Where favorable rate differences go |
 | Exchange Loss | Accounting Settings > Default Accounts > Exchange difference entries | `expense_currency_exchange_account_id` | Where unfavorable rate differences go |
 | Auto Currency Rates | Accounting Settings > Currencies | `module_currency_rate_live` | Auto-fetch rates from central banks |
+| Revaluation Journal | (stored on company) | `account_revaluation_journal_id` | Journal for unrealized gain/loss entries (enterprise) |
+| Expense Provision Account | Multicurrency Revaluation wizard | `account_revaluation_expense_provision_account_id` | Where unrealized losses go (enterprise) |
+| Income Provision Account | Multicurrency Revaluation wizard | `account_revaluation_income_provision_account_id` | Where unrealized gains go (enterprise) |
 
-**Visibility:** The "Default Accounts" block requires `account.group_account_user` group ([view line 255](../addons/account/views/res_config_settings_views.xml#L255)). The "Exchange difference entries" section is hidden unless multi-currency is enabled ([view line 257](../addons/account/views/res_config_settings_views.xml#L257)).
+**Visibility:** The "Default Accounts" block requires `account.group_account_user` group ([view line 255](../addons/account/views/res_config_settings_views.xml#L255)). The "Exchange difference entries" section is hidden unless multi-currency is enabled ([view line 257](../addons/account/views/res_config_settings_views.xml#L257)). The Multicurrency Revaluation report requires `account_reports` (enterprise).
 
 ---
 
@@ -342,6 +654,11 @@ The entry is posted to the **Exchange Gain or Loss Journal** (`currency_exchange
 | `account.payment` | `outstanding_account_id` | Computed from payment method line, used as liquidity account in the journal entry ([account_payment.py:122](../addons/account/models/account_payment.py#L122)) |
 | `account.payment` | `destination_account_id` | Receivable/Payable based on partner type ([account_payment.py:129](../addons/account/models/account_payment.py#L129)) |
 | `account.partial.reconcile` | `exchange_move_id` | Links a partial reconciliation to its exchange difference entry ([account_partial_reconcile.py:23](../addons/account/models/account_partial_reconcile.py#L23)) |
+| `account.move` | `exchange_diff_partial_ids` | Inverse: partials that created this exchange move ([account_move.py:197](../addons/account/models/account_move.py#L197)) |
+| `res.company` | `account_revaluation_journal_id` | Journal for unrealized revaluation entries ([res_company.py:35](../enterprise/account_reports/models/res_company.py#L35)) |
+| `res.company` | `account_revaluation_expense_provision_account_id` | Provision account for unrealized losses ([res_company.py:36](../enterprise/account_reports/models/res_company.py#L36)) |
+| `res.company` | `account_revaluation_income_provision_account_id` | Provision account for unrealized gains ([res_company.py:37](../enterprise/account_reports/models/res_company.py#L37)) |
+| `account.account` | `exclude_provision_currency_ids` | Currencies excluded from revaluation for this account ([account.py:13](../enterprise/account_reports/models/account.py#L13)) |
 
 ### Methods
 
@@ -349,9 +666,14 @@ The entry is posted to the **Exchange Gain or Loss Journal** (`currency_exchange
 |---|---|---|
 | `_prepare_move_line_default_vals()` | [account_payment.py:280](../addons/account/models/account_payment.py#L280) | Builds the 2 journal lines for a payment (outstanding + destination) |
 | `_get_outstanding_account()` | [account_payment.py:881](../addons/account/models/account_payment.py#L881) | Gets outstanding account from chart template, falls back to `transfer_account_id` |
+| `_get_exchange_journal()` | [account_move_line.py:2846](../addons/account/models/account_move_line.py#L2846) | Returns `company.currency_exchange_journal_id` |
 | `_get_exchange_account()` | [account_move_line.py:2849](../addons/account/models/account_move_line.py#L2849) | Returns gain or loss account based on residual sign |
-| `_prepare_exchange_difference_move_vals()` | [account_move_line.py:2854](../addons/account/models/account_move_line.py#L2854) | Builds the exchange difference journal entry |
-| `_create_exchange_difference_moves()` | [account_move_line.py:2942](../addons/account/models/account_move_line.py#L2942) | Creates and posts exchange difference entries |
+| `_prepare_exchange_difference_move_vals()` | [account_move_line.py:2854](../addons/account/models/account_move_line.py#L2854) | Builds the exchange difference journal entry (2 lines per difference) |
+| `_create_exchange_difference_moves()` | [account_move_line.py:2943](../addons/account/models/account_move_line.py#L2943) | Validates config, creates and posts exchange difference entries |
+| `_prepare_reconciliation_single_partial()` | [account_move_line.py:2295](../addons/account/models/account_move_line.py#L2295) | Computes exchange difference amounts during reconciliation |
+| `_reconcile_plan_with_sync()` | [account_move_line.py:2735](../addons/account/models/account_move_line.py#L2735) | Links exchange moves to partials via `exchange_move_id` |
+| `_get_move_vals()` (revaluation) | [multicurrency_revaluation.py:108](../enterprise/account_reports/wizard/multicurrency_revaluation.py#L108) | Builds unrealized gain/loss journal entry from report data |
+| `create_entries()` (revaluation) | [multicurrency_revaluation.py:169](../enterprise/account_reports/wizard/multicurrency_revaluation.py#L169) | Creates revaluation entry + auto-reversal |
 
 ---
 
@@ -365,7 +687,9 @@ The entry is posted to the **Exchange Gain or Loss Journal** (`currency_exchange
 
 - **v19 removed auto-paired transfers:** The `is_internal_transfer` field, `destination_journal_id` field, and `_create_paired_internal_transfer_payment()` method from v17/v18 do not exist in v19. You must create both sides of an internal transfer manually.
 
-- **Outstanding account fallback:** If no `payment_account_id` is set on the payment method line, `_get_outstanding_account()` falls back to `company.transfer_account_id` ([line 886](../addons/account/models/account_payment.py#L886)).
+- **Enterprise payments have no journal entry by default:** With `account_accountant` installed, `payment_account_id` is empty on payment method lines. Payments are records only -- journal entries are created during bank statement reconciliation. This is by design. To change this, manually set outstanding accounts on the journal's payment method lines (see Section 4 in Configuration).
+
+- **Outstanding account fallback (community only):** If no `payment_account_id` is set on the payment method line, `_get_outstanding_account()` falls back to `company.transfer_account_id` ([line 886](../addons/account/models/account_payment.py#L886)). This fallback only triggers in community edition (`accounting_installed = False`) or with `force_payment_move` context.
 
 - **`no_exchange_difference` context flag:** Odoo creates exchange moves with `context(no_exchange_difference=True)` to prevent infinite recursion ([line 2983](../addons/account/models/account_move_line.py#L2983)).
 
