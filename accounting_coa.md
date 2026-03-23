@@ -204,6 +204,7 @@ If an account has its own `currency_id` set, every journal line on that account 
 | Module | Why |
 |---|---|
 | `base_setup` | Company setup wizard, country/currency data |
+| `onboarding` | Onboarding panel and setup steps |
 | `product` | Product accounts (`account_id`, `property_account_income_id`) |
 | `analytic` | Analytic account field on journal lines |
 | `portal` | Customer portal access to invoices |
@@ -244,7 +245,7 @@ This is the central record — one row per ledger account.
 | `group_id` | `Many2one` `account.group` (computed) | — | Auto-resolved from code prefix match against `account.group` |
 | `root_id` | `Many2one` `account.root` (computed) | — | Virtual node: first 2 chars of code |
 | `active` | `Boolean` | "Active" | Inactive accounts are hidden but preserved |
-| `non_trade` | `Boolean` | "Non-Trade" | Marks receivable/payable as non-trade for report filters |
+| `non_trade` | `Boolean` | "Non Trade" | Marks receivable/payable as non-trade for report filters |
 | `opening_debit` | `Monetary` (computed/inverse) | "Opening Debit" | Balance from the company opening journal entry |
 | `opening_credit` | `Monetary` (computed/inverse) | "Opening Credit" | Balance from the company opening journal entry |
 | `current_balance` | `Float` (computed) | — | Sum of posted `account.move.line.balance` for the active company |
@@ -408,7 +409,7 @@ These accounts **reset to zero** at the start of each fiscal year. Their year-en
 |---|---|---|
 | `internal_group` | `account_type.split('_')[0]` — e.g. `asset_cash` -> `asset` | [`_compute_internal_group()`](../addons/account/models/account_account.py#L652) |
 | `include_initial_balance` | `True` if not income/expense and not `equity_unaffected` | [`_compute_include_initial_balance()`](../addons/account/models/account_account.py#L638) |
-| `reconcile` | Auto-set True for receivable/payable; False for income/expense/equity/cash | [`_compute_reconcile()`](../addons/account/models/account_account.py#L665) |
+| `reconcile` | Auto-set True for receivable/payable; False for income/expense/equity/cash/credit card/off-balance; unchanged for other asset/liability types | [`_compute_reconcile()`](../addons/account/models/account_account.py#L665) |
 
 ---
 
@@ -799,7 +800,8 @@ PAYMENT TERM LINE                          PRODUCT LINE
      account_receivable_id                    |                        |
         |                                     v                        |
         v                              Apply fiscal position           |
-  4. ir.default fallback               map_account() if set            |
+  4. First active receivable/payable
+     account in the company (SQL fallback)               map_account() if set            |
         |                                                              |
         v                              <-------------------------------+
   Apply fiscal position                         |
@@ -949,7 +951,7 @@ When a user picks an account on a journal line, Odoo suggests accounts ordered b
 **Logic:**
 1. Look up `account.move.line` for the same partner, last 2 years.
 2. Order by count of usage (most used first).
-3. Filter by `internal_group`: `income` for customer invoices, `expense` / `asset_fixed` for vendor bills.
+3. Filter by `internal_group`: `income` for customer invoices, `expense` for vendor bills.
 
 Source: [`_get_most_frequent_accounts_for_partner()`](../addons/account/models/account_account.py#L730)
 Suggested accounts are marked `Suggested` in the dropdown.
@@ -969,7 +971,7 @@ Source: [`models/res_config_settings.py`](../addons/account/models/res_config_se
 | `chart_template` | (COA picker) | `company_id.chart_template` | Which chart of accounts is loaded |
 | `account_fiscal_country_id` | "Fiscal Country Code" | `company_id.account_fiscal_country_id` | Country for tax reporting |
 | `tax_calculation_rounding_method` | "Tax Calculation Rounding Method" | `company_id.tax_calculation_rounding_method` | `round_globally` (per tax) vs `round_per_line` |
-| `currency_exchange_journal_id` | "Currency Exchange Journal" | `company_id.currency_exchange_journal_id` | Journal for FX gain/loss entries |
+| `currency_exchange_journal_id` | "Exchange Gain or Loss Journal" | `company_id.currency_exchange_journal_id` | Journal for FX gain/loss entries |
 | `income_currency_exchange_account_id` | "Gain Exchange Rate Account" | `company_id.income_currency_exchange_account_id` | Account for FX gains (`internal_group = income`) |
 | `expense_currency_exchange_account_id` | "Loss Exchange Rate Account" | `company_id.expense_currency_exchange_account_id` | Account for FX losses (`account_type = expense`) |
 | `account_journal_suspense_account_id` | "Bank Suspense" | `company_id.account_journal_suspense_account_id` | Temporary account for unreconciled bank imports |
@@ -988,7 +990,7 @@ Source: [`security/account_security.xml`](../addons/account/security/account_sec
 | Billing (Invoice) | `group_account_invoice` | Create/edit invoices, payments | `group_account_basic`, `group_account_manager` |
 | Basic Accounting | `group_account_basic` | Invoice + basic bank reconciliation | `group_account_user` |
 | Read-only Accounting | `group_account_readonly` | See everything (entries, reports, advanced config) | `group_account_user` |
-| Accountant (User) | `group_account_user` | Full accounting except advanced config | `group_account_manager` |
+| Accountant (User) | `group_account_user` | Full accounting except advanced config | — |
 | Accounting Manager | `group_account_manager` | Everything including lock dates, COA setup | — |
 | Secured Entries | `group_account_secured` | Hash-locked entry integrity | — |
 | Cash Rounding | `group_cash_rounding` | Enabled by "Cash Rounding" setting | — |
@@ -1325,7 +1327,7 @@ The variation = `stock_value() - stock_accounting_value()`. If positive, invento
 
 - **`equity_unaffected` is special:** It is the only equity account where `include_initial_balance = False`. Odoo uses it to show "current year earnings" on the balance sheet. If you use a wrong account type here, your balance sheet will not balance.
 
-- **Changing `account_type` is blocked for active accounts:** If a journal has `default_account_id` pointing to an account, changing its type to `asset_receivable` or `liability_payable` raises a `ValidationError`. Source: [`_check_account_type_sales_purchase_journal()`](../addons/account/models/account_account.py#L291).
+- **Changing `account_type` is blocked when used as a journal default:** If a **sale or purchase** journal has `default_account_id` pointing to an account, changing its type to `asset_receivable` or `liability_payable` raises a `ValidationError`. General/bank/cash journals are not affected. Source: [`_check_account_type_sales_purchase_journal()`](../addons/account/models/account_account.py#L291).
 
 - **Changing currency on account checks journal consistency:** If a journal uses this account and has a currency set, both must match. Source: [`_check_journal_consistency()`](../addons/account/models/account_account.py#L197).
 
