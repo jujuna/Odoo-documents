@@ -1678,3 +1678,4 @@ Source: [`_compute_value()`](../addons/stock_account/models/product.py#L141-L169
 - [`inventory.md`](inventory.md) -- Core inventory (warehouses, routes, quants, reservations)
 - [`accounting_coa.md`](accounting_coa.md) -- Chart of Accounts setup (stock accounts configuration)
 - [`accounting_fixed_costs_guide.md`](accounting_fixed_costs_guide.md) -- Account types and reconciliation
+- [`mrp.md`](mrp.md) -- Manufacturing: MO Overview valuation, production costing, work center costs
