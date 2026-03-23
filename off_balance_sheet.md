@@ -46,7 +46,7 @@ Imagine your company guarantees a $100,000 bank loan for a friend's business. Ri
 **In Odoo:**
 1. Create two off-balance accounts (e.g., "Guarantees Given" and "Guarantees Given - Counterpart")
 2. Create a journal entry: Debit "Guarantees Given" 500,000 / Credit "Guarantees Given - Counterpart" 500,000
-3. The Balance Sheet report shows this under a separate "OFF BALANCE SHEET ACCOUNTS" section at the bottom
+3. The entry is visible in the Trial Balance and General Ledger reports (the Balance Sheet section for off-balance accounts does not display due to a `hide_if_zero` bug -- see "How It Appears in Reports" below)
 
 **Result:** Auditors can see the guarantee commitment. It doesn't inflate your liabilities. If the subsidiary defaults, you'd create a real liability entry and reverse the off-balance entry.
 
@@ -86,7 +86,7 @@ Imagine your company guarantees a $100,000 bank loan for a friend's business. Ri
 
 | Feature | Off-Balance Sheet | All Other Types |
 |---|---|---|
-| Appears in Balance Sheet totals | No -- separate section at bottom | Asset/Liability/Equity: Yes. Income/Expense: No (they go to P&L) |
+| Appears in Balance Sheet totals | No -- defined as a separate section, but currently hidden due to `hide_if_zero` bug | Asset/Liability/Equity: Yes. Income/Expense: No (they go to P&L) |
 | Appears in Profit & Loss | No | Income/Expense: Yes. Asset/Liability/Equity: No |
 | Can have taxes | No (hard block) | Yes (no restriction at account level, except off-balance) |
 | Can be reconciled | No (hard block) | Receivable/Payable: auto-set to reconcilable. Equity/Income/Expense: No |
@@ -116,12 +116,22 @@ This means off-balance entries always balance **within their own world**. They d
 ## How It Appears in Reports
 
 ### Balance Sheet
-Off-balance amounts appear in a dedicated **"OFF BALANCE SHEET ACCOUNTS"** section at the very bottom of the Balance Sheet, below the "Liabilities + Equity" total. This section:
-- Is grouped by account
-- Is foldable (can be collapsed)
-- Is hidden automatically if all off-balance accounts have zero balance
+The report definition in [`balance_sheet.xml:276-284`](../enterprise/account_reports/data/balance_sheet.xml#L276) includes an "OFF BALANCE SHEET ACCOUNTS" section at the very bottom, configured with `groupby=account_id`, `foldable=True`, and `hide_if_zero=True`.
 
-Source: [`balance_sheet.xml:276-284`](../enterprise/account_reports/data/balance_sheet.xml#L276)
+**However, this section never actually displays.** The reason is a logical conflict in the report engine:
+
+1. Off-balance entries must always balance internally (debit one off-balance account, credit another). So the **sum across all off-balance accounts is always 0**.
+2. The report line computes `-sum([('account_id.account_type', '=', 'off_balance')])` which always evaluates to 0.
+3. `hide_if_zero=True` hides the line when its column value is 0 ([`account_report.py:2750-2771`](../enterprise/account_reports/models/account_report.py#L2750)).
+4. The hide check only inspects static children (`children_ids`), not the dynamically generated groupby sub-lines. Since this line has no static children, only its own zero-value total is checked -- and it's always hidden.
+
+The individual account sub-lines (which would show non-zero balances like +22 and -22) never render because their parent line is hidden first.
+
+**To actually see off-balance accounts on the Balance Sheet**, you would need to either:
+- Remove `hide_if_zero` from the report line definition, or
+- Use the **Trial Balance** report instead (see below)
+
+This appears to be a bug in Odoo's standard report definition -- `hide_if_zero` should not be `True` on a grouped line whose total is structurally always zero.
 
 ### Profit & Loss
 Not included. Off-balance accounts never appear here.
