@@ -73,27 +73,39 @@ One record per employee per day when overtime is detected.
 | `rule_ids` | M2M → `hr.attendance.overtime.rule` — which rules triggered |
 
 ### `hr.attendance.overtime.ruleset`
-Container for overtime rules, assigned to a contract version.
+Named container of overtime rules, assigned to a contract version via `hr.version.ruleset_id` (default = seeded "Default Ruleset"). Defined in [hr_attendance_overtime_ruleset.py](../addons/hr_attendance/models/hr_attendance_overtime_ruleset.py).
 
 | Field | Description |
 |---|---|
 | `name` | Display name |
-| `rate_combination_mode` | `max` = use highest rate; `sum` = add extra percentages above 100% |
+| `rate_combination_mode` | `max` = use highest rate of the applicable rules; `sum` = 100% + each rule's extra above 100% (150% & 120% → 170%) |
+| `country_id` | Informational/grouping, defaults to company country |
 | `rule_ids` | One2many → `hr.attendance.overtime.rule` |
 
+Seed: the **"Default Ruleset"** ships with two rules ([rule_data.xml](../addons/hr_attendance/data/hr_attendance_overtime_rule_data.xml)), both `paid`: **Employee Schedule Rule** (`quantity`, hours beyond the employee schedule) and **Non Working Days Rule** (`timing` / `non_work_days`, any hours on a day off). `action_regenerate_overtimes` (Regenerate overtimes button) re-runs detection for all attendances of employees on the ruleset.
+
 ### `hr.attendance.overtime.rule`
-Defines a single overtime threshold and how to pay it.
+One overtime definition. Two fundamentally different modes via `base_off`. Defined in [hr_attendance_overtime_rule.py](../addons/hr_attendance/models/hr_attendance_overtime_rule.py).
 
 | Field | Description |
 |---|---|
-| `base_off` | `quantity` = based on total hours worked; `timing` = based on time of day / day type |
-| `quantity_period` | `day` or `week` — period over which hours are counted |
-| `expected_hours_from_contract` | If True, threshold = employee's scheduled hours from calendar; if False, use `expected_hours` |
-| `expected_hours` | Manual threshold in hours (only if `expected_hours_from_contract = False`) |
-| `paid` | True = this overtime creates a paid work entry |
-| `amount_rate` | Pay multiplier for overtime hours under this rule |
-| `work_entry_type_id` | Work entry type to assign (e.g. Overtime Hours) |
-| `employer_tolerance` | Minimum overtime minutes before the rule triggers (buffer) |
+| `base_off` | `quantity` = hours above a threshold; `timing` = hours worked in a specific window/day-type |
+| **Quantity mode** | |
+| `quantity_period` | `day` or `week` — period the hours are summed over |
+| `expected_hours_from_contract` | True → threshold = employee's scheduled hours (shown as "From Employee"); False → use `expected_hours` |
+| `expected_hours` | Manual threshold in hours (when not from contract) |
+| **Timing mode** | |
+| `timing_type` | `work_days` / `non_work_days` / `leave` (employee off) / `schedule` (outside a specific calendar) |
+| `timing_start` / `timing_stop` | Hour-of-day window (default 0–24) |
+| `resource_calendar_id` | The schedule, required when `timing_type='schedule'` |
+| **Pay** | |
+| `paid` | True = produces a paid overtime line / work entry |
+| `amount_rate` | Pay multiplier. **Enterprise** relabels this to **"Salary Rate"**, makes it read-only and computes it from `work_entry_type_id.amount_rate` |
+| `employer_tolerance` | Buffer — overtime under this is ignored |
+| `employee_tolerance` | Buffer for negative "undertime" (needs `company.absence_management`) |
+| `information_display` | Computed human-readable summary (the "Information" column) |
+
+`work_entry_type_id` is **enterprise-only** (`hr_work_entry_attendance` adds it; required when `paid`) — [rule extension](../enterprise/hr_work_entry_attendance/models/hr_attendance_overtime_rule.py). It is **not** on the community rule model.
 
 ---
 
@@ -149,12 +161,13 @@ Even though A ends at 07:58 and B ends at 07:45 (no time overlap), WE 1 is archi
 
 ### 4d. Overtime Detection
 
-Requires `ruleset_id` set on the contract version (`hr_version`).
+Requires `ruleset_id` set on the contract version (`hr_version`). On attendance create/write/unlink, `_update_overtime()` runs — [hr_attendance.py:265](../addons/hr_attendance/models/hr_attendance.py#L265): it deletes stale lines for the affected employee/date range, resolves each attendance's active version → `version.ruleset_id`, and calls `ruleset.rule_ids._generate_overtime_vals_v2(...)`.
 
-1. On attendance save, `_update_overtime()` is triggered.
-2. For each attendance day, actual worked hours are compared to the scheduled hours.
-3. If `worked_hours > expected_hours + employer_tolerance`, an `hr.attendance.overtime.line` is created/updated.
-4. The overtime line gets `status = 'approved'` automatically (can be manually refused).
+Each rule contributes overtime by its `base_off`:
+- **Quantity** — sums worked hours over the period (day/week), subtracts the threshold (employee schedule when `expected_hours_from_contract`, else `expected_hours`); the excess above `employer_tolerance` is overtime. A shortfall below `employee_tolerance` can become negative "undertime" when `company.absence_management` is on.
+- **Timing** — marks the hours falling in the rule's window (`timing_type` + `timing_start`/`timing_stop`) as overtime.
+
+When multiple paid rules cover the same interval, `_extra_overtime_vals()` combines their rates per the ruleset's `rate_combination_mode` (`max`/`sum`). The line gets `status = 'approved'` automatically, or `to_approve` if the company's attendance validation is "by manager" (then manually approved/refused).
 
 ### 4e. Overtime → Work Entry Split
 

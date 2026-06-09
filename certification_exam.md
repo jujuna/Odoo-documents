@@ -5,7 +5,7 @@
 
 ---
 
-## General & User Interface (3 questions)
+## General & User Interface (9 questions)
 
 ### 1. By default, when are followers notified about a record?
 
@@ -27,6 +27,42 @@
 - Click Schedule Activities in the Configuration Menu and add the activity type, and due date
 - Click on the phone icon in the top menu bar and then click the '+' button to add an activity
 
+### 4. Inside a record, how do you schedule an activity?
+
+- Click the "Activity" button at the top of the chatter and choose the activity type, due date, assignee, and log a note. **(True)**
+- Click the "New Activity" option in the chatter menu and select the activity type, responsible user, and deadline.
+- Open the Activities panel from the record header and use "Add Activity" to define the activity details.
+
+### 5. What happens to the fields of secondary contacts when merging into a master contact?
+
+- Odoo discards all information from secondary contacts except for linked records.
+- Fields in the master record remain, and non-empty fields from the secondary records are merged in. **(True)**
+- All fields from secondary contacts overwrite the data in the master contact.
+
+### 6. How can you save a frequently used search filter for future use?
+
+- Add the filter to your User Preferences in Settings.
+- After applying the filter, click Favorites > Save Current Search. **(True)**
+- Save the filter as a custom view in Developer Mode.
+
+### 7. How many languages can be installed in an Odoo database?
+
+- Only one at a time.
+- Multiple languages can be installed; there is no limit. **(True)**
+- Only a maximum of 3 languages can be installed and then the subscription needs to be modified.
+
+### 8. How do you access the technical menu?
+
+- Go to the Settings module and it automatically appears there.
+- Load the technical module from the Apps module and it will be accessible.
+- Activate developer mode and go to the Settings module. **(True)**
+
+### 9. In a multi-company setup, how can you allow a customer record to be shared across all companies?
+
+- This is not possible because each customer is restricted to a single company.
+- Leave the "Company" field empty on the contact record (Sales & Purchase Tab). **(True)**
+- Enable an option called Accessible to Everyone on the contact.
+
 ---
 
 ## Users & Permissions (1 question)
@@ -39,7 +75,7 @@
 
 ---
 
-## Inventory (22 questions)
+## Inventory (50 questions)
 
 ### 1. Which of the following statements is TRUE about products with the product type set to 'Goods' and the Track Inventory field unchecked?
 
@@ -312,9 +348,63 @@
 - The order is waiting for products to be available before it can be shipped
 - The 'Validate' button never appears in purple
 
+### 43. Which of the following is NOT a 'Variant Creation' option while creating product attributes?
+
+- Instantly
+- Formula-based **(True)**
+- Dynamically
+
+> The valid Odoo 19 modes are Instantly, Dynamically, and Never; both "Automatically" and "Formula-based" are invalid distractors.
+
+### 44. Where is the "Count Entire Locations" Barcode feature configured?
+
+- In Inventory > Configuration > Settings, under the Barcode section, enable the "Count Entire Locations" feature
+- Go to the Locations configuration page and enable the "Count Entire Locations" feature
+- In the Barcode app, click "Count inventory", click the gear icon (settings) menu, and enable "Count Entire Locations" **(True)**
+
+### 45. A product is tracked by lot numbers, and there are three quantities of Lot 123 on hand, each valued at 50, 35, and 35 USD per unit, with 35 USD being the most recently received value. If you perform an inventory adjustment to increase the quantity of Lot 123 from 3 to 5 units, what will be the updated valuation per unit?
+
+- 40
+- 50
+- 35 **(True)**
+
+> When increasing inventory via adjustment with FIFO/AVCO, the new units are valued at the most recent receipt's unit cost (35 USD), not the average.
+
+### 46. You notice that products are being selected using the FIFO strategy from WH/Stock/A, B, and C. But, you want them taken from A first, then B, then C. How would you configure this behavior?
+
+- Assign a custom Removal Strategy rule to WH/Stock/A with the highest priority
+- Set the Removal Strategy to "Closest Location" on WH/Stock/A to prioritize it
+- Set the Removal Strategy to "Closest Location" on WH/Stock to prioritize based on alphanumeric order **(True)**
+
+### 47. You create two automatic reordering rules for the same product—one for Warehouse A (Buy route) and one for Warehouse B (Manufacturing route). What happens when stock drops below the minimum in Warehouse B?
+
+- The rule fails because only one reordering rule is allowed per product
+- Odoo uses the first rule (Buy route) because it prioritizes it over Manufacturing
+- Triggers a manufacturing order according to the second reordering rule **(True)**
+
+### 48. Your warehouse is set up to deliver in three steps: pick, pack, and ship. In the 'Pick' step, you are supposed to pick 10 chairs and 5 desks, but you accidentally pick 15 chairs and 2 desks. You select 'No Backorder' during the process. What will be the result in the 'Pack' step?
+
+- 15 chairs, 2 desks **(True)**
+- 10 chairs and 5 desks
+- 10 chairs, 2 desks
+
+> The Pack step receives whatever was actually picked in the Pick step, since "No Backorder" was selected and the actual transferred quantities continue downstream.
+
+### 49. You're reviewing the Forecasted report for a product that's running low. The "Time to Replenish" field shows 5 days. What does this tell you?
+
+- You have 5 days to decide to replenish before your stock runs into critically low levels
+- The product can't be replenished sooner than 5 days because the vendor is out
+- If you order today, the product would arrive in 5 days, based on today's date and configured lead times **(True)**
+
+### 50. When reusable packages are utilized during the Pick operation in a two-step delivery process, what happens to the package during the delivery step?
+
+- There is no destination package set in the second step. **(True)**
+- The package is used as source and destination package
+- There is no difference between disposable and reusable package types
+
 ---
 
-## MRP (21 questions)
+## MRP (28 questions)
 
 ### 1. How are the costs of by-products accounted for?
 
@@ -336,8 +426,8 @@
 
 ### 4. Your MPS shows a forecasted demand of 110 units for a product with a BoM Batch Size of 40. What happens when you click "Order"?
 
-- 3 MOs are created, with 40 units in two MOs, and 30 units in the third MO **(True)**
-- 3 MOs are created, 40 units each
+- 3 MOs are created, with 40 units in two MOs, and 30 units in the third MO
+- 3 MOs are created, 40 units each **(True)**
 - 4 MOs with 30 each
 
 ### 5. How do you configure a manufacturing product for subcontracting?
@@ -442,6 +532,48 @@
 - `stock.valuation.layer`
 - `mrp.workorder.group`
 
+### 22. What do the "Setup Time" and "Cleanup Time" fields on a work center configuration page do?
+
+- They add extra minutes to the duration of operations performed at that work center **(True)**
+- They add the same number of minutes to all operations across the company
+- They represent periods where labor cost is reduced because employees aren't performing active work
+
+### 23. When an analytic account is assigned to a MO, how are the related costs recorded?
+
+- Finished products are posted as revenue, while consumed components appear as costs, and labor is billed through timesheets
+- Consumed components and labor costs are recorded as expenses on the linked analytic account (project) **(True)**
+- Finished products and by-products are recorded as revenue on the analytic account
+
+### 24. A MO produces 5 products tracked by serial numbers. How do you generate serial numbers for all finished products?
+
+- Enable the "Custom Lot/Serial" feature for the product, then click "Generate Serial". This creates five serial numbers in the Lot/Serial Number field **(True)**
+- It's not possible to have more than one serial number in the "Lot/Serial Number" field, so Odoo creates backorders for the remaining four unassigned serial numbers
+- You must manually create five separate Manufacturing Orders, each for quantity 1
+
+### 25. When alternative work centers are configured, which work center will Odoo select for work orders?
+
+- The work center with the highest capacity
+- The work center with the lowest cost per hour **(True)**
+- The work center that will finish the task the soonest
+
+### 26. You've configured your manufacturing process to happen in two steps: pick components, and then manufacture. You decide to produce more, what happens with the pre-production picking?
+
+- Nothing at first, and once you confirm the picking, a backorder is created to make up the missing quantities
+- The component quantities are updated to reflect the new quantities needed **(True)**
+- A warning is raised to reflect that the original quantity does not fulfill the updated demand
+
+### 27. Which of the following is true about splitting/merging manufacturing orders?
+
+- Only manufacturing orders of identical products with the same BoM may be merged **(True)**
+- Only manufacturing orders in the draft state may be merged
+- Only manufacturing orders of even quantities may be split
+
+### 28. What does it mean when a work center is "fully productive"?
+
+- The work center is operational
+- The work center is processing a work order within its expected duration **(True)**
+- The work center is processing multiple work orders
+
 ---
 
 ## POS (3 questions)
@@ -466,7 +598,7 @@
 
 ---
 
-## HR (5 questions)
+## HR (9 questions)
 
 ### 1. How would you set up a mechanism where the amount of time off an employee gets depends on their number of days worked?
 
@@ -498,9 +630,33 @@
 - In the Employees app dashboard, click Presence Icon > Absent **(True)**
 - On the Employee record, click Actions > Presence Control > Set Absent
 
+### 6. What is true about a "Mandatory Day" in the Time Off Application?
+
+- Any requests for time off during Mandatory Days will automatically require secondary approval
+- Users without Admin Rights in the Time Off App are not allowed to request time off on a Mandatory Day **(True)**
+- Users are warned prior to submitting their request on a Mandatory Day that their request may be rejected.
+
+### 7. In the Employees app, what does the History smart button do?
+
+- Allows you to revert to any previous contract
+- It shows all versions of the Employee record, and allows you to view past records **(True)**
+- Shows all payslips for the employee, grouped by job title and salary
+
+### 8. When creating an Onboarding Plan activity, how can you configure a specific user to be automatically assigned to an activity?
+
+- Set the Assignment field to 'Default user,' and then select the specific user. **(True)**
+- Set the Assignment field to 'Ask at launch' and then select the user when the plan is launched
+- Only one user is assigned to a plan, and other users can be selected for individual tasks after the plan is launched
+
+### 9. How does the Lunch app determine which vendor's products to display on any given day?
+
+- Based on the 'Availability' configured on the Vendor form. **(True)**
+- Based on the 'Orders' section on the vendor form.
+- Based on the 'Product Category' on the product form.
+
 ---
 
-## Spreadsheet (3 questions)
+## Spreadsheet (5 questions)
 
 ### 1. Which of the following is an advantage of converting an inserted pivot table into a dynamic pivot table?
 
@@ -520,9 +676,21 @@
 - You need to duplicate the dashboard and assign each copy to a single company
 - This is not possible; any dashboard is visible to all companies present in the database
 
+### 4. In the Data menu, what does a warning symbol beside the data source of an inserted list or pivot table mean?
+
+- There is a problem preventing the data in the list or pivot table being updated automatically.
+- The number of records in the list or pivot table exceeds the maximum allowed, impacting performance.
+- There is no list or pivot table related to that data source present in the spreadsheet. **(True)**
+
+### 5. On a dashboard, what additional feature is available when a time-series chart is expanded to full screen?
+
+- It is possible to edit the chart's data source directly from the full-screen view.
+- It is possible to zoom in on a specific time span and scroll forwards and backwards in time. **(True)**
+- Real-time data streaming shows live updates to the data while the chart is expanded.
+
 ---
 
-## Accounting (20 questions)
+## Accounting (29 questions)
 
 ### 1. A customer invoice with two lines, each with the same account and same 10% tax, is validated. How many items will the generated journal entry have?
 
@@ -551,8 +719,8 @@
 ### 5. Where is the Catalog view available?
 
 - On invoices
-- On vendor bills **(True)**
-- On invoices and vendor bills
+- On vendor bills
+- On invoices and vendor bills **(True)**
 
 ### 6. What information can you define on a contact record?
 
@@ -644,9 +812,63 @@
 - The fiscal position created most recently
 - The fiscal position linked to the product category
 
+### 21. What happens when you reconcile a bank transaction with a customer invoice using the bank reconciliation tool?
+
+- Odoo creates a new journal entry for the payment and does not change the account of any existing journal entry.
+- Odoo updates the bank transaction's journal entry to replace the suspense account with the account receivable of the invoice. **(True)**
+- Odoo updates the invoice journal entry to replace the account receivable with the suspense account of the bank transaction.
+
+### 22. How can you modify a posted journal entry's number?
+
+- You can modify a single posted journal entry's number by resetting it to draft and manually changing the number, or you can change them en masse by going into developer mode, selecting the journal entries, and selecting Resequence from the action menu. **(True)**
+- Odoo will only allow users with Bookkeeper access rights to modify it.
+- You can modify a single posted journal entry's number by going into developer mode and manually changing the number.
+
+### 23. Which feature allows you to automatically change the income or expense account that a product should use based on the customer or vendor?
+
+- Fiscal Positions. **(True)**
+- Fiscal Localizations.
+- Account Groups.
+
+### 24. What happens when you try to confirm a bill with an Accounting Date before the Lock Tax Return date?
+
+- Odoo will only allow users with Administrator access rights to confirm the bill.
+- Odoo will allow you to post the bill, but it will alert you that the tax period is locked.
+- Odoo will automatically set the Accounting Date to today. **(True)**
+
+### 25. How can you create financial budgets?
+
+- Set up analytic plans and accounts first, then create a budget via Accounting > Accounting > Analytic Budget. **(True)**
+- Go to Accounting > Reporting > Profit and Loss, then click the Budget button.
+- Go to Accounting > Reporting > Balance Sheet, and select the period.
+
+### 26. How can you register a payment for the full amount of an invoice that uses a payment method with installments?
+
+- The default amount that is set when registering a payment is the full amount.
+- By manually entering the full amount on the payment wizard or by clicking on "full amount". **(True)**
+- Registering the full payment amount must be done in multiple payments to respect the payment method's installments.
+
+### 27. How can you configure payments to create journal entries automatically?
+
+- Payments automatically create journal entries by default.
+- Enable the "Auto check on post" option in the journal that is used to record the payment.
+- By adding an outstanding payments/receipts account to the payment method in the journal that is used to record the payment. **(True)**
+
+### 28. How can you set a lock date for only vendor bills?
+
+- Set the Journal Entries Lock Date.
+- Set the Lock Bills date.
+- Set the Lock Purchases date. **(True)**
+
+### 29. In perpetual accounting, when purchasing goods to sell them, which actions generate journal entries?
+
+- Confirming the vendor bill and confirming the customer invoice.
+- Confirming the vendor bill, validating the delivery order, and confirming the customer invoice.
+- Validating the receipt, confirming the vendor bill, validating the delivery order, and confirming the customer invoice. **(True)**
+
 ---
 
-## Timesheets (12 questions)
+## Timesheets (14 questions)
 
 ### 1. What does it mean when a timesheet line is in italics?
 
@@ -720,9 +942,21 @@
 - For all employees in Timesheets settings
 - In the Billing Rate Leaderboard
 
+### 13. What happens when you click one of the lettered-buttons (e.g., a, b, c) on the left of a timesheet?
+
+- You open the task linked to the timesheet
+- You open the project linked to the timesheet
+- You launch the related task's timer **(True)**
+
+### 14. On the "All Timesheets" view, what does it mean when a duration is in orange?
+
+- It means the employee worked overtime on that day
+- It means the employee took time off on that day
+- It means the employee worked undertime on that day **(True)**
+
 ---
 
-## Project (14 questions)
+## Project (17 questions)
 
 ### 1. How are tags shared between tasks?
 
@@ -751,8 +985,8 @@
 ### 5. What does the blue color represent in the bar at the top of a Kanban stage?
 
 - Sub-tasks
-- Unassigned tasks **(True)**
-- Tasks blocked by other tasks
+- Unassigned tasks
+- Tasks blocked by other tasks **(True)**
 
 ### 6. When creating a task from a project's Kanban view, adding "24h" to the task title will:
 
@@ -807,9 +1041,27 @@
 - Milestones have to be manually marked as reached **(True)**
 - Milestones are automatically marked as reached when all of their tasks are done
 
+### 15. What is not carried over from the original task when a recurring task is created?
+
+- Tags
+- Activities **(True)**
+- Assignees
+
+### 16. When automatically rescheduling dependent tasks from the Gantt view, which information related to assignees is not taken into account?
+
+- Time off
+- Working hours
+- Calendar **(True)**
+
+### 17. When is a milestone displayed in green?
+
+- When the milestone's deadline is today
+- When all its tasks have been marked as done or canceled
+- When the milestone is marked as reached **(True)**
+
 ---
 
-## Knowledge (4 questions)
+## Knowledge (6 questions)
 
 ### 1. Which article does Knowledge open when you first open the app?
 
@@ -835,6 +1087,18 @@
 - Restore the article from the 'Archived' articles
 - Restore the article from the 'Trash'
 
+### 5. Which types of content can you include within the HTML body field of an article?
+
+- Text, images, external links, records, and pre-configured templates **(True)**
+- Only plain text, images, and embedded PDF documents
+- Only text and basic formatting
+
+### 6. Which of the following commands allows for hiding and showing a block of content?
+
+- Index
+- Toggle list **(True)**
+- Separator
+
 ---
 
 ## eCommerce (10 questions)
@@ -853,7 +1117,7 @@
 
 ### 3. Where can you automate Ribbons and Badges? How many 'assign' options do you have?
 
-- On the back-end, in Product Ribbons. When a Ribbon is selected, you can choose an option between 'Manually', 'On Sale', 'When new' or 'When out of stock' **(True)**
+- On the back-end, in Product Ribbons. When a Ribbon is selected, you can choose an option between 'Manually', 'On Sale', 'When new' or 'When out of stock' **(True — best of three; location is correct, but actual options in v19 are only 'Manually', 'On Sale', 'When New' — there is no 'When out of stock' option)**
 - On the back-end of a specific product only, in the Sales tab, you can choose an option between 'Manually', 'On Sale', 'When new' or 'When out of stock'
 - On the back-end of a specific product only, in the Attributes & Variants tab, you can choose an option between 'Manually', 'On Sale', 'When new'
 
@@ -901,7 +1165,7 @@
 
 ---
 
-## Website (8 questions)
+## Website (11 questions)
 
 ### 1. Is it possible to hide a building block for a specific language?
 
@@ -951,9 +1215,27 @@
 - Select the text and use one of various highlight options **(True)**
 - Select the text, use the brush and add background color and form
 
+### 9. What does the 'Optimize SEO' tab do?
+
+- It generates a title, a description of the page, a cover image, and hidden keywords for search engine results. **(True)**
+- It translates the URLs in different languages.
+- It allows you to modify your URLs.
+
+### 10. In the 'Optimize SEO' tool, can you choose to fill some fields with AI?
+
+- Yes, but only the title and description.
+- Yes, but only keywords.
+- Yes: title, description, and keywords can be filled with AI. **(True)**
+
+### 11. How can you hide the header and/or footer on pages?
+
+- You can do this upon activating developer mode.
+- You can do this in the website editor, in the Styles tab. **(True)**
+- You can do this in the website editor, in the Blocks tab.
+
 ---
 
-## Marketing (8 questions)
+## Marketing (10 questions)
 
 ### 1. In Odoo, 'UTM' is used as an abbreviation for:
 
@@ -1003,9 +1285,21 @@
 - Revenues
 - Opportunities **(True)**
 
+### 9. Can you send a mailing to multiple mailing lists at once?
+
+- Yes **(True)**
+- Yes, but only if you're a developer with the proper access rights.
+- No
+
+### 10. In SMS Marketing, under the 'A/B Tests' tab on a message form, which metric is available for selecting the winning email?
+
+- Highest Click Rate **(True)**
+- Forwards
+- Bounces
+
 ---
 
-## CRM (18 questions)
+## CRM (23 questions)
 
 ### 1. What happens to an opportunity that is marked as 'Lost'?
 
@@ -1070,8 +1364,8 @@
 ### 11. What happens when you click one of the colored bars at the top of a CRM pipeline kanban stage?
 
 - Nothing happens
-- Odoo only displays opportunities in that stage that share the same color-code, which represents its current Activity Status
-- It only displays opportunities with a specific activity status (Planned, Today, Overdue) for all stages **(True)**
+- Odoo only displays opportunities in that stage that share the same color-code, which represents its current Activity Status **(True)**
+- It only displays opportunities with a specific activity status (Planned, Today, Overdue) for all stages
 
 ### 12. What is the impact of setting a sales team on a pipeline stage?
 
@@ -1113,9 +1407,40 @@
 - Navigate to Configuration > Sales Teams, click 'Update Probabilities' beneath the 'Predictive Lead Scoring' setting, and proceed to customize criteria
 - (In Developer Mode) Click Reporting > 'Update Probabilities', and proceed to customize criteria
 
+### 19. A user with the access rights User: Own Documents Only can work with which leads?
+
+- All leads, if the user is in Developer Mode.
+- Leads that were created in the previous year.
+- Leads that are assigned to them, or not yet assigned to anyone. **(True)**
+
+### 20. Which of the following is not a way to create a lead from your website in Odoo?
+
+- Set the action on the Contact Us form to Create an Opportunity.
+- Set the action on the Appointments form to Create an Opportunity.
+- Set the action on the Shop form to Create an Opportunity. **(True — NOT a way)**
+
+### 21. How can you set the Days to Rot for a stage in the CRM pipeline?
+
+- Click the gear icon on the stage, select Edit, and enter the number of days in the Days to Rot field. **(True)**
+- Open any opportunity in that stage and set the number of days in the Days to Rot field on the record itself.
+- Go to Configuration > CRM Settings and define a default number of days that applies to all stages in the pipeline.
+
+### 22. How are leads from external sources, such as an email alias, automatically handled in Odoo?
+
+- They are automatically assigned to the sales team leader to ensure follow-up.
+- They remain unassigned until a salesperson manually claims them. **(True)**
+- They are assigned randomly to any available salesperson.
+
+### 23. When you convert a CRM Opportunity into a Sales Quotation, what happens automatically by default?
+
+- The opportunity is archived
+- A new customer record is always created
+- The quotation is linked to the opportunity and the pipeline stage updates **(True)**
+- An invoice is generated immediately
+
 ---
 
-## Survey (4 questions)
+## Survey (6 questions)
 
 ### 1. What is a 'Matrix' question?
 
@@ -1126,8 +1451,8 @@
 ### 2. In the 'Options' tab of a survey form, what are the 'Display Progress as' options?
 
 - 'Percentage left' and 'Progress bar'
-- 'Percentage left' and 'Number'
-- 'Progress bar' and 'Number' **(True)**
+- 'Percentage left' and 'Number' **(True)**
+- 'Progress bar' and 'Number'
 
 ### 3. What does the Allow Roaming option let participants do during a survey?
 
@@ -1141,9 +1466,21 @@
 - Scoring without Answers
 - Matrix Questions
 
+### 5. How can a survey conclude with a custom message for participants?
+
+- Enter a custom message in the Description tab of the survey form.
+- Enter a custom message in the Confirmation email settings instead of the survey itself.
+- Enter a custom message in the End Message tab of the survey form. **(True)**
+
+### 6. Which of the following question types cannot be used to generate leads on a Survey?
+
+- Multiple Choice: only one answer.
+- Single line text box.
+- Matrix. **(True)**
+
 ---
 
-## Sales (22 questions)
+## Sales (30 questions)
 
 ### 1. Assuming you have enough stock to fulfill an order, what will the scheduled delivery date be when a sales order is confirmed on September 1st -- for a product that has a customer lead time of 5 days, and a security lead time of 2 days?
 
@@ -1202,8 +1539,8 @@
 ### 10. What is a valid configuration for an achievement-based commission plan?
 
 - 10% of all sales to a specific customer each quarter
-- $1,000 for reaching $25,000 in sales each month **(True)**
-- 5% of the margin of all sales across a specific product category over the course of a year
+- $1,000 for reaching $25,000 in sales each month
+- 5% of the margin of all sales across a specific product category over the course of a year **(True)**
 
 ### 11. A product uses the 'Delivered quantities' invoicing policy. When does Odoo allow you to create the invoice?
 
@@ -1277,9 +1614,59 @@
 - Sales order lines can show both the unit price and cost price of the product, as well as the margin, by calculating the difference between the unit price and the cost price **(True)**
 - Margins will only display on confirmed sales orders, not on quotations
 
+### 23. What does it mean when a product has both the "Purchase" checkbox and the "Replenish on Order (MTO)" checkbox in the Inventory tab checked on its product form?
+
+- When a reordering rule set on the product is triggered, a manufacturing order will be generated if there is not sufficient inventory
+- When a sales order is confirmed, a Request for Quotation to purchase the product from a vendor will be generated if there is not sufficient inventory **(True)**
+- When inventory for the product reaches 0, a Request for Quotation will be sent to a vendor to have them come and assemble more of the product in your warehouse
+
+### 24. If you confirm a quotation with a "Goods"-type product that has an invoicing policy set to 'Delivered quantities,' which of the following is true?
+
+- A draft Regular invoice can be generated while a delivery order is in the 'Ready' stage
+- The option to create a Regular draft invoice is only available after a delivery order has been processed **(True)**
+- A Regular draft invoice is automatically generated after a delivery order has been processed
+
+### 25. Where can you see the profit margin for a given sales order?
+
+- Margins are only calculated for all of the orders in each quarter
+- Margins for a sales order can be found on the sales order itself, so long as the "Margins" checkbox has been ticked in the Sales app settings **(True)**
+- Margins can only be viewed by going to the Reporting header and clicking "Margins"
+
+### 26. What's the best way to set up the product form for a product where a consultant will come to the customer's location and conduct a home appraisal?
+
+- This should be set up with the Product Type "Goods" and the Invoicing Policy "Delivered quantities"
+- This should be set up with the Product Type "Service" and the Invoicing Policy "Prepaid/Fixed Price" since the consultant is providing a one-time service **(True)**
+- This should be set up with the Product Type "Combo"
+
+### 27. Which of the following products would it make sense to classify as a Service with the "Based on Milestones" Invoicing Policy?
+
+- An order for 100 office chairs intended to be delivered 10 at a time
+- A kitchen remodeling where the work is planned to be broken up into discrete, measurable deliverables **(True)**
+- A car engine repair where the cause of the problem is unknown and a considerable amount of time will be spent diagnosing and troubleshooting before repairs can begin
+
+### 28. Which of the following is NOT a valid option when setting an achievement-based commission plan for your team?
+
+- A plan based on the total amount of sales invoiced
+- A plan based on the total amount of sales quoted **(True — NOT valid)**
+- A plan based on the total quantity of products sold
+
+### 29. You want to show your customers additional products they may be interested in upon checkout, which feature can you use?
+
+- Alternative products
+- Optional products
+- Accessory products **(True)**
+
+> Accessory products are shown in the cart review / checkout step. Optional products are shown on the quotation/sales order. Alternative products are shown on the product page.
+
+### 30. How can you prevent people from buying published products on your eCommerce and make sure they contact you?
+
+- Go to the Style tab on the product page and toggle off display price.
+- Enable the 'Prevent Sale of Zero Priced Product' feature in the website settings. If the product price equals 0, it replaces the 'Add to Cart' button with a 'Contact us' button. **(True)**
+- Go to the Style tab on the product page, toggle off display price, and add a form building block.
+
 ---
 
-## AI (5 questions)
+## AI (10 questions)
 
 ### 1. Which of the following can be used as Sources for an AI Agent?
 
@@ -1311,9 +1698,39 @@
 - A maximum of five active agents per user
 - As many as needed, there's no fixed limit **(True)**
 
+### 6. What is the purpose of AI Tools in Odoo's AI framework?
+
+- To provide extra data sources for the agent to read from.
+- To limit the agent's output to predefined templates.
+- To extend the AI Agent's capabilities beyond text generation, allowing it to perform defined actions or functions. **(True)**
+
+### 7. What are Topics used for in Odoo's AI system?
+
+- To organize collections of tools and instructions that guide how the AI interacts with users. **(True)**
+- To define which users can access the AI Agent.
+- To restrict the AI's access to certain documents.
+
+### 8. In an AI Agent prompt, what is the purpose of using /field selector?
+
+- To reference or update specific fields from a record directly within the prompt. **(True)**
+- To create a shortcut for adding new custom fields to a model.
+- To insert predefined text snippets stored in the Knowledge app.
+
+### 9. What does the "Ask AI Search" feature do?
+
+- To turn a plain-language search into the right database filters automatically. **(True)**
+- To generate AI suggestions for improving your search terms.
+- To search only within Knowledge articles and uploaded files.
+
+### 10. When you open a conversation with an AI Agent, what information does it automatically know about the record?
+
+- Only the record name and user's message.
+- It can access the field values of the record you're viewing, unless restricted by configuration. **(True)**
+- It only knows what's stored in its Sources.
+
 ---
 
-## Studio (6 questions)
+## Studio (11 questions)
 
 ### 1. In the Form view, what is the key difference between a Primary button and a Secondary button?
 
@@ -1351,9 +1768,39 @@
 - When setting up an approval step, click the filter icon and define the relevant conditions **(True)**
 - After the basic approval rule is set up, create an automation rule to further define the circumstances in which it applies
 
+### 7. In which types of views can you add 'New Fields' using Studio?
+
+- Form and List views only.
+- Form, List, and Kanban views.
+- All views available for the specific model. **(True)**
+
+### 8. When setting up an approval step on a button, which option, if enabled, prevents a user who approves one step from approving any other step on the same record?
+
+- Exclusive Approval. **(True)**
+- Approval Order.
+- Sequential Approval.
+
+### 9. How can you trigger an automated action only upon the creation of a record?
+
+- Set the Trigger to 'On create'. **(True)**
+- Set the Trigger to 'On save' and use 'ID is not set' as the 'Before Update Domain' and 'ID is set' as the 'Apply on' domain.
+- Set the Trigger to 'Values Updated' and select 'Creation Date' as the field to watch.
+
+### 10. How frequently does the Odoo scheduler check for time-triggered automation rules?
+
+- The scheduler checks every 240 minutes (4 hours), irrespective of the 'Delay' after which the action should be triggered. **(True)**
+- If any time-triggered rule has a 'Delay' of less than 2400 minutes (40 hours), the frequency of the check is recalculated to respect the delay more closely.
+- The scheduler checks every minute when the database is at low load, rising to maximum 5 minutes when the database is under peak load.
+
+### 11. When updating a record using AI, how can you insert dynamic values in prompts?
+
+- Right-click, select 'Insert Dynamic Placeholder', then select the field.
+- Type a field's technical name enclosed in curly brackets, e.g., {customer_id}.
+- Type '/' then click 'Field selector' and select the field. **(True)**
+
 ---
 
-## Purchase (20 questions)
+## Purchase (29 questions)
 
 ### 1. You configure a product to calculate its cost on a 'Standard Price' basis, and you currently have 8 units of it in stock, with a cost of $100/unit. If you were to purchase and receive 2 more units at a price of $10/unit, what will your new cost be?
 
@@ -1474,6 +1921,62 @@
 - This will be known at reception only
 - Today +20 days
 - Today +15 days **(True)**
+
+### 21. Why is a line highlighted in red in a purchase order? *(image-based question)*
+
+- The product is currently out of stock.
+- This PO line will exceed the analytic budget if confirmed. **(True)**
+- The product is not available for delivery in the requested quantity.
+
+### 22. After the buyer confirms a purchase order, how does the seller create a corresponding sales order using EDI?
+
+- The buyer's database automatically pushes the PO into the seller's sales orders list **(True)**
+- The seller downloads the XML from the buyer's portal and uploads it in their Sales app
+- In the email the seller receives, the seller clicks the "Download" button and uploads the downloaded PDF to the Sales dashboard
+
+### 23. When using a Blanket Order, are you able to order more than what was originally specified in the Purchase Agreement?
+
+- Yes **(True)**
+- Yes, but only if you are an administrator
+- No
+
+### 24. What will the Expected Arrival date be if you validate a sales order on October 25th with a MTO route, with a 'Customer Lead Time' set to 10 Days and 'Vendor Lead Time' set to 6 Days?
+
+- October 31 (6 days later)
+- November 4 (10 days later) **(True)**
+- October 25 (0 days later)
+
+> Note: question #18 in this section asks for the *scheduled purchase order date* (Oct 25 + (10-6) = Oct 29), while this one asks for the *expected arrival* (Oct 25 + 10 = Nov 4).
+
+### 25. Can you combine multiple purchase orders into one vendor bill?
+
+- Yes **(True)**
+- Yes, after the "Combine POs" setting is activated
+- No
+
+### 26. When you purchase new products, how is the Expected Arrival date computed on new PO lines?
+
+- Order Date - Vendor Lead Time - Company Security Days
+- Order Date + Vendor Lead Time
+- Order Date + Vendor Lead Time + Company Security Days **(True)**
+
+### 27. Once you validate a purchase order, is it still possible to add purchase order lines?
+
+- Yes, as long as the purchase order is not 'Locked' **(True)**
+- Yes, as long as the purchase order hasn't been sent to the customer
+- No, never
+
+### 28. When creating a new 'Blanket Order', can you configure the purchase agreement to expire on a specific date?
+
+- No, a 'Blanket Order' can only be deleted or archived manually after being created
+- Yes, by entering the desired date in the 'Agreement validity' field **(True)**
+- Yes, by changing the 'Expiration Date' of the products included on the individual product forms
+
+### 29. When creating a new request for quotation (RFQ), are you able to link it to an existing RFQ as an alternative?
+
+- No, alternative RFQs must be created from the 'Alternatives' tab of an existing, pre-populated RFQ with a listed vendor and products **(True)**
+- No, Odoo does not allow multiple RFQs to be linked to each other unless the same vendor is listed on each
+- Yes, by clicking 'Link to Existing RfQ', under the 'Alternatives' tab on a new request for quotation
 
 ---
 
@@ -2588,7 +3091,7 @@
 
 ### 79. What actions are available when defining a follow-up?
 
-- Email, SMS, letter, WhatsApp. **(True)**
+- Email, SMS, letter, WhatsApp. **(True — best of three; in Odoo 19 follow-up actions are `send_email`, `send_sms`, `send_letter`, and `manual_action`. WhatsApp is NOT a follow-up channel — but every other answer choice has its own incorrect action listed, so this is the closest match.)**
 - Email, SMS, voicemail, letter.
 - Email, SMS only.
 
@@ -2915,3 +3418,749 @@
 - Validated timesheets are automatically forwarded to the project manager by email.
 
 ---
+
+
+### 1. What is the difference between a message/discussion and a log note in the chatter?
+
+- A message/discussion is sent to the customer and notifies all the followers, whereas a log note is only seen in the chatter by internal users or via @ mentions. **(True)**
+- Messages/discussions are sent to customers via email from Odoo while log notes are only sent via Odoo internal notifications to customers.
+- There is no difference between a message/discussion and a log note in Odoo.
+
+---
+
+### 2. What option in Odoo can help a user better protect their account?
+
+- VPN (Virtual Private Network)
+- Use an incognito browser window
+- 2FA (Two-Factor Authentication) **(True)**
+
+---
+
+### 3. What needs to be done prior to using a WhatsApp template?
+
+- Nothing, WhatsApp templates can be used immediately after creating them.
+- The template needs to be approved by Meta, WhatsApp's parent company. **(True)**
+- The WhatsApp template needs to be set to production in the technical settings (using developer mode).
+
+---
+
+### 4. What reporting tool is/are available in the 'Settings' of my website to track traffic?
+
+- Plausible
+- Plausible and Google Analytics **(True)**
+- Plausible, Google Analytics and Console Google Search
+
+---
+
+### 5. Are building blocks shared across all themes or specific to each one?
+
+- Building blocks are specific to each theme — that's why you start with the theme selection
+- No. All themes share the same building blocks and features **(True)**
+- Some building blocks are shared between different themes; others don't
+
+---
+
+### 6. When can you configure the 'Lost Reasons' you want your Sales Team to use?
+
+- They are created when the application is installed and can never be modified
+- They can only be set up once before creating any opportunity
+- They can be modified by a user with Sales Administrator access rights at any time **(True)**
+
+---
+
+### 7. Which of the following variables can be used to automatically compute the probability of winning an opportunity?
+
+- Source **(True)**
+- Expected closing date
+- Priority
+
+---
+
+### 8. What does converting a lead mean?
+
+- Creating a lead from a contact card
+- Closing a deal
+- Transforming a lead into an opportunity **(True)**
+
+---
+
+### 9. A meeting activity type is used to:
+
+- Create a meeting in the user's calendar **(True)**
+- Automatically schedule the follow-up task
+- Generate a link for an online conference
+
+---
+
+### 10. Reporting is accessible:
+
+- Only for database admins
+- Only for managers
+- For all CRM users, but the data is filtered based on each user's access rights **(True)**
+
+---
+
+### 11. If the manager of the Pre-Sales team creates a new property field on an opportunity, who can see it?
+
+- Only members of the Pre-Sales team
+- Only managers of other sales teams
+- Anyone who has access to that opportunity **(True)**
+
+---
+
+### 12. Which variables does Odoo always use to calculate the probability of winning an opportunity?
+
+- Stage and Team **(True)**
+- Stage and Email Quality
+- Source and Team
+
+---
+
+### 13. In the next-activity configuration, if the 'Call' activity is marked as done today, and 'Reminder' is set to trigger '7 days after previous activity deadline', what will the deadline of the next 'Reminder' activity be?
+
+- There will be no deadline set
+- 8 days from today
+- 7 days from today **(True)**
+
+---
+
+### 14. Which of the following is NOT true about the relationship between an opportunity and a customer?
+
+- You can create a new customer record before or after you have won the opportunity
+- Once an opportunity is won, you can no longer create a new customer record from the opportunity form **(True)**
+- Opportunities (even won) can exist in the database without a customer record
+
+---
+
+### 15. Duplicating an opportunity will...
+
+- ...create an exact copy of the opportunity in the same stage as the original opportunity **(True)**
+- ...create an exact copy of the opportunity and bring it back to the first stage of the pipeline
+- ...create a copy of the opportunity, but it will be set as a lead
+
+---
+
+### 16. The probability of winning an opportunity is computed based on:
+
+- Aggregated industry benchmarks
+- Data collected from all Odoo databases
+- Data collected from your own database **(True)**
+
+---
+
+### 17. Reporting is accessible (when no 'data filtered' option is shown):
+
+- Only for database admins
+- Only for managers
+- For all CRM users **(True)**
+
+---
+
+### 18. What is one benefit of using the gamification feature?
+
+- Salespeople can design more beautiful quotations
+- Salespeople feel more motivated **(True)**
+- Salespeople get to play mini computer games when they close a deal
+
+---
+
+### 19. Where can individual sales teams' pipelines be accessed?
+
+- Navigate to 'Sales' > 'Teams' > 'Pipeline'
+- Navigate to 'Configuration' > 'Teams' > 'Pipeline'
+- Both A and B **(True)**
+
+---
+
+### 20. Which of the following statements is true regarding a pricelist computation that uses a discount and rounding to make all prices end in '.90'?
+
+- Customers associated with this pricelist will receive a discount of exactly 10% on all products
+- Customers associated with this pricelist will have all prices end in '90' **(True)**
+- Customers associated with this pricelist will have all prices end in '00'
+
+---
+
+### 21. How do you configure a pricelist that gives a progressive discount based on the quantity being ordered by the customer (e.g. 5% discount for 0–9 units; 10% discount for 10 or more units)?
+
+- Create one pricelist with two lines **(True)**
+- Create two pricelists with one line each
+- Create one pricelist with one line, and put the two prices on this line
+
+---
+
+### 22. What does the configuration for a storable product with Routes = Buy + Replenish on Order (MTO) imply?
+
+- When a reordering rule set on the product is triggered, a manufacturing order will be generated
+- When a sales order is confirmed, an RFQ will be generated **(True)**
+- When a sales order is confirmed, a manufacturing order will be generated
+
+---
+
+### 23. What does it mean if the forecasted quantity of a "Goods"-type product is higher than the quantity on hand?
+
+- Nothing, as we do not know the complete history of each product
+- New products are planned to arrive in stock **(True)**
+- There are probably more outgoing products planned than incoming products
+
+---
+
+### 24. What does it mean when a product is labeled under the product type "Combo"?
+
+- When purchasing this product type, the customer can choose one product amongst a selection of multiple **(True)**
+- This product is a combination of a "Good" and a "Service"
+- When purchasing this product, the customer must choose multiple product variants
+
+---
+
+### 25. Regarding pricelists and the unit price of a product in a quotation, which of the following is true?
+
+- When you add a product to a quotation, with pricelists activated, the unit price will be recomputed based on the pricelist configuration
+- Whenever you change the associated pricelist on a quotation, the product's unit price is automatically recomputed
+- Both are true **(True)**
+
+---
+
+### 26. How do I configure a quarterly subscription product?
+
+- There is no such thing as a quarterly subscription product
+- Check the 'Subscriptions' box when configuring the product form. This will enable a billing-period selection window, where you select the 'Quarterly' billing period
+- Head to 'Subscriptions > Configuration > Recurring Plans', and create a new recurring plan with a three-month billing period **(True)**
+
+---
+
+### 27. When confirming a quotation for a storable product with an invoicing policy set to Ordered quantities, which statement is accurate regarding invoice creation?
+
+- A draft invoice can be generated only after a delivery order has been processed.
+- A draft invoice is automatically generated after a delivery order has been processed.
+- A draft invoice can be generated while a delivery order is in the 'Waiting' or 'Ready' stage. **(True)**
+
+---
+
+### 28. A customer is associated with the Pricelist1 pricelist. If you create a quotation for this customer and switch the pricelist to Pricelist2 before adding any products, which pricelist will determine the price of the sales order lines?
+
+- A price from the Pricelist1 pricelist.
+- The system issues a warning and requests the correct pricelist be applied.
+- A price from the Pricelist2 pricelist. **(True)**
+
+---
+
+### 29. How can you configure separate invoice and delivery addresses for contacts in Odoo?
+
+- In Developer mode, navigate to the Sales app settings (under the Configuration menu), select 'Customer Addresses', and make all necessary adjustments.
+- On a contact form, under the 'Contacts & Addresses' tab, click 'Add' and enter specific addresses for different purposes. **(True)**
+- No, this isn't possible with Odoo.
+
+---
+
+### 30. How do I reopen a canceled subscription?
+
+- Head to 'Configuration' > 'Settings' > 'Subscriptions', and reopen from there.
+- On the canceled subscription, click the 'Reopen' button on the top **(True)**
+- Contact the customer directly, and have them submit a ticket to Helpdesk.
+
+---
+
+### 31. When should you use 'Service' as the product type in Odoo?
+
+- When the product being sold is kept in a warehouse.
+- When the product being sold has to be purchased from a vendor.
+- When the product being sold is a non-material product **(True)**
+
+---
+
+### 32. Why might a product configured under 'Sales' and available for sales quotations not appear in your eCommerce shop?
+
+- Products cannot be sellable on a sales quotation and an eCommerce website at the same time.
+- It is under the eCommerce minimum price of $10
+- Under 'eCommerce Shop' in the Sales tab, you need to check the 'Is Published' option or toggle it from 'Unpublished' to 'Published' on your website **(True)**
+
+---
+
+### 33. How can you configure an upsell product to appear at the bottom of another product page in your eCommerce store?
+
+- There is no way to add an upsell product to the bottom of a product page in the eCommerce store.
+- In your eCommerce website, drag and drop the product from the Odoo product page (open on a separate tab).
+- In the 'Sales' tab of your eCommerce product, enter the upsell product in the 'Alternative Products' field **(True)**
+
+---
+
+### 34. Which Sales setting must be activated to manage promotions, coupons, loyalty cards, gift cards, and eWallets in Odoo?
+
+- Loyalty
+- Discounts & Gift Cards
+- Discounts, Loyalty & Gift Card **(True)**
+
+---
+
+### 35. How can you configure a product to offer a yearly subscription in Odoo?
+
+- "There is no such thing as a yearly subscription product."
+- Check the 'Subscriptions' box when configuring the product form.
+- In Developer mode, navigate to the Sales app settings and make adjustments.
+- Head to 'Subscriptions -> Configuration -> Recurring Plans', and create a new recurring plan with a yearly billing period. **(True)**
+
+---
+
+### 36. When generating gift cards in Odoo, for whom can they be created?
+
+- Anonymous Customer
+- Selected Customers
+- Both **(True)**
+
+---
+
+### 37. How would you configure a promotion in Odoo to offer the following: "Receive a free Black embroidered t-shirt with purchases of $100 or more"?
+
+- Create a Conditional Rule with min. purchase $100 and Reward Type = 'Free Shipping'.
+- Create a Conditional Rule with min. quantity = 100 and Reward Type = 'Discount'.
+- Create a Conditional Rule with min. purchase $100 and Reward Type = 'Free Product'. Then, create or select 'Black embroidered t-shirt' in the Product field. **(True)**
+
+---
+
+### 38. If a sales order is confirmed on December 1st, and the product has a customer lead time of 7 days and a security lead time of 2 days, what will the scheduled delivery date be?
+
+- December 6th
+- December 10th
+- December 8th **(True)**
+
+> Calculation: `expected_date = date_order + customer_lead = Dec 1 + 7 = Dec 8`. Security lead time is **subtracted** to compute the picking's `date_planned` (internal scheduling buffer), it is never added to the customer-facing delivery date. Source: `addons/sale/models/sale_order_line.py` `_expected_date()` and `addons/sale_stock/models/sale_order_line.py` (`date_planned = date_deadline - security_lead`).
+
+---
+
+### 39. When is it most appropriate to use 'Order Grid Entry' as the sales variant selection type for a product?
+
+- When salespeople typically recommend specific product variants to clients.
+- When clients want their sales orders organized in a grid.
+- When salespeople often create large quotations with many product variants for clients. **(True)**
+
+---
+
+### 40. What conclusion can be drawn if the forecasted quantity of a storable product is lower than the quantity currently on hand?
+
+- There is no significance because the complete product history is unknown.
+- There are more products scheduled to be shipped out than those expected to arrive. **(True)**
+- New products are planned to arrive in stock.
+
+---
+
+### 41. How can you configure Odoo to display the product 'Aperol Spritz' as a suggested option when a customer adds the product 'Cabinet with Doors' to their shopping cart in the online store?
+
+- List the Aperol Spritz as an 'Optional Product' on the Cabinet with Doors's product form (under 'Sales' tab) **(True)**
+- List the Aperol Spritz as an 'Alternative Product' on the Cabinet with Doors's product form (under 'Inventory' tab)
+- List the Cabinet with Doors as an 'Alternative Product' on the Aperol Spritz's product form (under 'General Information' tab).
+
+---
+
+### 42. How can Odoo be configured to provide free shipping when a customer buys at least 5 chairs?
+
+- Create a pricelist focused on a minimum quantity of '5' for the product 'chairs'.
+- This is not possible in Odoo.
+- Create a promotion program. Configure a conditional rule with a minimum quantity of '5' for chairs and add all 'chairs' products to the 'Products' field. Then, set a reward with the type 'Free Shipping'. **(True)**
+
+---
+
+### 43. What requirement must be met when setting a default unit of measure and a purchase unit of measure for a product?
+
+- The purchase unit of measure must belong to the same UoM category as the default unit of measure. **(True)**
+- The two units of measure must be from different categories.
+- The two units of measure must have the same name.
+
+---
+
+### 44. What is the main advantage of using quotation templates in Odoo?
+
+- They allow you to generate invoices directly.
+- They automatically create purchase orders.
+- They streamline the quotation process by predefining products, terms, and conditions. **(True)**
+
+---
+
+### 45. Which sales order setting ensures that a down payment is requested before confirming the order?
+
+- Invoice Policy set to "Delivered Quantities."
+- Online Payment setting enabled in the quotation template. **(True)**
+- Pricelist setting applied to the sales order.
+
+---
+
+### 46. When you configure a product's invoicing policy to 'Based on Milestones', how does the delivered quantity on the sales order behave?
+
+- The delivered quantity on the sales order must be set manually each time
+- The delivered quantity on the sales order updates automatically based on timesheet completion in the Timesheets app
+- The delivered quantity on the sales order updates automatically based on milestone completion in the Project app **(True)**
+
+---
+
+### 47. If a salesperson forgets to assign a Quotation Template when creating a new quotation but still sets a Default Quotation Validity in the Sales app settings, what will happen to the Expiration Date field in the quotation?
+
+- The Expiration Date will remain blank and must be entered manually.
+- The Expiration Date will not appear at all unless a Quotation Template is chosen.
+- The Expiration Date will automatically use the Default Quotation Validity days from settings. **(True)**
+- The Expiration Date will be randomly assigned based on the system's default values.
+
+---
+
+### 48. When a quotation is Confirmed and the Lock Confirmed Sales setting is enabled, what becomes restricted in Odoo?
+
+- Only discount fields remain editable
+- New products can't be added, but prices can still change
+- Quotations automatically cancel if modified
+- Both product edits and pricing edits are blocked **(True)**
+
+---
+
+## Extracted Questions Batch 2 (from extracted_questions.txt)
+
+### 1. Can you define a quality control point on incoming shipments?
+
+- Yes **(True)**
+- No, quality control points are only for manufacturing orders
+- No, quality control points are only for delivery orders
+
+> Quality Control Points can be set on any operation type, including Receipts (incoming shipments).
+
+---
+
+### 2. Is it possible to set up flexible consumption for subcontracted production?
+
+- Yes **(True)**
+- No
+- Only if processed via the archived subcontracting operation type in the back end
+
+> Subcontracting BoMs support a `consumption` field (`flexible`/`warning`/`strict`).
+
+---
+
+### 3. When creating an expense report, who will automatically be set as the one responsible for the validation of your expense?
+
+- Your manager
+- The manager of your department
+- Whoever is set as the person responsible for approving your expenses on the Employee form **(True)**
+
+---
+
+### 4. You have 5 units of a product reserved for future deliveries. A sales order for 3 units is confirmed but cannot be delivered because all 5 units are still reserved. Which option lets you fulfil the order?
+
+A. Start the picking of 3 units
+B. Don't set reservation method to "At Confirmation"
+C. Unreserve picking of 5, start picking of 3
+
+- A & B
+- A & C **(True)**
+- B & C
+
+---
+
+### 5. I CANNOT set the capacity on a location by:
+
+- Product
+- Package type
+- Volume **(True)**
+
+> Storage category capacity supports limits by Product, Package type, and Weight — not Volume.
+
+---
+
+### 6. On which document can an expiration date be set for newly received products?
+
+- Purchase order
+- Receipt
+- Either A or B **(True)**
+
+---
+
+### 7. How do you process quality checks on a warehouse transfer?
+
+- Quality checks cannot be set in Inventory
+- Click the "Quality Checks" button available on transfers configured with a quality control point **(True)**
+- Go to Inventory > Operations > Quality Checks
+
+---
+
+### 8. You can see the following in a product's Forecasted Report:
+
+A. Reserved quantities in multi-step
+B. Receipt & delivery dates
+C. Lead times
+
+- Just A
+- A & B
+- B & C **(True)**
+
+---
+
+### 9. On the Forecasted Report of a product, what does the "Free Stock in Transit" line represent?
+
+- Received products from vendors, currently in transit to input or quality-control locations
+- Received products in input location, not yet in stock, but available for reservation in delivery orders **(True)**
+- Tracks product shipment status to the warehouse
+
+---
+
+### 10. For a delivery method that's "Based on Rules," what is the total delivery cost for an order worth $55? Orders < $50 cost $13, Orders > $50 are free, Margin = 25%, Additional margin = $8.
+
+- $8 **(True)**
+- $10
+- $13
+
+> $55 > $50 → free shipping rule applies (cost = 0). Total = 0 + (25% × 0) + $8 additional margin = $8.
+
+---
+
+### 11. Can you assign several bills of materials to the same product?
+
+- Yes **(True)**
+- No
+- Only for products with variants
+
+---
+
+### 12. What does Overall Equipment Effectiveness (OEE) represent?
+
+- The efficiency of a work center **(True)**
+- The efficiency of a work order
+- The efficiency of a manufacturing order
+
+---
+
+### 13. In an OEE calculation, what is considered as fully productive time?
+
+- Recorded working time that doesn't exceed the expected working time **(True)**
+- All recorded time on a work order before it's marked as done
+- All time recorded on the work order during a work center's scheduled working hours
+
+---
+
+### 14. Is it possible to specify product-specific capacities for work centers?
+
+- Yes **(True)**
+- No
+- No, you must create different work centers
+
+> The `mrp.workcenter.capacity` model lets you set per-product capacity, setup, and cleanup times.
+
+---
+
+### 15. How do you start the timer for a work order in the Shop Floor module?
+
+- Click the header of the work-order card **(True)**
+- Click "Start Timer" at the bottom of the work-order card
+- Work orders are not timed by Odoo
+
+---
+
+### 16. How do you make the Production Analysis report show data for a single product?
+
+- Select the product from the Measures drop-down menu
+- Enter the product's name in the search bar **(True)**
+- Access the report from the product's form
+
+---
+
+### 17. What method is unavailable for an employee sign-in using an Attendances kiosk?
+
+- Barcode/RFID
+- Manual Selection
+- Biometric Signature **(True)**
+
+---
+
+### 18. An employee is scheduled for an 8-hour shift, clocks in at 09:13 AM and out at 5 PM, yet their time card shows 8 hours. How is this possible?
+
+- 'Tolerance Time in Favor of Company' was set to 15 minutes
+- 'Tolerance Time in Favor of Employee' was set to 15 minutes **(True)**
+- 'Extra Hours Validation' is set to Automatically Approved
+
+> The employee worked 7h47m but is credited 8h — this is undertime forgiveness in the employee's favor. `employee_tolerance` controls when small undertime is ignored (no penalty). Source: `addons/hr_attendance/models/hr_attendance_overtime_rule.py` and view `hr_attendance_overtime_rule_views.xml:42-43` ("in favor of the employee of").
+
+---
+
+### 19. Is it possible for employees to view the onboarding slides in the Referrals app after they've already seen them?
+
+- Yes, by going to "Referrals" app > Configuration > Onboarding and click "Force Onboarding". **(True)**
+- Yes, by setting the "Onboarding" option to "always show".
+- No, they can only be viewed once and cannot be shown again.
+
+---
+
+### 20. What is submitted to your manager for approval when finalizing an expense for reimbursement?
+
+- An expense
+- An expense report **(True)**
+- An approval request
+
+---
+
+### 21. In what increments of time can Time Off Types be configured to allow time off?
+
+- Day or Half Day only
+- Hours only
+- Day, Half Day, or Hours **(True)**
+
+---
+
+### 22. Which of the following is not a default report available in the Recruitment app?
+
+- Source Analysis
+- Applicant Analysis
+- Cost Per Hire Analysis **(True)**
+
+---
+
+### 23. How can you configure the Recruitment app to automatically send an email requesting an applicant to schedule an interview?
+
+- Configure the 'Recruitment: Schedule Interview' email template directly in the job position's settings
+- Automatic emails cannot be configured in the Recruitment app
+- Edit the pipeline stage and select the 'Recruitment: Schedule Interview' email template **(True)**
+
+---
+
+### 24. How is the expense category determined when an expense is created via email?
+
+- It is not assigned automatically and must be manually added.
+- From the body of the email
+- From the subject of the email **(True)**
+
+---
+
+### 25. How can you notify employees about a new job position in the Referrals app?
+
+- Create a message by going to Referrals > Configuration > Message Employees
+- Create an alert by going to Recruitment > Configuration > Referrals
+- Create an alert by going to Referrals > Configuration > Alerts **(True)**
+
+---
+
+### 26. Where can you configure the default journal to be used for Expense reports?
+
+- There is no default journal—it must be assigned to each expense report individually
+- At the Expense Category level
+- In the Expenses module under Configuration > Settings **(True)**
+
+---
+
+### 27. How can a user access a job applicant's record without having full access permissions to the Recruitment app?
+
+- By referring a candidate for a position.
+- They cannot—full access permissions are required to view an applicant's record
+- By being assigned as an interviewer for the position **(True)**
+
+---
+
+### 28. What must be included in the subject line of an email for an expense to be created from the email?
+
+- Only the amount
+- The 'Product Name' of the expense category
+- The 'Reference' of the corresponding expense category **(True)**
+
+---
+
+### 29. How can you attract high-performing candidates to join your team?
+
+- By using the Online Jobs module
+- By using the Referrals app **(True)**
+- By using the Recruitment app
+
+---
+
+### 30. What are the possible ways to add a new employee in the system?
+
+- Using the 'Create Employee' button in the Recruitment app
+- Using the 'New' button in the Employees app
+- Both options are available **(True)**
+
+---
+
+### 31. What tax configurations are supported when adding a product to an Expense Report?
+
+- Excluded from Price
+- Excluded from Price & Included in Price **(True)**
+- Included in Price
+
+---
+
+### 32. Where is the employee hourly cost specified for timesheet tracking?
+
+- On the sale order line linked to the task
+- On the Employee's contract
+- On the Employee's record, under the Settings tab **(True)**
+
+---
+
+### 33. Where can you configure Time Off requests to require multiple approvals?
+
+- On the employee form
+- In the settings of the Time Off app
+- On the Time Off Type form **(True)**
+
+---
+
+### 34. When linking an analytical account to a manufacturing order, how are the related costs recorded?
+
+- Produced units are recorded as positive amounts, while consumed components are recorded as negative amounts **(True)**
+- Only costs of consumed components and work orders are recorded as negative amounts
+- The analytical account does not track any manufacturing-related costs
+
+---
+
+### 35. If an amount is entered in both the "per workcenter" and "per employee" fields in the "Cost per hour" section, which value is used?
+
+- The values are added together.
+- The value in the "per workcenter" field.
+- The value in the "per employee" field **(True)**
+
+---
+
+### 36. What happens when the 'Comparison' option is enabled in a Manufacturing report?
+
+- The data for two products is compared.
+- The data for two time periods is compared. **(True)**
+- The data for two datasets is compared.
+
+---
+
+### 37. Which of the following details is NOT displayed on the card for a manufacturing order (MO) on the Shop Floor dashboard?
+
+- The product being manufactured.
+- The MO number.
+- The estimated time to complete the MO. **(True)**
+
+---
+
+### 38. What does the capacity of a work center indicate?
+
+- The number of workers assigned to the work center.
+- The number of operations from a BoM that the work center can perform simultaneously.
+- The number of product units the work center is capable of manufacturing at the same time. **(True)**
+
+---
+
+### 39. Which application is the Shop Floor module typically installed with?
+
+- Maintenance
+- Accounting
+- Manufacturing **(True)**
+
+---
+
+### 40. Is it possible to include a kit as a component in a bill of materials?
+
+- Yes **(True)**
+- No
+- Only if the 'BoM Kits' setting is activated
+
+---
+
+### 41. How can you set up a Bill of Materials (BoM) to produce multiple products simultaneously (e.g., A + B = C + D)?
+
+- By activating the "By-Products" option and defining by-products in the "By-Products" section of the BoM **(True)**
+- By specifying a by-product directly in the routing.
+- By creating a separate kit BoM and including it as a component in the main BoM.
+
+---
+
+### 42. You configured your manufacturing into two steps: picking components and manufacturing. During a work order, an additional component is consumed. What is the outcome?
+
+- The existing transfer is modified to include the extra component
+- No additional picking is created. The quantity of this component at the pre-production location is reduced **(True)**
+- A new transfer is created for the additional component from stock to the pre-production location

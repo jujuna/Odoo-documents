@@ -43,8 +43,30 @@ Draft payslip created  →  Worked days computed  →  Salary rules evaluated  �
 |---|---|---|
 | `draft` | editable, not confirmed | `validated`, `cancel` |
 | `validated` | rules computed, locked | `paid`, `cancel` |
-| `paid` | payment registered | — |
+| `paid` | marked paid (status flag — see below, not necessarily a registered payment) | — |
 | `cancel` | voided | — |
+
+---
+
+## Getting to "Paid" — does confirming a payslip create a payment?
+
+**No.** Confirmation, accounting, and "paid" are three separate steps, and `paid` is a status flag — not proof that money moved.
+
+| Step | Method | What it does | Money moved? |
+|---|---|---|---|
+| Confirm / validate | `action_validate` → `action_payslip_done` ([hr_payslip.py:586](../enterprise/hr_payroll/models/hr_payslip.py#L586)) | `draft → validated`, sets `done_date` | No |
+| Post accounting entry (only with `hr_payroll_account`) | `_action_create_account_move` ([hr_payslip.py:54](../enterprise/hr_payroll_account/models/hr_payslip.py#L54)) | Creates the salary **journal entry** `account.move` (Dr expense / Cr salary payable), stored on `move_id` | No — journal entry only |
+| Register payment | `action_register_payment` ([hr_payslip.py:277](../enterprise/hr_payroll_account/models/hr_payslip.py#L277)) | Opens the standard `account.payment.register` wizard on the payable line → creates the real `account.payment` and reconciles | **Yes** |
+| Mark as paid | `action_payslip_paid` ([hr_payslip.py:632](../enterprise/hr_payroll/models/hr_payslip.py#L632)) | `→ paid`, sets `paid_date`, reconciles salary attachments | No — status flag |
+
+- The `paid` boolean is labelled **"Made Payment Order?"** ([hr_payslip.py:108](../enterprise/hr_payroll/models/hr_payslip.py#L108)) — independent of `state`.
+- Out of the box the two are decoupled: you can flag a payslip paid with no payment, or register a payment without flagging it. **No automatic bank payment is created on confirmation.**
+- Actual money out is plain accounting — an `account.payment` against the salary journal entry, the same mechanism used to pay a vendor bill.
+
+### Relation to the Basis Bank salary integration
+The `gec_basis_bank_integration` module does **not** create salary payments. Salaries are paid the standard way described above — Register Payment on the Basis Bank journal, which reconciles the payable and marks the payslip `paid`. The module's only job is to **send** those resulting `account.payment` records to the bank and confirm them from the statement. So all payroll accounting and `paid` status stay 100% Odoo-standard; the bank module is a pure sender/confirmer.
+
+> Earlier versions of the module had a wizard that created its own payments directly from payslip data (bypassing reconciliation). That path was removed because it duplicated payments and left the salary payable unreconciled. The module's salary XLSX wizard remains, but only for ad-hoc non-payroll IBAN lists (it creates standalone payments, not tied to payslips).
 
 ---
 
@@ -277,6 +299,79 @@ These are standing orders that automatically inject an input line into every pay
 - **Archiving an input type with open attachments is blocked**: `_check_salary_attachment_type_active` raises `UserError` if you try to archive a type that has running salary adjustments. Source: [`hr_payslip_input_type.py:36`](../enterprise/hr_payroll/models/hr_payslip_input_type.py#L36)
 
 - **Property inputs vs. Other inputs**: `property_inputs` in localdict (from JSON on contract/payslip) are completely separate from `inputs` (from `hr.payslip.input` lines). Rules using `condition_select = 'property_input'` do NOT read from the Other Inputs tab.
+
+---
+
+## Changing Salary — How Version Effective Dates Affect the Payslip
+
+In Odoo 19 the old `hr.contract` is replaced by **`hr.version`**: an employee record that is time-sliced by `date_version` (its effective date). The `wage` lives on each version. Source: [`hr_version.py:53`](../addons/hr/models/hr_version.py#L53), [`hr_version.py:167`](../addons/hr/models/hr_version.py#L167).
+
+### The one rule that decides the wage
+
+The wage at any date = the version with the **greatest `date_version` that is `<= date`** — `_get_version`. Source: [`hr_employee.py:547`](../addons/hr/models/hr_employee.py#L547).
+
+A monthly payslip resolves its version from the **period start (`date_from`, usually the 1st)**, not mid-period. The `is_wrong_version` flag literally compares `version_id` to `_get_version(date_from)`. Source: [`hr_payslip.py:113`](../enterprise/hr_payroll/models/hr_payslip.py#L113), [`hr_payslip.py:398`](../enterprise/hr_payroll/models/hr_payslip.py#L398).
+
+A pay run picks **one version per contract** — the one active at the period start — and only produces **multiple payslips when `contract_date_start` differs** (a genuinely new contract). The selection loop adds the first version with `date_version <= date_start` and breaks. Source: [`hr_payslip_run.py:120`](../enterprise/hr_payroll/models/hr_payslip_run.py#L120) (break at [`:159`](../enterprise/hr_payroll/models/hr_payslip_run.py#L159)).
+
+Version date span: `date_start = max(date_version, contract_date_start)`, `date_end = min(next_version.date_version − 1, contract_date_end)`. Source: [`hr_version.py:552`](../addons/hr/models/hr_version.py#L552).
+
+### Effect of each way to change the wage (monthly schedule)
+
+| How you change it | Effect on the current month |
+|---|---|
+| Edit **Wage** on the current version and Save (in-place `write`). Same for the **Salary Indexation** wizard, which writes the new wage onto existing versions. | New wage applies to the **whole current month** (retroactive to period start). No proration. If the payslip is already confirmed, `has_wrong_data` flags it → recompute. Source: [`hr_payroll_index_wizard.py:77`](../enterprise/hr_payroll/wizard/hr_payroll_index_wizard.py#L77), [`hr_payslip.py:403`](../enterprise/hr_payroll/models/hr_payslip.py#L403) |
+| **New version dated the 1st** of the month | New wage for the whole month; earlier months keep the old wage (history preserved). Cleanest. |
+| **New version dated mid-month** (e.g. 15th), **same contract** | Current month still uses the version active on the 1st → **old wage all month**; new wage takes effect **next period**. No mid-month split or proration. |
+| **New contract mid-month** (new `contract_date_start`; old contract ended on the 14th) | Pay run creates **two payslips**: 1st–14th at old wage, 15th–end at new wage, each **pro-rated by worked days** in its own span. Only true mid-month split. |
+
+### Recommended workflow
+
+- For a normal raise: make it **effective the 1st of a pay period** (edit the wage, run Indexation, or create a new version dated the 1st). Each month then sits at a single clean wage.
+- For a genuine **mid-month** change with split pay: model it as a **new contract** (end the old one on the prior day, start a new one) — that is the only path that pro-rates within the month.
+- New versions are created via `create_version` / the **New Contract** button / the **Salary Configurator** ([`hr_contract_salary`](../enterprise/hr_contract_salary/controllers/main.py#L620)), never automatically when you just edit and save. Source: [`hr_employee.py:556`](../addons/hr/models/hr_employee.py#L556).
+
+---
+
+## Payslip Period Range — How `date_from` / `date_to` Are Determined
+
+Two layers set the period, both driven by the **pay schedule** (`schedule_pay`).
+
+**1. Pay run (`hr.payslip.run`)** — the batch you create first. You set **From** (`date_start`) and **To** (`date_end`) directly; defaults are the 1st and last day of the current month. Changing the run's **Pay Schedule** recomputes them via `_compute_date_start` → `_schedule_period_start` and `_compute_date_end` → `date_start + _schedule_timedelta`. Source: [`hr_payslip_run.py:44`](../enterprise/hr_payroll/models/hr_payslip_run.py#L44), [`hr_payslip_run.py:203`](../enterprise/hr_payroll/models/hr_payslip_run.py#L203).
+
+**2. Individual payslip (`hr.payslip`)** — `date_from` defaults to the 1st of the current month and is editable; **`date_to` is computed**, never typed: `date_to = date_from + _get_schedule_timedelta()`. Source: [`hr_payslip.py:62`](../enterprise/hr_payroll/models/hr_payslip.py#L62), [`hr_payslip.py:277`](../enterprise/hr_payroll/models/hr_payslip.py#L277).
+
+The schedule used = `version_id.schedule_pay or version_id.structure_type_id.default_schedule_pay`. Source: [`hr_payslip.py:273`](../enterprise/hr_payroll/models/hr_payslip.py#L273).
+
+### Period start and length per schedule
+
+`_schedule_period_start` ([`hr_payslip.py:187`](../enterprise/hr_payroll/models/hr_payslip.py#L187)) sets the start; `_schedule_timedelta` ([`hr_payslip.py:250`](../enterprise/hr_payroll/models/hr_payslip.py#L250)) sets the length:
+
+| `schedule_pay` | Start | `date_to` = start + |
+|---|---|---|
+| **monthly** (default) | 1st of month | +1 month −1 day → last day of month |
+| semi-monthly | 1st or 15th | to the 15th or 31st |
+| bi-monthly | 1st of the 2-month slice | +2 months −1 day |
+| quarterly | 1st of quarter | +3 months −1 day |
+| semi-annually | Jan 1 / Jul 1 | +6 months −1 day |
+| annually | Jan 1 | +1 year −1 day |
+| weekly | Monday | +6 days |
+| bi-weekly | Monday, 2-week cycle | +13 days |
+| daily | today | same day |
+
+A normal **month range** is the monthly schedule: 1st → last day of the month.
+
+### Where to configure it
+
+| Level | Field / place | Effect |
+|---|---|---|
+| **Structure Type** (Payroll ▸ Configuration ▸ Structure Types) | `default_schedule_pay` ("Scheduled Pay") | Default schedule for any version using that type. Source: [`hr_payroll_structure_type.py:28`](../enterprise/hr_payroll/models/hr_payroll_structure_type.py#L28) |
+| **Version / contract** (employee record, Payroll section) | `schedule_pay` ("Pay Schedule") | Per-employee override; inherits the structure-type default. Hidden when only one option exists (`show_schedule_pay`). Source: [`hr_version.py:14`](../enterprise/hr_payroll/models/hr_version.py#L14) |
+| **Contract template** | `schedule_pay` | Pre-fills the schedule when the template is loaded onto a version. Source: [`hr_contract_template_views.xml:32`](../enterprise/hr_payroll/views/hr_contract_template_views.xml#L32) |
+| **Pay run** | From / To (`date_start` / `date_end`) | Directly edit the actual dates for one batch, overriding the schedule-derived default. |
+| **Payslip** | `date_from` editable; `date_to` auto | Adjust the start; end recomputes from the schedule (unless a `default_date_to` context is set). |
+
+Schedule options come from `_get_selection_schedule_pay` ([`hr_payroll_structure_type.py:13`](../enterprise/hr_payroll/models/hr_payroll_structure_type.py#L13)). There is **no company-level period setting** — it lives on the structure type and the version.
 
 ---
 
