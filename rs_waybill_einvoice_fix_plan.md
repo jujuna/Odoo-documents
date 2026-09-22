@@ -1,6 +1,6 @@
 # rs_waybill + rs_einvoice + rs_base_methods — Findings and Fix Plan
 
-**Date:** 2026-09-18 · **Sources:** two independent source reviews (Claude, Codex), every item re-verified against this checkout's Odoo 19 core · **Status:** nothing changed yet. **Core-safety review + provoke steps added 2026-09-18** (section below the priority table).
+**Date:** 2026-09-18 · **Sources:** two independent source reviews (Claude, Codex), every item re-verified against this checkout's Odoo 19 core · **Status:** none of the 65 findings are fixed. **The 20.0 port is** — G1–G4 and G7 were applied 2026-09-22 and all three modules now install on gec20_prod1. **Core-safety review + provoke steps added 2026-09-18** (section below the priority table).
 
 Tags: **[C]** proven from code · **[L]** strong inference · **[D]** business rule must be decided first.
 **Canonical folder: `custom_addons/gec_odoo_modules` — nothing else.** (Decided 2026-09-19.) All three modules live there and every path below points there. Older copies elsewhere on disk (`gec_rs_waybill`, `rs_base`, `gec_project`, `gec_rs_invoice`) are dead — do not read, edit or install from them, and keep them off `--addons-path`.
@@ -8,6 +8,526 @@ Tags: **[C]** proven from code · **[L]** strong inference · **[D]** business r
 Paths: `W` = [rs_waybill](../custom_addons/gec_odoo_modules/rs_waybill) · `E` = [rs_einvoice](../custom_addons/gec_odoo_modules/rs_einvoice) · `B` = [rs_base_methods](../custom_addons/gec_odoo_modules/rs_base_methods).
 
 **gec_modules2 is a TEST database, not production** (corrected 2026-09-19 — an earlier pass in this file and in project memory called it "live"). Every `gec_modules2` reference below confirms a mechanism fires on realistic data, or checks an index/field/install-state fact; it is never evidence of a current production condition. Read "N posted bills show X on gec_modules2" as "N test-DB records show X", not as "N production records are wrong right now."
+
+## Re-verified against Odoo 20 core — 2026-09-22
+
+Everything below this section was written and verified against **Odoo 19**. This checkout is **20.0**.
+Every core `file:line` the plan cites was re-resolved against the 20.0 tree by symbol (line numbers
+all drifted; only the deltas that change a finding or a fix are listed here). Sources: branch `20.0`
+working tree, compared with `git show 19.0:<path>`.
+
+**Verdict: no finding is invalidated. Three core changes rewrite fixes, one correction kills a stated
+mechanism, and the modules themselves no longer run on 20.0 — the plan cannot be executed until the
+four blockers below are cleared.**
+
+### A. Blockers — the three modules do not run on 20.0 (new, not in the plan)
+
+| # | What | Where | Effect |
+|---|---|---|---|
+| V1 | `stock.return.picking` / `stock.return.picking.line` **deleted** (`[REM] stock: remove return wizard`) | [rs_waybill.py:1453](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1453) | `_create_return_picking` raises `KeyError: 'stock.return.picking'`. Every return path dies: edit-down, cancel-completed, type-5 |
+| V2 | `stock.move.product_uom` → **`uom_id`**; `stock.move.line.product_uom_id` → **`uom_id`**; `purchase.order.line.product_uom_id` → **`uom_id`** | [stock_picking.py:223](../custom_addons/gec_odoo_modules/rs_waybill/models/stock_picking.py#L223), [rs_waybill.py:956](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L956), [1378](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1378), [1421](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1421), [1711](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1711), [1760](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1760), [1860](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1860) | 7 sites. PO creation, move-line creation and the rs.ge `UNIT_TXT` payload all raise `ValueError: Invalid field`. `account.move.line.product_uom_id` and `sale.order.line.product_uom_id` are **unchanged** — the two wizard sites in `rs_base_methods` are fine |
+| V3 | OWL 3: `useState` is no longer exported by `@odoo/owl`; `t-esc` is retired (609 core files in 19.0 → 2 in 20.0) | [waybill_list_kpis.js:13,36](../custom_addons/gec_odoo_modules/rs_waybill/static/src/dashboard/waybill_list_kpis.js#L13), [waybill_list_kpis.xml](../custom_addons/gec_odoo_modules/rs_waybill/static/src/dashboard/waybill_list_kpis.xml) | The waybill dashboard KPI component fails at setup. Core's replacement is `proxy()` ([dialog.js:75](../addons/web/static/src/core/dialog/dialog.js#L75)) and `t-out`. `odoo/upgrade_code/owl3-migration.py` does this mechanically |
+| V4 | `ir.model.access` + `ir.rule` merged into `ir.access` | — | **Already fixed 2026-09-22.** All three modules now ship `security/ir.access.csv` (rs_einvoice 16 rows, rs_waybill 18, rs_base_methods 6); `rs_einvoice` installs on gec20_prod1. Item **#36** now reads [rs_waybill/security/ir.access.csv:2](../custom_addons/gec_odoo_modules/rs_waybill/security/ir.access.csv#L2) — still `base.group_user,crud`, so the finding stands unchanged |
+| V5 | `product.tracking` dropped the `'none'` value and is no longer required/defaulted ([stock/models/product.py:835-841](../addons/stock/models/product.py#L835); v19 had `('none','By Quantity')`, `required=True, default='none'`) | [rs_waybill.py:2029](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L2029) | **Silent, not a crash.** `move.product_id.tracking == 'none'` is now always False, so the branch it guards never runs. The v20 equivalent is `not move.product_id.tracking` |
+| V6 | `ir.config_parameter.get_param` / `set_param` **removed**, replaced by typed accessors `get_bool/get_int/get_float/get_str` and `set_bool/set_int/set_float/set_str` ([ir_config_parameter.py:66-131](../odoo/addons/base/models/ir_config_parameter.py#L66)) | [res_company.py:69,73,80](../custom_addons/gec_odoo_modules/rs_waybill/models/res_company.py#L69), [rs_waybill_sync.py:278,279,304,389](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill_sync.py#L278) | `AttributeError: 'ir.config_parameter' object has no attribute 'get_param'` **at install** — `res_company.init()` runs during `init_models`. `config_parameter=` on `res.config.settings` fields is unaffected ([res_config.py:220-331](../odoo/addons/base/models/res_config.py#L220)) |
+| V7 | `res.partner.company_registry` and `res.company.company_registry` **removed** (commit `6f8c2526a00 [REF] base,*: multi ID for UBL + remove company_registry`); country-specific IDs now live in the `additional_identifiers` JSON ([res_partner.py:330](../odoo/addons/base/models/res_partner.py#L330)) | 33 non-test sites across `rs_waybill` + `rs_base_methods`, 21 more in tests | `ValueError: Wrong @depends ... Dependency field 'company_registry' not found` at registry init, then every TIN lookup, search domain and waybill payload. **There is no `GE_*` key** in `ADDITIONAL_IDENTIFIERS_METADATA` (58 keys, none Georgian), and the column does not exist in gec20_prod1 — so `vat` is the only field left for a Georgian TIN |
+| V8 | `uom` view xmlids renamed: `product_uom_form_view` → `uom_uom_view_form`, `product_uom_tree_view` → `uom_uom_view_list`, `product_uom_form_action` → `uom_uom_action_list` | [uom_uom_views.xml:7,19](../custom_addons/gec_odoo_modules/rs_waybill/views/uom_uom_views.xml#L7) | `ParseError` at install. The `uom.product_uom_*` **data** xmlids (unit, kgm, gram, …) are unchanged — all 11 the module references still resolve |
+| V9 | `sale_stock`'s order-form extension now carries `<field name="priority">20</field>` ([sale_order_views.xml:8](../addons/sale_stock/views/sale_order_views.xml#L8)); it had none in 19.0 | [sale_order_views.xml](../custom_addons/gec_odoo_modules/rs_waybill/views/sale_order_views.xml) | Our view (default priority 16) now applies **before** it, so `//button[@name='action_view_delivery']` is not in the arch yet → "cannot be located in parent view" |
+| V10 | List-view columns are wrapped in `<column>` elements in 20.0 | [sale_order_views.xml](../custom_addons/gec_odoo_modules/rs_waybill/views/sale_order_views.xml), [stock_picking.xml:49](../custom_addons/gec_odoo_modules/rs_waybill/views/stock_picking.xml#L49) | `product_id` is no longer a direct child of `<list>` — on `sale.order.line` it is inside `<column name="product_and_description">`, on the picking move list inside an unnamed `<column>`. Bare `<field>` children of `<list>` still work, so only `product_id` anchors broke |
+
+### B. Core changes that rewrite a stated fix
+
+**The return wizard is gone — #16, #22, #25 and the module's own `_create_return_picking` all need new API.**
+Odoo 20 makes returns picking-native: [`_create_return()`](../addons/stock/models/stock_picking.py#L976), with
+[`action_return`](../addons/stock/models/stock_picking.py#L812) / [`action_return_all`](../addons/stock/models/stock_picking.py#L823)
+as the UI entry points and `return_id` / `return_ids` / `show_return` fields on the picking.
+
+The per-module overrides that the plan relied on **survived, but moved off the wizard onto `stock.picking`**,
+so the guarantees the ADJUST verdicts for #22 and #25 were built on still hold:
+
+| What the plan needed | v19 (wizard) | v20 |
+|---|---|---|
+| `origin_returned_move_id` | `stock/wizard/stock_picking_return.py:39` | [stock_picking.py:949](../addons/stock/models/stock_picking.py#L949) in `_prepare_return_move_default_values` |
+| `purchase_line_id` + partner | `purchase_stock/models/stock.py:128` | [purchase_stock/models/stock.py:46-50](../addons/purchase_stock/models/stock.py#L46) |
+| `sale_line_id` | `sale_stock/wizard/stock_picking_return.py:11` | [sale_stock/models/stock.py:399-403](../addons/sale_stock/models/stock.py#L399) |
+| `to_refund` | `stock_account/wizard/stock_picking_return.py:10` | [stock_account/models/stock_picking.py:34-37](../addons/stock_account/models/stock_picking.py#L34) |
+
+Two behavioural differences to carry into the fixes:
+
+- **Return quantities start at 0, not at the delivered quantity.** `_prepare_return_move_default_values`
+  sets `product_uom_qty = move_id.quantity if not self.show_return else 0`
+  ([stock_picking.py:939](../addons/stock/models/stock_picking.py#L939)). The wizard's
+  `product_return_moves` lines are gone, so the caller writes `product_uom_qty` per move itself
+  (match by `move.origin_returned_move_id`) or calls `action_return_all`.
+- **`_create_return()` leaves the picking in `draft`** and does not confirm or assign — the same
+  `action_confirm()` / `action_assign()` the module already calls afterwards still apply, and
+  "leave the return *Ready*, the warehouse validates" (the #22/#25 verdict) is still the right shape.
+
+**#15 (forced validation) — the ADJUST verdict holds, with renamed dependencies.** `stock.move.quantity`
+still has the spreading inverse: field [stock_move.py:171](../addons/stock/models/stock_move.py#L171),
+inverse `_set_quantity` at [465](../addons/stock/models/stock_move.py#L465), putaway applied at
+[2668](../addons/stock/models/stock_move.py#L2668). `picked` unchanged. But the fix must be written
+against `uom_id`, not `product_uom` (see V2).
+
+**#4 / #5 — `_check_draftable` lost one of its three blocks, so auto-cancel is *less* constrained on 20.0.**
+[account_move.py:7010](../addons/account/models/account_move.py#L7010) now refuses only
+exchange-difference entries and hash-locked entries; the v19 tax-cash-basis refusal
+(`move.tax_cash_basis_rec_id or move.tax_cash_basis_origin_move_id`) is deleted. `button_cancel` is
+byte-identical ([7039](../addons/account/models/account_move.py#L7039)) and still calls
+`remove_move_reconcile()` at [7049](../addons/account/models/account_move.py#L7049) — **#4 is confirmed
+and marginally worse**. Consequence for the #5 *Provoke* recipe: the cash-basis route to an
+un-cancellable original no longer exists; use the hash lock (*Lock Posted Entries with Hash*), which
+is unchanged.
+
+**#30 — holds, but the field moved out of `stock`.** `is_storable` is now defined in
+[product_template.py:127](../addons/product/models/product_template.py#L127) (still `default=False`),
+compute `_compute_is_storable` at [477](../addons/product/models/product_template.py#L477) still only
+forces False for non-`consu` types, so a `True` passed to `create()` still wins. Two v20 additions to
+watch when writing the fix: a new `store_by` selection ([stock/models/product.py:842](../addons/stock/models/product.py#L842))
+whose inverse writes both `is_storable` and `tracking`, and `tracking` no longer accepts `'none'` —
+use `False`.
+
+**#6 — the "no upselling" correction is still right, and now has a second escape hatch.**
+`qty_delivered > product_uom_qty` is still the only trigger
+([sale_order_line.py:1388-1396](../addons/sale/models/sale_order_line.py#L1388)); v20 adds
+`and not (line.qty_overage and line.order_id.invoice_overages)` at
+[1394](../addons/sale/models/sale_order_line.py#L1394). Drafts still count in `qty_invoiced`
+(the filter moved into `_prepare_qty_invoiced`, [1286](../addons/sale/models/sale_order_line.py#L1286)),
+and the credit-note copy the verdict leans on is unchanged
+([account_move.py:5898](../addons/account/models/account_move.py#L5898),
+[sale/account_move_line.py:41-43](../addons/sale/models/account_move_line.py#L41),
+[purchase/account_invoice.py:667-670](../addons/purchase/models/account_invoice.py#L667)).
+
+### C. One correction: #40's mechanism is wrong, in v19 as well as v20
+
+The plan's core evidence for #40 is `account_move_line.py:378-382 (digits='Product Price')` plus
+`fields_numeric.py:140-144 (Float.convert_to_cache rounds to digits[1])`. That citation points at
+`product_uom_id`, not `price_unit`. The real definition — **identical in 19.0 and 20.0** — is
+[account_move_line.py:457-461](../addons/account/models/account_move_line.py#L457):
+
+```python
+price_unit = fields.Float(
+    string='Unit Price',
+    compute='_compute_price_unit', store=True, readonly=False, precompute=True,
+    min_display_digits='Product Price',
+)
+```
+
+`min_display_digits` without `digits` sets `digits = False`
+([fields_numeric.py:124-126](../odoo/orm/fields_numeric.py#L124)), so `get_digits()` returns falsy and
+`convert_to_cache` **does not round** ([169-173](../odoo/orm/fields_numeric.py#L169)); the column is
+`numeric` with no scale — confirmed on gec20_prod1: `account_move_line.price_unit` is `numeric` with
+`numeric_scale` NULL. `_rs_pulled_line_vals` does not round either
+([account_move_sync.py:630-634](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move_sync.py#L630)).
+
+The 0.01 drift observed on the gec_modules2 test DB is not disputed, but the stated cause is not the
+field precision, and therefore the proposed fix ("raise the Product Price `decimal.precision`") would
+change nothing. **Re-derive #40 against the v19 DB before acting on it** — where the rounded value
+actually enters is still unknown.
+
+### D. Claims re-checked and unchanged
+
+`Field.__set__` always writes ([fields.py:2019](../odoo/orm/fields.py#L2019), #3) ·
+`_sql_constraints` still only warned and ignored ([model_classes.py:175](../odoo/orm/model_classes.py#L175), #33) ·
+`account.tax.price_include` still computed with a `search=` method, so the `('price_include','=',False)` domain works ([account_tax.py:122](../addons/account/models/account_tax.py#L122), #38) ·
+`_update_line_quantity` guard ([sale_stock/sale_order_line.py:420](../addons/sale_stock/models/sale_order_line.py#L420), #17) ·
+`_prepare_qty_received` still nets out returns ([purchase_stock/purchase_order_line.py:62-87](../addons/purchase_stock/models/purchase_order_line.py#L62), #22/#25) ·
+the done-move cancel guard, which the plan mis-cited as `stock_move.py:2032` in v19 too — it is `_action_cancel` at [stock_move.py:2274](../addons/stock/models/stock_move.py#L2274), and `unlink()` has no such guard (#24) ·
+`stock.picking._action_done` still delegates to `todo_moves._action_done()` ([stock_picking.py:1013](../addons/stock/models/stock_picking.py#L1013)), so **#62 holds and grows**: a bare `moves._action_done()` now also skips a new v20 no-backorder follower notification ([1017-1037](../addons/stock/models/stock_picking.py#L1017)) on top of `date_done`, `_trigger_assign`, `_intercompany_unpack` and `_send_confirmation_email` ·
+journal hash mode and all five lock dates unchanged (#41, #45).
+
+### E. Not re-verified
+
+Items **39, 42–61, 63–68** were re-checked only where they cite a core file (all such citations are
+covered above). Their module-side mechanics and the test-DB counts were not re-run on 20.0, and the
+gec_modules2 figures throughout this file are Odoo 19 test-DB numbers.
+
+### F. One dead-code finding turned up by the comparison
+
+`_name_search` is overridden in [res_partner.py:36](../custom_addons/gec_odoo_modules/rs_waybill/models/res_partner.py#L36)
+and [fleet_vehicle.py:37](../custom_addons/gec_odoo_modules/rs_waybill/models/fleet_vehicle.py#L37). Core has no such
+method: `name_search` searches `display_name` directly and dispatches to `_search_display_name`
+([models.py:1593-1622](../odoo/orm/models.py#L1593), [1521](../odoo/orm/models.py#L1521)). Neither override has ever
+run — this was already true on 19.0, so it is not a 20.0 regression. Whatever partner and vehicle lookup behaviour they
+were meant to add (TIN search, plate search) is simply absent; port them to `_search_display_name(operator, value)`
+or delete them.
+
+---
+
+## G. How to fix the 20.0 blockers
+
+**Status 2026-09-22: G1–G4 and G7 are APPLIED. All three modules install and upgrade cleanly on
+gec20_prod1** (`-i rs_waybill,rs_base_methods` → `installed`, no traceback). G5 is still optional and
+not applied; the test suite is not ported (see G8).
+
+The sections below are kept as the record of what each fix is and why. `_sql_constraints` is the only
+warning left in the install log, and that is plan item **#33**, not a 20.0 regression.
+
+### G1 — V2: the UoM renames (7 sites)
+
+Pure rename, no logic change. Odoo 20 renamed the UoM field on three models
+([stock_move.py:68](../addons/stock/models/stock_move.py#L68),
+[stock_move_line.py:33](../addons/stock/models/stock_move_line.py#L33),
+[purchase_order_line.py:48](../addons/purchase/models/purchase_order_line.py#L48)):
+
+| Model | 19.0 | 20.0 |
+|---|---|---|
+| `stock.move` | `product_uom` | `uom_id` |
+| `stock.move.line` | `product_uom_id` | `uom_id` |
+| `purchase.order.line` | `product_uom_id` | `uom_id` |
+| `account.move.line` | `product_uom_id` | **unchanged** |
+| `sale.order.line` | `product_uom_id` | **unchanged** |
+
+| File | Line | Now | Becomes |
+|---|---|---|---|
+| [stock_picking.py](../custom_addons/gec_odoo_modules/rs_waybill/models/stock_picking.py#L223) | 223 | `'unit_name': move.product_uom.name` | `'unit_name': move.uom_id.name` |
+| [rs_waybill.py](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L956) | 956 | `'product_uom_id': line.product_id.uom_id.id` (PO line) | `'uom_id': line.product_id.uom_id.id` |
+| [rs_waybill.py](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1378) | 1378 | `'product_uom_id': move.product_uom.id` (move line) | `'uom_id': move.uom_id.id` |
+| [rs_waybill.py](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1421) | 1421 | `'product_uom_id': m.product_uom.id` (move line) | `'uom_id': m.uom_id.id` |
+| [rs_waybill.py](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1711) | 1711 | `'product_uom_id': product.uom_id.id` (PO line) | `'uom_id': product.uom_id.id` |
+| [rs_waybill.py](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1760) | 1760 | `'product_uom_id': product.uom_id.id` (PO line) | `'uom_id': product.uom_id.id` |
+| [rs_waybill.py](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1860) | 1860 | `'product_uom_id': move.product_uom.id` (move line) | `'uom_id': move.uom_id.id` |
+
+The two `product_uom_id` keys in [rs_invoice_from_waybill_wizard.py:358,419](../custom_addons/gec_odoo_modules/rs_base_methods/wizards/rs_invoice_from_waybill_wizard.py#L358)
+build `account.move.line` vals — **leave them alone.**
+
+Knock-on: **#31**'s fix text is written against the old names. When that item is implemented it must read
+`move.uom_id._compute_quantity(qty, product.uom_id)` and `move.uom_id.rs_unit_id`, not `move.product_uom`.
+
+### G2 — V1: rewrite `_create_return_picking` on the picking-native API
+
+This is the one real rewrite. [rs_waybill.py:1441-1468](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1441)
+drives the deleted `stock.return.picking` wizard. The v20 shape is: create the return, write the
+quantities yourself, drop the untouched lines, then confirm and assign.
+
+What the wizard did for us and what replaces it:
+
+| v19 wizard | v20 |
+|---|---|
+| `create({})` built one `product_return_moves` line per non-cancelled, non-inventory move | [`picking._create_return()`](../addons/stock/models/stock_picking.py#L976) creates one **`stock.move`** per non-cancelled move, at `product_uom_qty = 0` |
+| set `return_line.quantity` | write `move.product_uom_qty`, matching by `move.origin_returned_move_id` |
+| a zero line produced **no move** | a zero move still exists — `unlink()` it |
+| raised *"Please specify at least one non-zero quantity"* when all were zero | nothing raises — check `move_ids` yourself |
+| `action_create_returns()` confirmed + assigned | `_create_return()` leaves the picking **draft** — you confirm and assign |
+| `_can_return()` refused non-done pickings | gone; the method's own `picking.state != 'done'` guard already covers it |
+
+Replace lines 1452-1468 with:
+
+```python
+        skip = not create_waybill
+        # Odoo 20 deleted stock.return.picking; returns are picking-native now.
+        # _create_return() copies every non-cancelled move at quantity 0 and leaves the
+        # picking in draft (stock_picking.py:976, :939), so we set the quantities, drop
+        # the lines we are not returning, and confirm/assign under the skip flag.
+        return_picking = picking.with_context(skip_rs_auto_create=skip)._create_return()
+        remaining = dict(qty_to_return)
+        for move in return_picking.move_ids:
+            want = remaining.get(move.product_id.id, 0.0)
+            # Per-move share, not the whole product quantity on every move (issue #16).
+            take = min(want, move.origin_returned_move_id.quantity or want) if want else 0.0
+            move.product_uom_qty = take
+            if take:
+                remaining[move.product_id.id] = want - take
+        return_picking.move_ids.filtered(lambda m: not m.product_uom_qty).unlink()
+        if not return_picking.move_ids:
+            return_picking.unlink()
+            return False
+        return_picking.with_context(skip_rs_auto_create=skip).action_confirm()
+        return_picking.with_context(skip_rs_auto_create=skip).action_assign()
+        return return_picking
+```
+
+Three things this buys:
+
+- **It closes #16 in the same edit.** The old loop wrote the full product quantity onto *every* return
+  line of that product (2 moves of A, return 2 → 2 + 2 = 4). Because v20 makes us write
+  `product_uom_qty` per move ourselves, the per-move decrement is now the natural way to write it —
+  this is exactly the fix #16 asks for, expressed against `origin_returned_move_id` instead of the
+  wizard's `move_id`. **#16's own fix text is superseded by this patch.**
+- **#22 and #25 keep their ADJUST verdicts.** The wizard's per-module overrides survived on
+  `stock.picking._prepare_return_move_default_values`, so a return built this way still carries
+  `origin_returned_move_id`, `purchase_line_id` + partner, `sale_line_id` and `to_refund` (see the
+  table in section B). Both items can be implemented on top of this method rather than hand-building
+  moves.
+- **"Leave the return Ready" is now the default**, not something to arrange: `_create_return()` does
+  not validate, and the two calls above stop at Ready.
+
+One behavioural difference to accept or guard: v19's wizard skipped moves whose
+`location_dest_usage == 'inventory'`; v20's `_create_return` only skips `state == 'cancel'`. For a
+waybill-linked delivery or receipt that destination does not occur, so the patch above ignores it — add
+`and m.origin_returned_move_id.location_dest_usage != 'inventory'` to the `unlink` filter if that ever
+changes.
+
+### G3 — V3: OWL 3 in the waybill dashboard
+
+Two mechanical edits, both inside
+[static/src/dashboard/](../custom_addons/gec_odoo_modules/rs_waybill/static/src/dashboard/). Everything else
+in that component is untouched: `onWillStart`, `status`, `useBus`, `useService`, `static template`, the
+`{...listView, Controller: ...}` registry spread, `model.bus` `"update"`, `model.config.domain` and
+`searchModel.getSearchItems` / `.query` / `.toggleSearchItem` all still exist in 20.0.
+
+**[waybill_list_kpis.js:13](../custom_addons/gec_odoo_modules/rs_waybill/static/src/dashboard/waybill_list_kpis.js#L13)** — `useState` is no longer exported by `@odoo/owl`:
+
+```diff
+-import { onWillStart, status, useState } from "@odoo/owl";
++import { onWillStart, proxy, status } from "@odoo/owl";
+```
+
+**[waybill_list_kpis.js:36](../custom_addons/gec_odoo_modules/rs_waybill/static/src/dashboard/waybill_list_kpis.js#L36)**:
+
+```diff
+-        this.kpis = useState({
++        this.kpis = proxy({
+```
+
+`proxy()` is the direct replacement — same call shape, same reactivity, and it is what core now uses
+([dialog.js:75,106](../addons/web/static/src/core/dialog/dialog.js#L75)). The `Object.assign(this.kpis, {...})`
+at the end of `refreshKpis` keeps working unchanged.
+
+**[waybill_list_kpis.xml](../custom_addons/gec_odoo_modules/rs_waybill/static/src/dashboard/waybill_list_kpis.xml)** — 8 occurrences of `t-esc`, all
+`t-esc="..."` → `t-out="..."`. `t-out` escapes the same way for plain values, so there is no
+behavioural change here.
+
+`odoo/upgrade_code/owl3-migration.py` performs both edits mechanically across a whole addons path;
+running it is safer than hand-editing if you also want the other custom modules done at the same time.
+
+**Out of scope for this file but the same fix:** `bsc_strategy`, `id_ge_sign`, `gec_income_tax_report`,
+`gec_analytic_margin` and `dps_account_report_filter` all still import `useState` and/or use `t-esc`,
+and `gec_income_tax_report` also imports **`useRef`**, which is likewise gone in 20.0 (295 core files
+in 19.0 → 0 in 20.0).
+
+### G4 — V5: the `tracking == 'none'` branch
+
+[rs_waybill.py:2029](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L2029) reads:
+
+```python
+                        if move.product_id.tracking == 'none':
+                            move.quantity = move.product_uom_qty
+                        else:
+                            tracked_unfilled |= move
+```
+
+In 20.0 `tracking` is `False` / `'lot'` / `'serial'` — the `'none'` value and the `required=True,
+default='none'` are gone ([product.py:835-841](../addons/stock/models/product.py#L835)). The comparison
+is now always False, so **every** unfilled incoming move is reported as tracked and nothing is
+force-filled — the receipt silently stops being completed. Fix:
+
+```diff
+-                        if move.product_id.tracking == 'none':
++                        if not move.product_id.tracking:
+                             move.quantity = move.product_uom_qty
+```
+
+Grep for other `tracking` comparisons before shipping: this is the only one in the three modules today.
+
+### G5 — F: port the two dead `_name_search` overrides
+
+Core has no `_name_search`. `name_search` searches `display_name` directly and the hook is
+`_search_display_name(operator, value)`, which returns a **domain**, not a recordset
+([models.py:1593-1622](../odoo/orm/models.py#L1593), [1521](../odoo/orm/models.py#L1521)). Both overrides
+below have therefore never run — on 19.0 either. Porting them turns two silently missing features back on.
+
+**[res_partner.py:36-44](../custom_addons/gec_odoo_modules/rs_waybill/models/res_partner.py#L36)** — widen the
+partner search by TIN:
+
+```python
+    @api.model
+    def _search_display_name(self, operator, value):
+        domain = super()._search_display_name(operator, value)
+        if value and self.env.context.get('search_partner_by_tin'):
+            joiner = Domain.AND if operator in Domain.NEGATIVE_OPERATORS else Domain.OR
+            domain = joiner([
+                domain,
+                Domain('company_registry', operator, value),
+                Domain('vat', operator, value),
+            ])
+        return domain
+```
+
+**[fleet_vehicle.py:37-49](../custom_addons/gec_odoo_modules/rs_waybill/models/fleet_vehicle.py#L37)** — replace the
+name match with plate / driver / TIN, which is what the old code meant by setting `name = ''`:
+
+```python
+    @api.model
+    def _search_display_name(self, operator, value):
+        if value and self.env.context.get('show_driver_vehicle_label'):
+            joiner = Domain.AND if operator in Domain.NEGATIVE_OPERATORS else Domain.OR
+            return joiner([
+                Domain('license_plate', operator, value),
+                Domain('driver_id.name', operator, value),
+                Domain('driver_id.vat', operator, value),
+                Domain('driver_id.company_registry', operator, value),
+            ])
+        return super()._search_display_name(operator, value)
+```
+
+`Domain` is already imported in `res_partner.py`; add `from odoo.fields import Domain` to
+`fleet_vehicle.py`. The `NEGATIVE_OPERATORS` branch mirrors what core's own `_search_display_name`
+does — OR-ing a `not ilike` would widen the result instead of narrowing it.
+
+### G6 — order of work, and what it unblocks
+
+1. **G1** (renames) — mechanical, no behaviour change, and G2 depends on `uom_id` existing.
+2. **G2** (`_create_return_picking`) — the only rewrite. Closes **#16** on the way and re-enables the
+   return paths that **#21**, **#22**, **#24**, **#25** and **#60** all sit on.
+3. **G4** (`tracking`) — one line, but it silently disables receipt completion until fixed.
+4. **G3** (OWL) — front-end only; the dashboard is broken but nothing server-side depends on it.
+5. **G5** (`_search_display_name`) — optional; it restores a feature rather than fixing a break.
+
+That order was followed on 2026-09-22, with G7 folded in as each install failure surfaced it. G5 was
+left out. The 65 open items below are actionable again. Nothing in G changes the plan's findings —
+**#40 still needs re-deriving first** (section C), and the gec_modules2 counts throughout this file
+remain Odoo 19 test-DB numbers.
+
+
+### G7 — V6–V10: the blockers found by actually installing (all applied)
+
+V1–V5 came from reading the source. V6–V10 came from running `-i rs_waybill` until it stopped failing.
+Each one is applied.
+
+**V6 — `ir.config_parameter`.** Straight rename to the typed accessor, chosen by what the key holds:
+
+| File | Was | Now |
+|---|---|---|
+| [res_company.py:69](../custom_addons/gec_odoo_modules/rs_waybill/models/res_company.py#L69) | `ICP.get_param(_MIGRATION_FLAG)` | `ICP.get_bool(_MIGRATION_FLAG)` |
+| [res_company.py:73](../custom_addons/gec_odoo_modules/rs_waybill/models/res_company.py#L73) | `ICP.get_param(param, '')` | `ICP.get_str(param, '')` |
+| [res_company.py:80](../custom_addons/gec_odoo_modules/rs_waybill/models/res_company.py#L80) | `ICP.set_param(_MIGRATION_FLAG, '1')` | `ICP.set_bool(_MIGRATION_FLAG, True)` |
+| [rs_waybill_sync.py:278-279](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill_sync.py#L278) | `ICP.get_param(key, '')` | `ICP.get_str(key, '')` |
+| [rs_waybill_sync.py:304,389](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill_sync.py#L304) | `ICP.set_param(cursor_key, now_str)` | `ICP.set_str(cursor_key, now_str)` |
+
+`get_bool` is backward-compatible with the legacy `'1'` the v19 code wrote: `_get` converts through
+`str2bool`, and `str2bool('1')` is `True`. An unparseable value returns the default rather than raising,
+because `_get` catches `ValueError` and yields `INVALID_VALUE` ([ir_config_parameter.py:132-150](../odoo/addons/base/models/ir_config_parameter.py#L132)).
+
+**V7 — `company_registry` → `vat`.** This is the one with a judgement call in it, and 20.0 forces the
+answer:
+
+- the field and its column are gone from `res.partner` and `res.company`;
+- its replacement, `additional_identifiers`, has **no Georgian key** — all 58 entries of
+  `ADDITIONAL_IDENTIFIERS_METADATA` ([odoo/tools/partner_identifiers.py:479](../odoo/tools/partner_identifiers.py#L479))
+  are for other countries, and `l10n_ge` adds none;
+- `res_partner.company_registry` does not exist as a column in gec20_prod1, so there is no stored
+  Georgian TIN to migrate out of it;
+- the module already read `company_registry or vat` everywhere, so `vat` was always the fallback.
+
+So every site collapses to `vat`, which is exactly what the fallback already did whenever
+`company_registry` was empty. 33 non-test sites:
+
+| Shape | Sites | Becomes |
+|---|---|---|
+| `(x.company_registry or x.vat or '')` | 13 | `(x.vat or '')` |
+| `x.company_registry or x.vat or False` | 2 | `x.vat or False` |
+| `['|', ('company_registry','=',t), ('vat','=',t)]` | 6 | `[('vat','=',t)]` |
+| `'company_registry': self.seller_tin` in partner `create` | 1 | dropped (`'vat'` was already in the same dict) |
+| `@api.depends(... 'company_registry')` | 2 | dependency dropped |
+| `_compute_display_name` preferring `company_registry` over `vat` | 1 | `vat` only |
+
+**Behavioural note worth stating plainly:** on a database where the TIN was stored in
+`company_registry` and **not** in `vat`, that TIN is now invisible to the module. gec20_prod1 has no
+such column so nothing is lost there, but any other 19.0 database must have its TINs moved into `vat`
+before these modules are pointed at it.
+
+**V8 — uom view refs.** [uom_uom_views.xml](../custom_addons/gec_odoo_modules/rs_waybill/views/uom_uom_views.xml):
+`ref="uom.product_uom_form_view"` → `ref="uom.uom_uom_view_form"`, `ref="uom.product_uom_tree_view"` →
+`ref="uom.uom_uom_view_list"`. The `//field[@name='name']` xpath inside still resolves
+([uom_uom_views.xml:24](../addons/uom/views/uom_uom_views.xml#L24)).
+
+**V9 — view priority.** [sale_order_views.xml](../custom_addons/gec_odoo_modules/rs_waybill/views/sale_order_views.xml)
+gained `<field name="priority">25</field>` on the view that inherits `sale.view_order_form`, so it
+applies after `sale_stock`'s priority-20 extension and the `action_view_delivery` button exists by then.
+This is the standard core idiom — `sale_project`, `sale_expense` and others do the same.
+
+**V10 — `<column>` anchors.** Two xpaths re-anchored:
+
+```diff
+-<xpath expr="//field[@name='order_line']/list/field[@name='product_id']" position="after">
++<xpath expr="//field[@name='order_line']/list/column[@name='product_and_description']" position="after">
+```
+```diff
+-<xpath expr="//field[@name='move_ids']/list/field[@name='product_id']" position="attributes">
++<xpath expr="//field[@name='move_ids']/list//field[@name='product_id']" position="attributes">
+```
+
+The first inserts `bar_code` as its own list column after the product column; the second is a
+`position="attributes"` edit, so a descendant axis is enough. `product_uom_qty` and `quantity` are still
+direct `<list>` children and needed no change.
+
+**A pre-flight that is worth reusing:** parse every inherited view in the three modules, load the base
+parent arch out of core XML, and run each `xpath expr` against it. It caught V10 before the installer
+did and gave exactly one false positive (V9's button, which comes from a sibling extension rather than
+the base arch). It does not model sibling extensions or priorities, so it narrows the install-fail loop
+rather than replacing it.
+
+### G8 — what is still not done
+
+- **The test suite is not ported.** Seven files still use removed APIs: `company_registry` in
+  `common.py`, `test_display_names.py`, `test_sync_resilience.py`, `test_sync_users.py`,
+  `test_data_integrity.py`, `test_live_view_drift.py`; `get_param`/`set_param` in `test_sync_users.py`
+  and `test_company_settings.py`. They will fail on 20.0 until ported the same way as G6/G7.
+- **G5** (`_name_search` → `_search_display_name`) is not applied — it restores a feature that has never
+  worked rather than fixing a break.
+- **The OWL dashboard is not runtime-verified.** `useState` → `proxy` and the 8 `t-esc` → `t-out` are
+  applied and every surrounding API was confirmed to still exist in 20.0, but the KPI cards have not
+  been opened in a browser.
+- **`_sql_constraints` still warns** at every load. That is plan item **#33**, unchanged from 19.0.
+- **#40 still needs re-deriving** before anyone acts on it (section C).
+
+### G9 — nested `next` actions crash the web client (fixed; **not** a 20.0 change)
+
+Found 2026-09-22 by clicking *Import Selected* on the rs.ge Buyer Inbox with no matching vendor:
+
+```
+TypeError: Cannot read properties of undefined (reading 'map')
+    at _preprocessAction (web.assets_web.min.js)
+    at doAction / doActionButton
+```
+
+The warning notification is shown first and is correct; the crash is the action that runs *after* it.
+
+**Mechanism.** `call_button` passes the returned action through `clean_action`, which calls
+`generate_views()` to build `views` from `view_mode` when it is missing
+([utils.py:40-43](../addons/web/controllers/utils.py#L40), [122-157](../addons/web/controllers/utils.py#L122)).
+It only does this for the **top-level** action. When the top level is an
+`ir.actions.client` / `display_notification`, the action nested under `params.next` is never touched.
+The client then reads `action.views.map(...)` unconditionally for any `ir.actions.act_window`
+([action_plugin.js:476](../addons/web/static/src/webclient/actions/action_plugin.js#L476)), and a
+`next` carrying only `view_mode` has no `views`.
+
+**This is not a 20.0 regression.** `_preprocessAction` is byte-identical between 19.0
+(`action_service.js:418`) and 20.0 (`action_plugin.js:452`) — verified by diff — and `display_notification`
+returns `params.next` the same way in both. The branch simply had not been hit before: it needs
+*Import Selected* to create **zero** bills.
+
+**Fix — spell `views` out on any action used as a nested `next`:**
+
+- [rs_buyer_inbox_wizard.py:406](../custom_addons/gec_odoo_modules/rs_einvoice/models/rs_buyer_inbox_wizard.py#L406) — the "no bills imported" warning's `next` **was removed entirely**. Adding `views` made it work, and working turned out to be wrong: the wizard is opened as a page, so a `target='new'` re-open stacked a second copy of it on top. `_executeClientAction` only navigates when the notification returns a `next` ([action_plugin.js:1391](../addons/web/static/src/webclient/actions/action_plugin.js#L1391), identical in 19.0), so with no `next` the toast shows and the operator stays on the wizard they are already looking at — which is what the `next` was trying to achieve.
+- [rs_replace_preview_wizard.py:131](../custom_addons/gec_odoo_modules/rs_einvoice/models/rs_replace_preview_wizard.py#L131) — `_open_drafts_action()` is returned directly in one place (safe) and as a `next` in another (not): added `'views': [(False, 'form')]` and `[(False, 'list'), (False, 'form')]` to its two branches.
+
+The other five nested `next` values in the three modules are `ir.actions.act_window_close` or
+`ir.actions.client` / `soft_reload`, which carry no `views` requirement and need no change.
+
+**Two rules for this codebase:**
+
+1. An `act_window` dict that can end up under `params.next` must carry an explicit `views`;
+   `view_mode` alone is only enough for an action returned at the top level.
+2. Use `next` only for *intentional navigation* (opening the records you just created). A `next` that
+   re-opens the wizard the operator is already in duplicates it instead of refreshing it — omit `next`
+   and the view simply stays put.
+
+**The underlying message was right, and the flow had a trap in it.** `_rs_find_partner_by_tin`
+([rs_buyer_inbox_wizard.py:106](../custom_addons/gec_odoo_modules/rs_einvoice/models/rs_buyer_inbox_wizard.py#L106))
+searches `vat`; the partner carrying TIN 12345678910 on gec20_prod1 was created at 16:00:27, two
+minutes *after* the 15:58:13 failure — i.e. the operator created it **because** of the message.
+
+`partner_id` on the inbox line was a plain stored m2o, resolved once when *Search rs.ge* built the row.
+So creating the vendor the message asks for changed nothing until the whole search was re-run, and the
+same message came back. Measured on gec20_prod1: 89 lines stuck with an empty `partner_id`, all stamped
+15:57:56, while the lookup run against the live database returns `res.partner(6,) satesto k`.
+
+**Fixed:** `_do_import` now retries `_rs_find_partner_by_tin` when the stored match is empty, before
+giving up ([rs_buyer_inbox_wizard.py:494](../custom_addons/gec_odoo_modules/rs_einvoice/models/rs_buyer_inbox_wizard.py#L494)),
+reusing the search path's own ambiguity wording. A vendor created in response to the message now works
+on the next *Import Selected* without re-running the search.
 
 ## Re-verification against the re-uploaded rs_waybill — 2026-09-19
 
@@ -254,6 +774,7 @@ if gap:
 - **Example.** Delivery has two moves of A (3 + 3); return 2 → return lines 2 + 2 = 4.
 - **Provoke.** SO with product A on two lines (3 + 3) → deliver, validate → waybill completed. Shell: `wb._create_return_picking({A.id: 2}, create_waybill=False)` → the return picking has two moves of 2 = 4.
 - **Fix.** Decrement per line: `take = min(remaining[pid], return_line.move_id.quantity); return_line.quantity = take; remaining[pid] -= take`.
+- **20.0.** Superseded by [G2](#g2--v1-rewrite-_create_return_picking-on-the-picking-native-api): the wizard this fix edits no longer exists, and the G2 rewrite of `_create_return_picking` carries the per-move decrement.
 
 ### 17. Sale line quantity overwritten by one delivery [C]
 - **Module.** `rs_waybill`
@@ -298,6 +819,7 @@ if gap:
 - **Provoke.** Shell: buyer waybill with PO + done receipt; `wb._reconcile_buyer_decrease_done(po, product, 1, po_line)` → a new outgoing transfer to Partners/Vendors in state Done, on-hand −1, no waybill anywhere.
 - **Fix.** Mirror the seller side: accumulate the decrease and open the Return Decision wizard on Receive (physical return → return picking left **Ready** for the warehouse; paperwork only → PO quantity only). At minimum stop calling `_force_validate_moves` there.
 - **Review.** ADJUST. Use `stock.return.picking` on the receipt: core sets `origin_returned_move_id`, `purchase_line_id`, partner and `to_refund`, and `_prepare_qty_received` (purchase_stock 65-67) counts it. Leave the return Ready.
+- **20.0.** Verdict unchanged, API changed: `stock.return.picking` is gone — build the return with `picking._create_return()` via the rewritten `_create_return_picking` ([G2](#g2--v1-rewrite-_create_return_picking-on-the-picking-native-api)). The four fields core sets still come for free (section B table), and "leave it Ready" is now the default.
 
 ### 23. Picking cancel cascade hits vendor waybills [C]
 - **Module.** `rs_waybill`
@@ -321,6 +843,7 @@ if gap:
 - **Provoke.** Seller type-5 return waybill synced from rs.ge for 4 units of a delivered SO → receipt created → Complete → on-hand +4, SO Delivered still 10, Create Invoice offers 10. Shell: `wb.picking_id.move_ids.mapped('origin_returned_move_id')` and `.mapped('sale_line_id')` both empty.
 - **Fix.** Seller: find the original delivery (waybill's `sales_order_id`, or same buyer + products) and use `stock.return.picking` as `_create_return_picking` does (1441-1468). Buyer: set `purchase_line_id` and `to_refund=True` on the moves as 1827-1835 does, matching PO lines by product.
 - **Review.** ADJUST. Same as #22: the return wizard on the original picking sets `sale_line_id` / `purchase_line_id` and `origin_returned_move_id`; hand-built moves are invisible to `qty_delivered` / `qty_received`.
+- **20.0.** Same as #22 — the hooks moved onto `stock.picking._prepare_return_move_default_values`, so route both directions through [G2](#g2--v1-rewrite-_create_return_picking-on-the-picking-native-api) instead of the deleted wizard.
 
 ### 26. Backfill builds documents for cancelled waybills [C]
 - **Module.** `rs_waybill`
@@ -357,6 +880,7 @@ if gap:
 - **Provoke.** Sync a buyer waybill with a barcode unknown to Odoo → product auto-created → Product form: *Track Inventory* unchecked. Receive → Inventory → On Hand shows nothing. gec_modules2 already has one: `SELECT id FROM product_template WHERE is_rs_product AND NOT is_storable`.
 - **Fix.** Add `'is_storable': True` to the three create dicts.
 - **Review.** OK once the business rule is confirmed: every rs.ge good is a tracked physical product. A value in `create` wins; the compute only forces False for non-consumables (`product.py:860-861`).
+- **20.0.** Still true, but `is_storable` now lives in `product/models/product_template.py:127` (compute `_compute_is_storable`, `:477`). Watch the new `store_by` inverse, and note `tracking` no longer accepts `'none'` ([G4](#g4--v5-the-tracking--none-branch)).
 
 ### 31. Price / discount / unit / currency not normalized [C] [D]
 - **Module.** `rs_waybill, rs_base_methods`
@@ -397,7 +921,7 @@ if gap:
 
 ### 36. Waybill ACL: delete for every internal user [C]
 - **Module.** `rs_waybill`
-- **Issue.** `W/security/ir.model.access.csv:2-3` grants full CRUD on `rs.waybill` and lines to `base.group_user`; rs.ge-mutating buttons carry no groups.
+- **Issue.** `W/security/ir.access.csv:2,4` (was `ir.model.access.csv:2-3` before the 2026-09-22 `ir.access` migration) grants full CRUD on `rs.waybill` and lines to `base.group_user`; rs.ge-mutating buttons carry no groups.
 - **Provoke.** Log in as an internal user without Inventory or Accounting groups → Waybills → open one → Delete allowed; Refuse and Cancel buttons visible.
 - **Fix.** add user/manager groups, restrict unlink to manager, put `groups=` on Refuse / Delete / Cancel buttons.
 

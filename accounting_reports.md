@@ -3,6 +3,7 @@
 > **Module:** `account_reports` (enterprise) | **Path:** [enterprise/account_reports/](../enterprise/account_reports/)
 > **Depends on:** `account_accountant`
 > **Base models:** `account` module ([addons/account/models/account_report.py](../addons/account/models/account_report.py))
+> **Odoo version:** 20.0 — see [What Changed in Odoo 20](#what-changed-in-odoo-20) if you know the 19 engine.
 
 ---
 
@@ -14,7 +15,7 @@ The reporting engine is a **data-driven framework** for financial statements. Ev
 - A report is `account.report` + its `account.report.line` rows
 - Each row has `account.report.expression` records — one per column
 - Each expression has an `engine` field that determines how its value is computed
-- 6 engines exist, each running against `account.move.line`
+- 8 engines exist (6 in Odoo 19 + `text` and `reference`), most running against `account.move.line`
 - The result is an interactive screen view with drill-down, filters, PDF/XLSX export, comparison columns
 
 ---
@@ -33,6 +34,7 @@ The reporting engine is a **data-driven framework** for financial statements. Ev
 | `l10n_*` | Localized tax report variants via `root_report_id` + `country_id` |
 | `account_reports_cash_basis` | `only_tax_exigible` filter |
 | `account_budget` | `filter_budgets` on P&L |
+| `account_asset` | asset/depreciation ledger reports and the `horizontal_group_ledger` grouping |
 
 ---
 
@@ -42,11 +44,15 @@ The reporting engine is a **data-driven framework** for financial statements. Ev
 account.report
     └── account.report.line          (one row, e.g. "Current Assets")
             └── account.report.expression   (one cell value per column)
-                    engine     = domain | tax_tags | aggregation | account_codes | external | custom
-                    formula    = what to compute (syntax depends on engine)
-                    subformula = modifier on the result
+                    engine     = domain | tax_tags | aggregation | account_codes
+                               | external | custom | text | reference
+                    formula    = what to compute (syntax depends on engine)   [Text]
+                    subformula = modifier on the result                       [Text]
                     date_scope = time window for the SQL
 ```
+
+`formula` and `subformula` were `Char` in Odoo 19 and are `Text` in Odoo 20, so multi-line aggregation formulas are now possible.
+Source: [account_report.py:686](../addons/account/models/account_report.py#L686)
 
 Every number on a financial report comes from an `account.report.expression` evaluated by its engine against `account.move.line`.
 
@@ -73,16 +79,31 @@ Every number on a financial report comes from an `account.report.expression` eva
 | `availability_condition` | `Selection` | When this report appears: `always`, `country`, `coa` |
 | `custom_handler_model_id` | `Many2one → ir.model` | Model inheriting `account.report.custom.handler` |
 | `default_opening_date_filter` | `Selection` | Default date range when report opens |
+| `groupby` / `user_groupby` | `Char` | Report-wide default groupby for its lines (new in Odoo 20); `user_groupby` is the editable copy |
+| `currency_translation` | `Selection` | `current` (latest rate at report date) or `cta` (per-account-type rates) — see [Currency Handling](#currency-handling) |
+| `enable_snapshots` | `Boolean` | Allows engine results for closed periods to be cached as `account.report.snapshot` records |
+| `use_fiscal_periods` | `Boolean` | Drive the date filter by fiscal periods rather than calendar ranges |
 
 **Filter fields** — each adds a filter widget in the UI:
-`filter_date_range`, `filter_journals`, `filter_analytic`, `filter_partner`, `filter_hierarchy`,
-`filter_period_comparison`, `filter_growth_comparison`, `filter_hide_0_lines`, `filter_multi_company`, etc.
+`filter_date_range`, `filter_journals`, `filter_partner`, `filter_hierarchy`, `filter_account_type`,
+`filter_period_comparison`, `filter_growth_comparison`, `filter_line_comparison`, `filter_hide_0_lines`,
+`filter_unreconciled`, `filter_show_draft`, `filter_aml_ir_filters`, `filter_budgets`, `filter_multi_company`.
+
+Odoo 20 changes on this model:
+
+| Field | Change |
+|---|---|
+| `filter_analytic` | removed — the analytic filter is now `filter_analytic_groupby`, declared in [account_analytic_report.py:14](../enterprise/account_reports/models/account_analytic_report.py#L14) |
+| `prefix_groups_threshold` | removed, together with `_init_options_prefix_groups_threshold` |
+| `filter_line_comparison`, `enable_snapshots`, `use_fiscal_periods`, `currency_translation`, `groupby`, `user_groupby` | added |
+| `load_more_limit` | default is now 500 (was unset) |
+| `active` | now computed from `active_fallback` / `active_selection` instead of a plain boolean |
 
 ---
 
 ### `account.report.line` — A Report Row
 
-> [addons/account/models/account_report.py:349](../addons/account/models/account_report.py#L349)
+> [addons/account/models/account_report.py:405](../addons/account/models/account_report.py#L405)
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -91,11 +112,13 @@ Every number on a financial report comes from an `account.report.expression` eva
 | `parent_id` | `Many2one` | Parent line for hierarchy |
 | `children_ids` | `One2many` | Child lines |
 | `expression_ids` | `One2many` | One expression per column |
-| `groupby` | `Char` | Comma-separated `account.move.line` fields — expands row into sublines |
+| `groupby` / `user_groupby` | `Char` | Comma-separated `account.move.line` fields — expands row into sublines. `user_groupby` is the editable override; `groupby` is the definition default |
 | `hierarchy_level` | `Integer` (computed) | Indentation depth; root = 1 |
-| `foldable` | `Boolean` | If True, line starts collapsed |
+| `foldability` | `Selection` (computed, editable) | `always_unfolded` / `never_unfolded` / `foldable`. **Replaces the `foldable` boolean of Odoo 19** |
 | `hide_if_zero` | `Boolean` | Hidden when all columns are 0 |
 | `horizontal_split_side` | `Selection` | `left`/`right` — side-by-side Balance Sheet layout |
+| `print_on_new_page` | `Boolean` | Start a new PDF page at this line |
+| `action_id` | `Many2one → ir.actions.actions` | Turns the line into a link executing that action |
 | `sequence` | `Integer` | Display order |
 
 **Shortcut write-only fields** (auto-create `expression_ids`):
@@ -108,7 +131,7 @@ Every number on a financial report comes from an `account.report.expression` eva
 
 ### `account.report.expression` — One Cell Value
 
-> [addons/account/models/account_report.py:579](../addons/account/models/account_report.py#L579)
+> [addons/account/models/account_report.py:664](../addons/account/models/account_report.py#L664)
 
 | Field | Type | Purpose |
 |---|---|---|
@@ -122,12 +145,20 @@ Every number on a financial report comes from an `account.report.expression` eva
 | `blank_if_zero` | `Boolean` | Show blank instead of 0 |
 | `auditable` | `Boolean` (computed) | Clicking opens journal line drill-down |
 | `carryover_target` | `Char` | `line_code.expr_label` — where to carry this value in next period |
+| `model_id` | `Many2one → ir.model` | New in Odoo 20 — the model the `reference` engine resolves against |
+
+Two database constraints worth knowing:
+
+- `_domain_engine_subformula_required` — a `domain` expression must have a subformula
+- `_line_label_uniq` — one label per report line
+
+Source: [account_report.py:719](../addons/account/models/account_report.py#L719)
 
 ---
 
 ### `account.report.external.value` — Stored Manual Values
 
-> [addons/account/models/account_report.py:947](../addons/account/models/account_report.py#L947)
+> [addons/account/models/account_report.py:1059](../addons/account/models/account_report.py#L1059)
 
 Used by the `external` engine. Each record is one manually entered (or carried-over) value for one expression.
 
@@ -143,48 +174,71 @@ Used by the `external` engine. Each record is one manually entered (or carried-o
 
 ---
 
-## The 6 Computation Engines
+## The 8 Computation Engines
 
-All engines are dispatched dynamically:
+**Renamed in Odoo 20.** Engine methods went from `_compute_formula_batch_with_engine_<engine>` to `_report_engine_<engine>`, and dispatch now goes through `_get_custom_report_function`, which also resolves custom engines declared on a handler:
 
 ```python
-# enterprise/account_reports/models/account_report.py:3852
-engine_function_name = f'_compute_formula_batch_with_engine_{formula_engine}'
-return getattr(self, engine_function_name)(column_group_options, date_scope, formulas_dict, ...)
+# enterprise/account_reports/models/account_report.py:4376
+engine_function = self._get_custom_report_function(self._get_engine_function_name(engine), 'engine')
+return engine_function(column_group_options, date_scope, formulas_dict, current_groupby, warnings=warnings)
+
+def _get_engine_function_name(self, engine):
+    # standard engine -> '_report_engine_<engine>'; custom engine -> the formula itself
+    ...
 ```
+
+Source: [`_compute_formula_batch() — account_report.py:4345`](../enterprise/account_reports/models/account_report.py#L4345), [`_get_engine_function_name() — account_report.py:4379`](../enterprise/account_reports/models/account_report.py#L4379)
+
+The engine signature also lost `next_groupby`, `offset` and `limit`; batching by `next_groupby` is gone.
+
+| Engine | Method | Added in |
+|---|---|---|
+| `domain` | `_report_engine_domain` | — |
+| `tax_tags` | `_report_engine_tax_tags` | — |
+| `aggregation` | resolved in `_compute_expression_totals_for_single_column_group` | — |
+| `account_codes` | `_report_engine_account_codes` | — |
+| `external` | `_report_engine_external` | — |
+| `custom` | the formula names the method | — |
+| `text` | `_report_engine_text` | **Odoo 20** |
+| `reference` | `_report_engine_reference` | **Odoo 20** |
+
+Source: [`engine` selection — account_report.py:672](../addons/account/models/account_report.py#L672)
 
 ---
 
 ### Engine 1: `domain` — Odoo Domain Filter
 
-> [_compute_formula_batch_with_engine_domain()](../enterprise/account_reports/models/account_report.py#L3934)
+> [`_report_engine_domain() — account_report.py:4464`](../enterprise/account_reports/models/account_report.py#L4464)
 
 Filters `account.move.line` by an Odoo domain, then aggregates the `balance` column.
 
 **Formula:** A Python list — a valid Odoo domain on `account.move.line`.
 
-**Subformulas:**
+**Subformulas (Odoo 20 — only two remain):**
 
 | Subformula | Result |
 |---|---|
 | `sum` | Sum of all matching line balances |
 | `-sum` | Negated sum — income accounts have credit-normal (negative) balances; negate to show positive revenue |
-| `sum_if_pos` | Result only if positive, else 0 |
-| `sum_if_neg` | Result only if negative, else 0 |
-| `count_rows` | Count of distinct groupby keys — **non-batchable, runs one SQL per formula, avoid on large reports** |
+
+`sum_if_pos`, `sum_if_neg` and `count_rows` were **removed in Odoo 20**. If a localized report still declares one, it will not resolve. Replace `sum_if_pos` / `sum_if_neg` with an `aggregation` expression carrying an `if_above(...)` / `if_below(...)` bound; `count_rows` has no replacement.
 
 **SQL generated (simplified):**
 ```sql
-SELECT COALESCE(SUM(balance * currency_rate), 0.0) AS sum,
-       COUNT(DISTINCT next_groupby_field)           AS count_rows
+SELECT COALESCE(SUM(consolidation_balance), 0.0) AS sum,
+       COUNT(1) > 0                              AS has_sublines
 FROM   account_move_line
-JOIN   currency_table ON ...
 WHERE  <date_scope_filter>
   AND  <company_filter>
   AND  <journal_filter>
   AND  <domain_filter>
 GROUP BY <current_groupby_field>   -- only when line has groupby
 ```
+
+`consolidation_balance` is `balance * consolidation_rate`, a computed-SQL field on `account.move.line`. It replaced the Odoo 19 `currency_table` JOIN — see [Currency Handling](#currency-handling).
+
+**Batching:** when every leaf of a domain walks the same many2one field (e.g. all terms start with `account_id.`), Odoo resolves that comodel once and groups all such formulas into a single query. Domains touching several root fields fall back to one query each.
 
 **Real examples:**
 ```xml
@@ -201,7 +255,7 @@ GROUP BY <current_groupby_field>   -- only when line has groupby
 
 ### Engine 2: `tax_tags` — Tax Tag Matching
 
-> [_compute_formula_batch_with_engine_tax_tags()](../enterprise/account_reports/models/account_report.py#L3858)
+> [`_report_engine_tax_tags() — account_report.py:4392`](../enterprise/account_reports/models/account_report.py#L4392)
 
 Matches `account.move.line` records carrying a specific `account.account.tag`. The tag is **auto-created** when the expression is saved — its name equals the formula string.
 
@@ -217,13 +271,13 @@ Matches `account.move.line` records carrying a specific `account.account.tag`. T
 ```
 
 **Tag creation:** When `engine = 'tax_tags'` is saved, `_create_tax_tags()` creates an `account.account.tag` with `applicability = 'taxes'` scoped to the report's country.
-Source: [account_report.py:695](../addons/account/models/account_report.py#L695)
+Source: [`_create_tax_tags() — account_report.py:805`](../addons/account/models/account_report.py#L805)
 
 ---
 
 ### Engine 3: `aggregation` — Formula Over Other Lines
 
-> Handled in [_compute_expression_totals_for_single_column_group()](../enterprise/account_reports/models/account_report.py#L3378)
+> Handled in [`_compute_expression_totals_for_single_column_group() — account_report.py:3773`](../enterprise/account_reports/models/account_report.py#L3773)
 
 Combines values of other report lines using arithmetic. References lines by their `code` field. **Runs last** — after all other engines.
 
@@ -238,12 +292,20 @@ sum_children                              ← sum all direct child lines
 
 | Subformula | Effect |
 |---|---|
-| `if_above(CUR 0)` | Show only if above 0 |
-| `if_below(CUR 0)` | Show only if below 0 |
-| `force_between(CUR -X, CUR X)` | Clamp to range |
-| `cross_report(xml.id)` | Reference a line from a **different** report |
+| `if_above(CUR(x))` | Result is blank unless it is strictly above `x` |
+| `if_below(CUR(x))` | Result is blank unless it is strictly below `x` |
+| `if_between(CUR(x), CUR(y))` | Result is blank unless it lies between `x` and `y` |
+| `round(n[, method])` | Round to `n` decimals; `method` is `HALF-UP`/`HALF-DOWN`/`HALF-EVEN`/`UP`/`DOWN` (default `HALF-DOWN`). `n` may be negative |
+| `cross_report(report[, force_date_scope])` | Reference a line from a **different** report; `force_date_scope` makes the referenced expression use this expression's `date_scope` |
+| `ignore_zero_division` | Return 0 instead of raising when a denominator is 0 |
 
-`cross_report` is used extensively in the Executive Summary to pull values from P&L without duplicating logic.
+`CUR` is a 3-letter currency code; the bound is converted to company currency at `date_to` before comparison.
+Source: [`_aggregation_apply_bounds() — account_report.py:4244`](../enterprise/account_reports/models/account_report.py#L4244)
+
+There is no `force_between` — the correct name is `if_between`, and it blanks the value rather than clamping it. Bounds are **not applied when a groupby is being expanded**; `round` still is.
+
+`cross_report` is used extensively in the Executive Summary to pull values from P&L without duplicating logic. Its `force_date_scope` argument is new in Odoo 20.
+Source: [`CROSS_REPORT_REGEX — account_report.py:25`](../addons/account/models/account_report.py#L25)
 
 **Real example — Balance Sheet total assets:**
 ```xml
@@ -257,7 +319,7 @@ sum_children                              ← sum all direct child lines
 
 ### Engine 4: `account_codes` — Account Code Prefix Matching
 
-> [_compute_formula_batch_with_engine_account_codes()](../enterprise/account_reports/models/account_report.py#L4111)
+> [`_report_engine_account_codes() — account_report.py:4575`](../enterprise/account_reports/models/account_report.py#L4575), parsing in [`_parse_account_code_engine_formulas() — account_report.py:4722`](../enterprise/account_reports/models/account_report.py#L4722)
 
 Sums balances of all accounts whose **code starts with** a given prefix. Useful for COA-based reports organized by code ranges (common in European localizations).
 
@@ -274,15 +336,18 @@ Sums balances of all accounts whose **code starts with** a given prefix. Useful 
 | `+` / `-` | Add or subtract prefix ranges |
 
 **How it works internally:**
-1. Loads all accounts for the company sorted by code
+1. Loads all accounts for the company sorted by code (falling back to another company's code for accounts with no code in the active company)
 2. Uses `bisect_left` for fast binary prefix matching
 3. Runs one aggregated SQL query to sum balances
+
+The formula grammar itself is unchanged from Odoo 19.
+Source: [`ACCOUNT_CODES_ENGINE_TERM_REGEX — account_report.py:28`](../addons/account/models/account_report.py#L28)
 
 ---
 
 ### Engine 5: `external` — Manually Entered Value
 
-> [_compute_formula_batch_with_engine_external()](../enterprise/account_reports/models/account_report.py#L4289)
+> [`_report_engine_external() — account_report.py:4791`](../enterprise/account_reports/models/account_report.py#L4791)
 
 The value is NOT computed from journal lines. It is either entered by the user directly in the report cell, or it is a value carried forward from a previous period.
 
@@ -304,9 +369,10 @@ The value is NOT computed from journal lines. It is either entered by the user d
 
 ### Engine 6: `custom` — Python Method
 
-> [_compute_formula_batch_with_engine_custom()](../enterprise/account_reports/models/account_report.py#L4401)
-
 Calls a Python method on the report's `custom_handler_model`. The formula IS the method name. The report must have `custom_handler_model_id` pointing to a model that inherits `account.report.custom.handler`.
+
+`_get_engine_function_name()` returns the formula unchanged for `custom`, and `_get_custom_report_function` resolves it on the handler (or on the root report's handler).
+Source: [`_get_engine_function_name() — account_report.py:4379`](../enterprise/account_reports/models/account_report.py#L4379)
 
 **Formula:** Method name on the handler model.
 
@@ -320,7 +386,23 @@ Calls a Python method on the report's `custom_handler_model`. The formula IS the
 
 **Use when:** Standard engines can't express the computation — running totals, special period logic, opening balance accumulation.
 
-> If `engine = 'custom'` but `custom_handler_model_id` is not set, Odoo raises `AttributeError` — it calls `getattr(self, formula_name)` on the base model which doesn't have that method.
+> If `engine = 'custom'` but `custom_handler_model_id` is not set, resolution falls through to `account.report` itself, which does not define the method, and the render fails.
+
+---
+
+### Engine 7: `text` — Literal String (new in Odoo 20)
+
+> [`_report_engine_text() — account_report.py:4384`](../enterprise/account_reports/models/account_report.py#L4384)
+
+Returns the formula itself as the cell value. No SQL, no groupby support (it returns `[]` when a groupby is being expanded). Use it for static labels in a column — e.g. a fixed reference code next to a computed amount in a statutory report — instead of inventing a custom handler.
+
+---
+
+### Engine 8: `reference` — Record Reference (new in Odoo 20)
+
+> [`_report_engine_reference() — account_report.py:4864`](../enterprise/account_reports/models/account_report.py#L4864)
+
+Delegates to `_report_engine_external`, but the expression carries a `model_id`, so the stored value is interpreted as a reference to a record of that model rather than a number or free text. Used for report cells where the user picks a record (a partner, an account, a tax) and the choice is persisted as an `account.report.external.value`.
 
 ---
 
@@ -337,8 +419,8 @@ Every expression has a `date_scope` controlling which `account.move.line` record
 | `to_beginning_of_period` | Lines before `date_from` | Running/opening balance of the current period |
 | `previous_return_period` | Lines from the previous tax return period | Carryover in tax reports |
 
-`_get_options_date_domain()` translates `date_scope` + current options into a SQL WHERE clause.
-Source: [account_report.py:915](../enterprise/account_reports/models/account_report.py#L915)
+`_get_options_date_domain()` translates `date_scope` + current options into a domain leaf on `date`.
+Source: [`_get_options_date_domain() — account_report.py:1216`](../enterprise/account_reports/models/account_report.py#L1216)
 
 ---
 
@@ -346,28 +428,39 @@ Source: [account_report.py:915](../enterprise/account_reports/models/account_rep
 
 Full call chain for one report render:
 
-> Entry: [account_report.py:2662](../enterprise/account_reports/models/account_report.py#L2662)
+> Entry: [`_get_lines() — account_report.py:2924`](../enterprise/account_reports/models/account_report.py#L2924)
 
 | Step | Method | What it does |
 |---|---|---|
-| 1 | `_get_lines()` | Entry point — flush DB, init currency table, call compute |
+| 1 | `_get_lines()` | Entry point — flush DB, generate common warnings, call compute |
 | 2 | `_compute_expression_totals_for_each_column_group()` | For each column group (comparison period), compute all expression values |
 | 3 | `_compute_expression_totals_for_single_column_group()` | Groups expressions by engine + date_scope, batch-computes, resolves aggregations last |
-| 4 | `_compute_formula_batch()` | Dispatches to the correct engine method (dynamic `getattr`) |
+| 4 | `_compute_formula_batch()` | Dispatches to `_report_engine_<engine>` via `_get_custom_report_function` |
 | 5 | `_get_dynamic_lines()` | Calls `_dynamic_lines_generator()` on the custom handler (for dynamic-only reports like Cash Flow) |
-| 6 | `_get_static_line_dict()` | Builds the line dict for each static line |
+| 6 | `_get_static_line_dict()` | Builds an `AccountReportLineData` object for each static line |
 | 7 | `_build_static_line_columns()` | For each column, looks up computed expression value from step 3 |
-| 8 | `_build_column_dict()` | Formats one column value — handles carryover, info popup, edit popup |
-| 9 | `_create_hierarchy()` | Re-aggregates account lines into `account.group` structure (if hierarchy enabled) |
-| 10 | `_add_totals_below_sections()` | Inserts section total rows |
-| 11 | `_fully_unfold_lines_if_needed()` | Expands groupby lines recursively (for "unfold all") |
-| 12 | `_custom_line_postprocessor()` | Custom handler hook — last chance to modify the line list |
-| 13 | `_customize_warnings()` | Custom handler hook — add report-specific warnings |
-| 14 | `_format_column_values()` | Format all numeric values for display (monetary, percentage, etc.) |
+| 8 | `_build_column_data()` | Formats one column value — handles carryover, info popup, edit popup. **Renamed from `_build_column_dict()` in Odoo 20** |
+| 9 | `_create_hierarchy()` | Re-aggregates account lines using `account.account.parent_id` (if hierarchy enabled) |
+| 10 | `_cleanup_empty_sections()` | Drops sections left with no visible children |
+| 11 | `_add_totals_below_sections()` | Inserts section total rows |
+| 12 | `_fully_unfold_lines_if_needed()` | Expands groupby lines recursively (for "unfold all") |
+| 13 | `_add_account_status_on_lines()` | Attaches audit-cycle status per account (new in Odoo 20) |
+| 14 | `_inject_account_names_for_consolidation()` | Adds account names when several companies are consolidated |
+| 15 | `_custom_line_postprocessor()` | Custom handler hook — last chance to modify the line list |
+| 16 | `_customize_warnings()` | Custom handler hook — add report-specific warnings |
+| 17 | `_format_column_values()` | Format all numeric values for display (monetary, percentage, etc.) |
+| 18 | `_update_line_comparison_data()` | Fill the line-comparison column (`filter_line_comparison`) |
+| 19 | `_postprocess_chatter_for_annotations()` | Attach annotation/chatter data (skipped for file exports) |
+
+**Lines are objects, not dicts (new in Odoo 20).** The render pipeline passes `AccountReportLineData` / `AccountReportColumnData` dataclasses instead of plain dicts. They are `slots`-based for speed; `__getitem__` and `__setitem__` still work but log a warning telling you to access the attribute directly. Use `.as_dict()` / `.from_dict()` at the boundaries.
+Source: [account_reports/utils/report_data_objects.py](../enterprise/account_reports/utils/report_data_objects.py)
 
 **Expression batching:**
 
-All expressions with the same `(engine, date_scope, current_groupby, next_groupby)` are computed in a single SQL call. This is the primary performance optimization — one call per engine/scope combination per column group, not one call per expression.
+All expressions with the same `(engine, date_scope, current_groupby)` are computed in a single SQL call. This is the primary performance optimization — one call per engine/scope combination per column group, not one call per expression. Odoo 19's extra `next_groupby` dimension is gone.
+
+**Snapshots (new in Odoo 20).** When a report has `enable_snapshots = True`, engines decorated with `@snapshotable_engine` first look for `account.report.snapshot` records covering the requested period and company. Full coverage means the engine is never called; partial coverage means the engine is called only for the gap after the snapshot date, and the two results are merged by the decorator's `result_aggregators`. Snapshots are intended for locked periods, and warnings produced inside a snapshotted range are lost.
+Source: [`snapshotable_engine() — account_report_snapshot.py:14`](../enterprise/account_reports/models/account_report_snapshot.py#L14)
 
 ---
 
@@ -375,13 +468,15 @@ All expressions with the same `(engine, date_scope, current_groupby, next_groupb
 
 `get_options(previous_options)` builds the complete options dict used for every render, export, and drill-down.
 
-Source: [account_report.py:2056](../enterprise/account_reports/models/account_report.py#L2056)
+Source: [`get_options() — account_report.py:2287`](../enterprise/account_reports/models/account_report.py#L2287)
 
 ### Rerouting to Variants
 
-The initialization sequence is split at `_init_options_report_id` (sequence 17). After that initializer runs, if the resolved `report_id` differs from `self.id` (because a localized variant was found), `get_options` is called again on the variant report. This is how French companies automatically see the French TVA report instead of the generic tax report.
+The initialization sequence is split at `_init_options_report_id` (sequence 17). After that initializer runs, if the resolved `report_id` differs from `self.id` (because a localized variant or section was found), `get_options` is called again on the resolved report, carrying `selected_variant_id`, `selected_section_id`, `variants_source_id` and `sections_source_id` forward. This is how French companies automatically see the French TVA report instead of the generic tax report.
 
 ### `_init_options_*` Execution Order
+
+Source: [`_get_options_initializers_forced_sequence_map() — account_report.py:2390`](../enterprise/account_reports/models/account_report.py#L2390)
 
 | Sequence | Method | Purpose |
 |---|---|---|
@@ -390,21 +485,28 @@ The initialization sequence is split at `_init_options_report_id` (sequence 17).
 | 16 | `_init_options_sections` | Select report sections (composite reports) |
 | 17 | `_init_options_report_id` | Set the actual report — variant reroute happens here |
 | 29 | `_init_options_return_periodicity` | Tax return period (monthly / quarterly) |
-| 30 | `_init_options_date` | Date range from filter selection |
+| 30 | `_init_options_filter_date` | Build the available date-filter choices (**new in Odoo 20**) |
+| 31 | `_init_options_date` | Resolve the selected date range |
 | 40 | `_init_options_horizontal_groups` | Horizontal groupby columns |
 | 50 | `_init_options_comparison` | Build comparison columns |
 | 60 | `_init_options_export_mode` | Export mode flag |
 | 70 | `_init_options_integer_rounding` | Rounding method |
+| 75 | `_init_options_consolidation` | Multi-company consolidation toggle |
 | 80 | `_init_options_journals` | Journal filter |
-| 200 | (all others) | Analytic, partner, budgets, buttons, hide_0, etc. |
+| 90 | `_init_options_journals_names` | Journal filter labels |
+| 100 | `_init_options_audit` | Audit-cycle options |
+| 200 | (all others) | Analytic, partner, budgets, buttons, hide_0, user groups, etc. |
 | 990 | `_init_options_column_headers` | Column header labels |
 | 1000 | `_init_options_columns` | Column structure — depends on dates and comparison |
 | 1010 | `_init_options_column_percent_comparison` | Growth/budget comparison columns |
 | 1020 | `_init_options_order_column` | Sort column |
 | 1030 | `_init_options_hierarchy` | Hierarchy expand/collapse state |
 | 1050 | `_init_options_custom` | Custom handler options |
-| 1055 | `_init_options_currency_table` | Currency conversion JOIN — must be after columns |
+| 1060 | `_init_options_section_buttons` | Buttons contributed by composite sections (**new in Odoo 20**) |
+| 1070 | `_init_options_readonly_query` | Marks the query as readonly-safe (**new in Odoo 20**) |
 | 1500 | `_init_options_filters` | Final filter aggregation |
+
+Removed in Odoo 20: `_init_options_currency_table` (1055) and `_init_options_prefix_groups_threshold` (1040).
 
 ### Key `options` keys
 
@@ -434,7 +536,7 @@ Each entry in `column_groups` represents one column in the report (main period +
 
 A custom handler is an `AbstractModel` inheriting `account.report.custom.handler` linked to a report via `custom_handler_model_id`.
 
-Source: [account_report.py:7857](../enterprise/account_reports/models/account_report.py#L7857)
+Source: [`account.report.custom.handler` — account_report.py:8494](../enterprise/account_reports/models/account_report.py#L8494)
 
 ### All Overridable Methods
 
@@ -444,16 +546,18 @@ Source: [account_report.py:7857](../enterprise/account_reports/models/account_re
 | `_caret_options_initializer()` | `()` | Define right-click context menu items per model type |
 | `_custom_options_initializer()` | `(report, options, previous_options)` | Add report-specific filters or option sections |
 | `_custom_line_postprocessor()` | `(report, options, lines)` | Modify the rendered line list before display — inject rows, rename, reorder |
-| `_custom_groupby_line_completer()` | `(report, options, line_dict, current_groupby)` | Customize a groupby-expanded line's data |
+| `_custom_groupby_line_completer()` | `(report, options, line_data, current_groupby)` | Customize a groupby-expanded line's data (parameter renamed from `line_dict` in Odoo 20 — it is an `AccountReportLineData` now) |
 | `_custom_unfold_all_batch_data_generator()` | `(report, options, lines_to_expand_by_function)` | Precompute data for "unfold all" to avoid N+1 queries |
 | `_get_custom_groupby_map()` | `()` | Define custom groupby fields beyond `account.move.line` fields |
 | `_customize_warnings()` | `(report, options, all_column_groups_expression_totals, warnings)` | Add report-specific warning messages |
 
+A handler may also declare **custom engines** as `_report_engine_<name>` methods; `_get_custom_report_function(name, 'engine')` resolves them, and they can be wrapped with `@snapshotable_engine` if their results are composable by company and date.
+
 **`_dynamic_lines_generator()` return format:**
 ```python
-return [(sequence, line_dict), ...]
-# sequence: integer for ordering relative to static lines
-# line_dict: same structure as lines returned by _get_lines()
+return [(sequence, line_data), ...]
+# sequence:  integer for ordering relative to static lines
+# line_data: an AccountReportLineData object (a plain dict still works via from_dict at the boundary)
 ```
 
 **`_caret_options_initializer()` return format:**
@@ -477,23 +581,24 @@ return {
 Caret options are context menu items that appear when clicking the arrow next to a line value.
 
 **Default options** (all reports unless overridden):
-Source: [account_report.py:2493](../enterprise/account_reports/models/account_report.py#L2493)
+Source: [`_caret_options_initializer_default() — account_report.py:2755`](../enterprise/account_reports/models/account_report.py#L2755)
 
 ```python
 {
-    'account.account':      [{'name': "General Ledger", 'action': 'caret_option_open_general_ledger'}],
-    'account.move':         [{'name': "View Journal Entry", 'action': 'caret_option_open_record_form'}],
-    'account.move.line':    [{'name': "View Journal Entry", 'action': 'caret_option_open_record_form', 'action_param': 'move_id'}],
-    'account.payment':      [{'name': "View Payment", 'action': 'caret_option_open_record_form', 'action_param': 'payment_id'}],
-    'res.partner':          [{'name': "View Partner", 'action': 'caret_option_open_record_form'}],
+    'account.account':        [{'name': "General Ledger", 'action': 'caret_option_open_general_ledger'}],
+    'account.move':           [{'name': "View Journal Entry", 'action': 'caret_option_open_record_form'}],
+    'account.move.line':      [{'name': "View Journal Entry", 'action': 'caret_option_open_record_form', 'action_param': 'move_id'}],
+    'account.payment':        [{'name': "View Payment", 'action': 'caret_option_open_record_form', 'action_param': 'payment_id'}],
+    'account.bank.statement': [{'name': "View Bank Statement", 'action': 'caret_option_open_statement_line_reco_widget'}],
+    'res.partner':            [{'name': "View Partner", 'action': 'caret_option_open_record_form'}],
 }
 ```
 
-**Trial Balance** adds "Journal Items" alongside "General Ledger":
-Source: [account_trial_balance_report.py:188](../enterprise/account_reports/models/account_trial_balance_report.py#L188)
+**Trial Balance** adds "Journal Items" alongside "General Ledger", plus a second entry set for its `undistributed_profits_losses` pseudo-model:
+Source: [`_caret_options_initializer() — account_trial_balance_report.py:194`](../enterprise/account_reports/models/account_trial_balance_report.py#L194)
 
 **General Ledger** overrides for its custom `id_with_accumulated_balance` groupby key:
-Source: [account_general_ledger.py:35](../enterprise/account_reports/models/account_general_ledger.py#L35)
+Source: [`account_general_ledger.py:51`](../enterprise/account_reports/models/account_general_ledger.py#L51)
 
 **How dispatch works:**
 1. Each rendered line carries a `caret_options` key identifying which model it represents
@@ -512,15 +617,22 @@ Carryover allows an expression value from one period to be automatically applied
 
 **`carryover_target` field:**
 ```python
-# addons/account/models/account_report.py:620
+# addons/account/models/account_report.py:713
 carryover_target = fields.Char(
     string="Carry Over To",
-    help="Formula in form line_code.expression_label. Target of carryover if different from parent line."
+    help="Formula in the form line_code.expression_label. This allows setting the target of the carryover for this "
+         "expression (on a _carryover_*-labeled expression), in case it is different from the parent line."
 )
 ```
 
+Two constraints enforce the naming convention at write time, so a mismatch raises immediately rather than silently at period close:
+
+- `carryover_target` on an expression whose label does not start with `_carryover_` → error
+- a `carryover_target` pointing at a label that does not start with `_applied_carryover_` → error
+
+Source: [`_check_carryover_target() — account_report.py:729`](../addons/account/models/account_report.py#L729)
+
 If `carryover_target` is not set, the framework auto-resolves the target by stripping the `_carryover_` prefix and finding a matching `_applied_carryover_*` expression on the same line.
-Source: [account_report.py:911](../addons/account/models/account_report.py#L911)
 
 **Storage:** Carryover values are written as `account.report.external.value` records with `carryover_origin_expression_label` and `carryover_origin_report_line_id` set.
 
@@ -542,18 +654,47 @@ When `account.report.line.groupby` is set, the engine splits results by that fie
 - First render: grouped by `partner_id` (collapsed rows)
 - Expand a partner: triggers new API call with `current_groupby = 'account_id'`
 
-**`foldable = True`:** Line starts collapsed. User click triggers new API call with `current_groupby` set.
+**`foldability`:**
+
+| Value | Behaviour |
+|---|---|
+| `foldable` | line shows a toggle and starts collapsed; clicking it triggers a new API call with `current_groupby` set |
+| `always_unfolded` | children are rendered expanded, no toggle |
+| `never_unfolded` | line cannot be expanded at all |
+
+The default is computed: a line with children → `always_unfolded`; a line with a groupby and no `aggregation`/`external` expression → `foldable`; a line whose expressions are `aggregation` or `external` → `never_unfolded`.
+Source: [`_compute_foldability() — account_report.py:490`](../addons/account/models/account_report.py#L490)
 
 ---
 
-## Hierarchy Filter (Account Groups)
+## Hierarchy Filter (Account Parents)
+
+**Rewritten in Odoo 20.** The `account.group` model no longer exists. The chart of accounts is a tree on `account.account` itself (`parent_id` / `parent_path`, `_parent_store`), and the report hierarchy walks that tree.
 
 When `filter_hierarchy = 'by_default'` or `'optional'` and enabled:
-- Account-level lines are re-aggregated into `account.group` structure
-- Uses `account.group.code_prefix_start/end` ranges
-- Each group row shows sum of accounts within its range
+- Account-level lines are re-aggregated under their `parent_id` chain
+- Each parent row shows the sum of its descendant accounts
+- The filter is only offered when at least one account in the selected companies actually has a parent
 
-Distinct from the `account.root` virtual model used in the COA list view — those are different grouping mechanisms.
+```python
+# _init_options_hierarchy
+if self.filter_hierarchy != 'never' and self.env['account.account'].search_count(
+        Domain.AND([
+            self.env['account.account']._check_company_domain(company_ids),
+            Domain('parent_id', '!=', False),
+        ]), limit=1):
+    options['display_hierarchy_filter'] = True
+```
+
+Source: [`_init_options_hierarchy() — account_report.py:1415`](../enterprise/account_reports/models/account_report.py#L1415), [`_create_hierarchy() — account_report.py:1434`](../enterprise/account_reports/models/account_report.py#L1434)
+
+| | Odoo 19 | Odoo 20 |
+|---|---|---|
+| Grouping source | `account.group` records with `code_prefix_start`/`code_prefix_end` | `account.account.parent_id` |
+| Filter availability | groups exist for the company | at least one account has a parent |
+| Migration impact | — | `account.group` data is gone; a chart with no `parent_id` set shows no hierarchy filter at all |
+
+Still distinct from the `account.root` virtual model used in the COA list view search panel — that is derived from the first two characters of the code, not from the parent tree.
 
 ---
 
@@ -603,31 +744,52 @@ Source: [account_report.py:157](../addons/account/models/account_report.py#L157)
 > [enterprise/account_reports/data/balance_sheet.xml](../enterprise/account_reports/data/balance_sheet.xml)
 > Handler: `account.balance.sheet.report.handler`
 
-- **Engine:** `domain` for leaf lines, `aggregation` for totals
+- **Engine:** `domain` for leaf lines, `aggregation` for totals, one `custom` engine for the CTA line
 - **`date_scope`:** `from_beginning` — assets/liabilities accumulate their full history
 - **Default date filter:** `today` — point-in-time snapshot, not a range
 - `filter_date_range = False` — single date only, no from/to
+- `enable_snapshots = True` (new in Odoo 20)
+- Report-level `groupby = account_id`
 - Layout: horizontal split — Assets left, Liabilities + Equity right
 
-**Structure:**
+**Structure (Odoo 20):**
 ```
-ASSETS  (TA = aggregation: CA + FA + PNCA)
-  ├── Current Assets  (CA = aggregation: BA + REC + CAS + PRE)
+ASSETS  (TA = CA + FA + PNCA)
+  ├── Current Assets  (CA = BA + REC + CAS + PRE)
   │     ├── Bank and Cash Accounts  → domain: account_type = asset_cash
-  │     ├── Receivables             → domain: account_type = asset_receivable AND non_trade = False
+  │     ├── Receivables             → domain: asset_receivable AND non_trade = False
   │     ├── Current Assets          → domain: asset_current OR (asset_receivable AND non_trade)
   │     └── Prepayments             → domain: account_type = asset_prepayments
   ├── Plus Fixed Assets             → domain: account_type = asset_fixed
   └── Plus Non-current Assets       → domain: account_type = asset_non_current
 
-LIABILITIES  (L = aggregation: CL + NL)
-  ├── Current Liabilities
-  └── Non-current Liabilities
+LIABILITIES  (L = CL + NL)
+  ├── Current Liabilities  (CL = CL1 + CL2 + CL3)
+  │     ├── Current Liabilities → liability_current OR (liability_payable AND non_trade)
+  │     ├── Payables            → liability_payable AND non_trade = False
+  │     └── Credit Card         → liability_credit_card
+  └── Non-current Liabilities   → liability_non_current
 
-EQUITY  (includes "Undistributed Profits/Losses" — see gotchas)
+EQUITY (& EARNINGS)  (EQ = EQU + EAR + OCI)
+  ├── Equity                       (EQU) → domain: account_type = equity,  from_beginning
+  ├── Earnings                     (EAR = PYE + CYE)
+  │     ├── Current Year Unallocated Earnings (CYE) → income*/expense*/equity_unaffected, from_fiscalyear
+  │     └── Previous Years Earnings           (PYE) → same domain, to_beginning_of_fiscalyear
+  └── Other Comprehensive Income   (OCI = CTA)
+        └── Cumulative Translation Adjustments (CTA) → custom engine
+
+LIABILITIES + EQUITY  (LE = L + EQ)
+OFF BALANCE SHEET ACCOUNTS  (OS) → -sum on off_balance, hidden when zero
 ```
 
-**`equity_unaffected` gotcha:** The Balance Sheet does NOT have a `domain` line for `equity_unaffected`. Instead, `AccountBalanceSheetReportHandler` computes "Undistributed Profits/Losses" as the residual: `Assets − Liabilities − explicit Equity`. If the `equity_unaffected` account type is wrong, the Balance Sheet won't balance.
+Source: [balance_sheet.xml](../enterprise/account_reports/data/balance_sheet.xml)
+
+**`equity_unaffected` — correcting a common misconception.** The Balance Sheet *does* have explicit domain lines covering `equity_unaffected`; nothing is derived as a plug. `CYE` and `PYE` sum all income, expense **and** `equity_unaffected` accounts, split by `date_scope` (`from_fiscalyear` vs `to_beginning_of_fiscalyear`). So current-year profit appears in equity because the P&L accounts themselves are summed there, not because a handler back-solved `Assets − Liabilities`.
+
+What the handler actually does is warn: if `currency_translation = 'cta'`, several company currencies are selected, and the report has no CTA expression, it raises `common_possibly_unbalanced_because_cta`.
+Source: [`AccountBalanceSheetReportHandler — balance_sheet.py:5`](../enterprise/account_reports/models/balance_sheet.py#L5), [`_report_engine_cumulative_translation_adjustment() — balance_sheet.py:49`](../enterprise/account_reports/models/balance_sheet.py#L49)
+
+**Odoo 20 addition — Other Comprehensive Income / CTA.** `_report_engine_cumulative_translation_adjustment` computes the translation difference that arises when subsidiaries in other currencies are consolidated, and posts it (sign-flipped) under equity. Without it, a multi-currency consolidated balance sheet does not balance.
 
 ---
 
@@ -643,17 +805,27 @@ EQUITY  (includes "Undistributed Profits/Losses" — see gotchas)
 
 **`-sum` on income:** Income accounts have **credit-normal balances** (negative by convention). `subformula = '-sum'` negates them so revenue displays as a positive number. Using `sum` on income would show negative revenue.
 
-**Structure:**
+**Structure (Odoo 20 — line codes and exact formulas):**
 ```
-Revenue              → domain: account_type = income,              subformula: -sum
-Cost of Revenue      → domain: account_type = expense_direct_cost, subformula: sum
-Gross Profit         → aggregation: REV.balance - COS.balance
-  Operating Expenses → domain: account_type = expense,             subformula: sum
-Operating Income     → aggregation: GRP.balance - OP.balance
-  Other Income       → domain: account_type = income_other,        subformula: -sum
-  Other Expenses     → domain: account_type = expense_other,       subformula: sum
-Net Profit           → aggregation: OI.balance + OTI.balance - OTE.balance
+Revenue              (REV)   → domain: account_type = income,                            -sum
+Costs of Revenue     (COS)   → domain: account_type = expense_direct_cost,                sum
+Gross Profit         (GRP)   → aggregation: REV.balance - COS.balance
+  Operating Expenses (EXP)   → domain: account_type = expense,                            sum
+Operating Income     (INC)   → aggregation: REV.balance - COS.balance - EXP.balance
+  Other Income       (OIN)   → domain: account_type = income_other,                      -sum
+  Other Expenses     (OEXP)  → domain: expense_depreciation OR expense_other,             sum
+Net Profit           (NEP)   → aggregation: REV.balance + OIN.balance
+                                          - COS.balance - EXP.balance - OEXP.balance
+  Allocations and Withdrawals (ALLOC) → domain: account_type = equity_unaffected,         sum
 ```
+
+Source: [profit_and_loss.xml](../enterprise/account_reports/data/profit_and_loss.xml)
+
+Two details that trip people up:
+
+- `OEXP` covers **both** `expense_other` and `expense_depreciation`. Depreciation charges do not get their own P&L line by default.
+- `INC` and `NEP` are computed from the leaves, not from the intermediate subtotals. Overriding `GRP` in a variant does not change `INC`.
+- Odoo 20 dropped the "Less …" / "Plus …" prefixes from the line labels ("Less Costs of Revenue" → "Costs of Revenue"). The codes are unchanged, so variants keyed on codes still work.
 
 ---
 
@@ -664,38 +836,44 @@ Net Profit           → aggregation: OI.balance + OTI.balance - OTE.balance
 
 **Purpose:** Verify mathematical integrity of the ledger. One row per account. No individual transactions.
 
-**Columns:**
+**Columns** — built in `_get_column_values()`, not declared statically. Each column carries a `trial_balance_column_type` in its column group's `forced_options`:
 
-| Column | Content | `date_scope` |
-|---|---|---|
-| Initial Balance | Net balance of all lines **before** `date_from` | `to_beginning_of_period` |
-| Debit | All debits **within** the period | `strict_range` |
-| Credit | All credits **within** the period | `strict_range` |
-| End Balance | Initial Balance + period debit − period credit | Computed in postprocessor, no SQL |
+| Column | `trial_balance_column_type` | Content | `date_scope` |
+|---|---|---|---|
+| Initial Balance | `initial_balance` | Net balance of all lines **before** `date_from` | `from_beginning`, capped at `trial_balance_block_end_date` |
+| Debit | `period` | All debits **within** the period | `strict_range` |
+| Credit | `period` | All credits **within** the period | `strict_range` |
+| End Balance | `end_balance` | Initial Balance + period debit − period credit | `from_beginning` up to `date_to` |
+
+Source: [`_get_column_values() — account_trial_balance_report.py:47`](../enterprise/account_reports/models/account_trial_balance_report.py#L47)
+
+Odoo 20 organises comparison periods into **blocks**. Each block carries its own `trial_balance_block_fiscalyear_start` and `trial_balance_block_end_date`, so an Initial/End pair is computed against the fiscal year of *its own* comparison period rather than the main one. Comparisons are also forced ascending and the period-order filter is hidden.
 
 **Balance sheet vs P&L accounts (income/expense reset):**
 
 Balance sheet accounts (`include_initial_balance = True`) show all history in Initial Balance.
-P&L accounts (`include_initial_balance = False`) only include lines from **fiscal year start** — they reset each year.
+P&L accounts (`include_initial_balance = False`) only include lines from the **block's fiscal year start** — they reset each year.
 
-Enforced by extra domain in `_report_custom_engine_trial_balance()`:
 ```python
-# account_trial_balance_report.py:231
-extra_domain = [
-    '|',
-    ('account_id.include_initial_balance', '=', True),
-    ('date', '>=', fiscalyear_start),
-]
+# account_trial_balance_report.py:237
+if fiscalyear_start := options.get('trial_balance_block_fiscalyear_start'):
+    extra_domain = [
+        '|',
+        ('account_id.include_initial_balance', '=', True),
+        ('date', '>=', fiscalyear_start),
+    ]
 ```
 
+The code comment is explicit that this is both an optimisation and a functional rule — and that it is why the Unaffected Earnings line cannot be expanded.
+
 **Undistributed Profits/Losses row:**
-A special row for `equity_unaffected` representing the net of all un-closed P&L lines. Computed in `_custom_line_postprocessor()` and injected as a total.
-Source: [account_trial_balance_report.py:333](../enterprise/account_reports/models/account_trial_balance_report.py#L333)
+A special row for `equity_unaffected` representing the net of all un-closed P&L lines. Computed in `_custom_line_postprocessor()` and injected as a total. Odoo 20 injects a **Cumulative Translation Adjustment** row next to it when several company currencies are consolidated.
+Source: [`_custom_line_postprocessor() — account_trial_balance_report.py:307`](../enterprise/account_reports/models/account_trial_balance_report.py#L307)
 
-**Caret drill-down:** Each account row has "General Ledger" and "Journal Items" in the caret menu.
-Source: [account_trial_balance_report.py:188](../enterprise/account_reports/models/account_trial_balance_report.py#L188)
+**Caret drill-down:** Each account row has "General Ledger" and "Journal Items"; the Undistributed Profits/Losses row gets its own pair pointing at `open_unallocated_items_journal_items`.
+Source: [`_caret_options_initializer() — account_trial_balance_report.py:194`](../enterprise/account_reports/models/account_trial_balance_report.py#L194)
 
-`filter_hierarchy = by_default` — accounts roll up into `account.group` by default.
+`filter_hierarchy = by_default` — accounts roll up under their `parent_id` by default (no longer `account.group`).
 
 ---
 
@@ -725,10 +903,11 @@ Source: [account_trial_balance_report.py:188](../enterprise/account_reports/mode
 
 **Running balance mechanism:**
 ```python
-# account_general_ledger.py:316
-accumulated_balance_by_colgroup[col_group_key] += line_balance
+# account_general_ledger.py:379
+accumulated_balance_by_colgroup[col_group_index] += line_balance
 ```
-The `progress` dict is threaded between line batches to carry the running total.
+The accumulator is threaded between line batches to carry the running total across pagination.
+Source: [`account_general_ledger.py:370`](../enterprise/account_reports/models/account_general_ledger.py#L370)
 
 **Opening balance line:**
 First row under each account is "Initial Balance" — `to_beginning_of_period` scope. All subsequent lines count from there.
@@ -756,17 +935,24 @@ First row under each account is "Initial Balance" — `to_beginning_of_period` s
 
 **Key difference from other reports:** Only **open items** appear. Fully reconciled invoices are excluded.
 
-**How "open" is determined:**
-```sql
--- Residual = original balance minus already-matched amounts
-balance - COALESCE(part_debit.amount, 0) + COALESCE(part_credit.amount, 0) AS residual
+**How "open" is determined (rewritten in Odoo 20):**
 
-HAVING
-    ROUND(SUM(residual_debit), precision) != 0
-    OR ROUND(SUM(residual_credit), precision) != 0
+The hand-written partial-reconciliation join is gone. The report now forces a reconciliation cut-off date into the options and reads two computed-SQL fields on `account.move.line`:
+
+```python
+if not report._get_option_recon_date(options):
+    options['recon_date'] = {'date_to': options['date']['date_to']}
+...
+balance_select = SQL("%s * %s", query.table.residual_at_date, query.table.consolidation_rate)
 ```
-Partial reconciliations are only counted if `part.max_date <= date_to` — this makes the report historically accurate for any past date.
-Source: [account_aged_partner_balance.py:155](../enterprise/account_reports/models/account_aged_partner_balance.py#L155)
+
+- `residual_at_date` = `balance + partial_summary.amount_to_date` — the residual as of the report date
+- `residual_currency_at_date` = the same in the line's own currency
+- Partial reconciliations are counted only if their `max_date` falls on or before the cut-off, so the report stays historically accurate for any past date
+
+Source: [`_aged_partner_report_custom_engine_common() — account_aged_partner_balance.py:85`](../enterprise/account_reports/models/account_aged_partner_balance.py#L85), [`residual_at_date — account_move_line.py:328`](../addons/account/models/account_move_line.py#L328)
+
+Practical benefit: the same field is available in SQL, in the ORM and in list views, so an aged-report figure can be reproduced outside the report engine.
 
 **Aging buckets** (default: 6 buckets, 30-day interval, based on `date_maturity`):
 
@@ -780,7 +966,7 @@ Source: [account_aged_partner_balance.py:155](../enterprise/account_reports/mode
 | `period5` | 121+ days overdue ("Older") |
 
 Interval is user-configurable (`aging_interval`, default 30).
-Source: [account_aged_partner_balance.py:45](../enterprise/account_reports/models/account_aged_partner_balance.py#L45)
+Source: [`_custom_options_initializer() — account_aged_partner_balance.py:41`](../enterprise/account_reports/models/account_aged_partner_balance.py#L41)
 
 **Aging date basis:**
 
@@ -796,8 +982,8 @@ Partner A             0–30   31–60   61–90   91–120   Older   Total
   INV/2025/0002                               800               800
 ```
 
-**Trust indicator:** Each partner row gets `trust` field (`good`/`normal`/`bad`) shown as a colored dot.
-Source: [account_aged_partner_balance.py:65](../enterprise/account_reports/models/account_aged_partner_balance.py#L65)
+**Trust indicator:** Each partner row gets `trust` (`good`/`normal`/`bad`) shown as a coloured dot, read with the partner's own company in context.
+Source: [`_custom_line_postprocessor() — account_aged_partner_balance.py:61`](../enterprise/account_reports/models/account_aged_partner_balance.py#L61)
 
 **AR vs AP — the only differences:**
 
@@ -807,8 +993,8 @@ Source: [account_aged_partner_balance.py:65](../enterprise/account_reports/model
 | Sign | `+1` (debit-normal) | `−1` (credit-normal, negated for positive display) |
 | Audit journal filter | Excludes `purchase` journals | Excludes `sale` journals |
 
-Both inherit `AccountAgedPartnerBalanceReportHandler` and share `_aged_partner_report_custom_engine_common()`.
-Source: [account_aged_partner_balance.py:83](../enterprise/account_reports/models/account_aged_partner_balance.py#L83)
+Both inherit `AccountAgedPartnerBalanceReportHandler` and share `_aged_partner_report_custom_engine_common()`. The engine methods are `_report_engine_aged_receivable` / `_report_engine_aged_payable` (renamed in Odoo 20).
+Source: [account_aged_partner_balance.py:79](../enterprise/account_reports/models/account_aged_partner_balance.py#L79)
 
 ---
 
@@ -831,11 +1017,12 @@ Source: [account_aged_partner_balance.py:83](../enterprise/account_reports/model
 
 Account tags are pulled via `_get_tags_ids()`:
 ```python
-# account_cash_flow_report.py:131
+# account_cash_flow_report.py:138
 'operating': self.env.ref('account.account_tag_operating').id,
-'investing':  self.env.ref('account.account_tag_investing').id,
-'financing':  self.env.ref('account.account_tag_financing').id,
+'investing': self.env.ref('account.account_tag_investing').id,
+'financing': self.env.ref('account.account_tag_financing').id,
 ```
+Source: [`_get_tags_ids() — account_cash_flow_report.py:135`](../enterprise/account_reports/models/account_cash_flow_report.py#L135)
 
 **Computation flow** (in `_dynamic_lines_generator()`):
 1. **Opening Balance** — `_compute_liquidity_balance(report, options, payment_account_ids, 'to_beginning_of_period')`
@@ -868,6 +1055,66 @@ Because all lines are generated dynamically, this report uses `_dynamic_lines_ge
 - Similar to General Ledger but grouped by partner
 - Shows receivable/payable lines per partner
 - `filter_account_type` switches between customer (AR) / vendor (AP) view
+
+---
+
+### Interco Comparison (new in Odoo 20)
+
+> [enterprise/account_reports/data/interco_comparison_report.xml](../enterprise/account_reports/data/interco_comparison_report.xml)
+> Handler: [interco_comparison_report.py](../enterprise/account_reports/models/interco_comparison_report.py)
+
+**Purpose:** Reconcile intercompany balances. For every counterpart company, it shows what the active company booked, what the counterpart booked, and the difference — the month-end check that previously had to be done by hand in a spreadsheet.
+
+**Columns:** `main_company` / `counterpart` / `difference`, all produced by one custom engine `_report_engine_interco_comparison` with the column label as subformula.
+
+**Groupby chain:** `currency_id → interco_company → interco_account_type → interco_account`
+
+**How it scopes the data** — `_custom_options_initializer` forces a domain selecting only lines that sit on one side of an intercompany relationship:
+
+```python
+options['forced_domain'] = [
+    ('move_id.exchange_diff_partial_ids', '=', False),
+    '|',
+        '&', ('partner_id', 'in', counterpart_companies.partner_id.ids), ('company_id', '=', self.env.company.id),
+        '&', ('partner_id', '=', self.env.company.partner_id.id),        ('company_id', 'in', counterpart_companies.ids),
+]
+```
+
+Account types are bucketed into pairs that should mirror each other — receivable ↔ payable, income ↔ expense, current assets ↔ current liabilities, and so on (`GROUPED_ACCOUNT_TYPES`). A non-zero **Difference** on a bucket means the two companies disagree and one side is missing or mis-posted.
+
+Extras: tax lines are hidden by default (`hide_tax_lines`), exchange-difference moves are excluded, and a warning appears when only one company is selected — the report is meaningless without a counterpart.
+
+---
+
+## Report Snapshots (new in Odoo 20)
+
+`account.report.snapshot` caches an engine's result for a closed period so later renders do not re-run the SQL.
+
+| Field | Purpose |
+|---|---|
+| `report_id`, `company_id`, `date` | what the snapshot covers |
+| `engine_func`, `engine_version` | which engine produced it, and at which version |
+| `serialized_options`, `serialized_formulas_dict`, `date_scope`, `groupby` | the exact call signature it answers |
+| `result` | the cached engine result (JSON) |
+
+Source: [account_report_snapshot.py:85](../enterprise/account_reports/models/account_report_snapshot.py#L85)
+
+**How it plugs in.** An engine opts in with `@snapshotable_engine(result_aggregators={...}, sub_engine_of=..., version=N)`. On each call the decorator looks for snapshots covering the requested period per company:
+
+| Coverage | Behaviour |
+|---|---|
+| Full, for every selected company, at the report's end date | the engine is not called at all |
+| Partial | the engine is called with a forced domain limited to dates after the snapshot, and the results are merged using `result_aggregators` |
+| None | normal engine call |
+
+Currently snapshotable: `_report_engine_tax_tags` and `_report_engine_account_codes` (through its subengine).
+
+**Two constraints to respect when writing a snapshotable engine:**
+
+1. The engine must be *composable* — computing it in parts by company and by date range, then aggregating, must give the same answer as computing it in one pass.
+2. Warnings raised inside a snapshotted range are lost. This is deemed acceptable because snapshots target locked periods.
+
+Bumping `version` invalidates existing snapshots: `_register_hook` deletes snapshots whose `engine_version` is lower than the current one, so a fix in stable forces recomputation.
 
 ---
 
@@ -905,15 +1152,38 @@ REV.balance → aggregation with cross_report(account.profit_and_loss_xml_id)
 
 ## Currency Handling
 
-Reports convert all balances to **company currency** via a currency rate table.
+**Reworked in Odoo 20.** The `currency_table` option and its JOIN are gone. Conversion now happens through computed-SQL fields on `account.move.line`:
 
-`_init_options_currency_table()` builds a JOIN applying the exchange rate from the transaction date (or report date for balance sheet items).
-Source: [account_report.py:1389](../enterprise/account_reports/models/account_report.py#L1389)
+| Field | Definition |
+|---|---|
+| `consolidation_rate` | the rate to apply to this line, resolved per company and account type |
+| `consolidation_debit` | `consolidation_rate * debit` |
+| `consolidation_credit` | `consolidation_rate * credit` |
+| `consolidation_balance` | `consolidation_rate * balance` |
 
-SQL balance computation:
+Engines select `SUM(consolidation_balance)` instead of `SUM(balance * currency_table.rate)`. When every selected company shares one currency, `_compute_sql_consolidation_rate` short-circuits to `SQL("1")` and no join is added at all.
+
+Source: [`_compute_sql_consolidation_rate() — account_move_line.py:896`](../addons/account/models/account_move_line.py#L896)
+
+**Which rate is used** depends on `account.report.currency_translation`:
+
+| `currency_translation` | Rule |
+|---|---|
+| `current` | the current rate for the line's company, for every line |
+| `cta` | per account type: `equity` → historical rate at the line's own date; `income*` / `expense*` / `equity_unaffected` → average rate over the period; everything else → current rate |
+
 ```sql
-account_move_line.balance * currency_table.rate
+CASE WHEN account_type = 'equity'
+        THEN historical->>company_id->>date
+     WHEN account_type LIKE ANY (ARRAY['income%','expense%','equity_unaffected'])
+        THEN average->>company_id
+     ELSE current->>company_id
+END::numeric AS rate
 ```
+
+`cta` is the default on the field. It is what makes a consolidated multi-currency Balance Sheet balance — the residual lands on the Cumulative Translation Adjustment line under Other Comprehensive Income (see Balance Sheet above). If a report uses `cta`, has several currencies, and has no CTA expression, the Balance Sheet handler raises the `common_possibly_unbalanced_because_cta` warning.
+
+Source: [`currency_translation — account_report.py:132`](../addons/account/models/account_report.py#L132)
 
 ---
 
@@ -956,6 +1226,7 @@ Export buttons are added to `options['buttons']` in `_init_options_buttons`.
 | Tax Report | Accounting → Reporting → Tax Report | VAT/tax return boxes |
 | Cash Flow | Accounting → Reporting → Cash Flow Statement | Operating/investing/financing cash |
 | Executive Summary | Accounting → Reporting → Executive Summary | KPI overview with key ratios |
+| Interco Comparison | Accounting → Reporting → Interco Comparison | **New in Odoo 20** — matches each company's intercompany balances against the counterpart company's |
 | Custom | Accounting → Reporting → (any custom) | Reports created via Accounting → Configuration → Financial Reports |
 
 ---
@@ -977,19 +1248,65 @@ An `aggregation` expression cannot reference a line whose expression is still pe
 
 **Variant reroute is silent**
 If a variant matches the current company's country, `get_options()` redirects without any visible indication. The UI shows the variant, not the root. Debugging: check `options['report_id']` vs `self.id`.
-Source: [account_report.py:2078](../enterprise/account_reports/models/account_report.py#L2078)
+Source: [`get_options() — account_report.py:2309`](../enterprise/account_reports/models/account_report.py#L2309)
 
 **`equity_unaffected` on Balance Sheet**
-Balance Sheet does NOT have a `domain` line for `equity_unaffected`. It's computed as the residual by `AccountBalanceSheetReportHandler`. Wrong account type on `equity_unaffected` breaks balance sheet equality.
+Contrary to a widespread belief, the Balance Sheet **does** have explicit domain lines covering `equity_unaffected` (`CYE` and `PYE` under Earnings). Nothing is back-solved. A wrong account type still breaks balance-sheet equality, but the failure mode is "the account is summed in the wrong bucket", not "the plug is wrong".
 
 **`custom` engine without handler**
-If `engine = 'custom'` but `custom_handler_model_id` is not set, Odoo raises `AttributeError` — `getattr(self, formula_name)` fails on the base model.
+If `engine = 'custom'` but `custom_handler_model_id` is not set, `_get_custom_report_function` falls through to `account.report`, which has no such method, and the render fails.
 
 **Carryover label convention**
-`carryover_target` only works if the source expression label starts with `_carryover_` and the target label starts with `_applied_carryover_`. Naming mismatch raises an error silently during period close.
+`carryover_target` only works if the source expression label starts with `_carryover_` and the target label starts with `_applied_carryover_`. Both rules are enforced by `@api.constrains` at write time, so the error surfaces when you save the expression, not at period close.
+
+**Report engine methods were renamed**
+Any custom module overriding `_compute_formula_batch_with_engine_*` silently stops being called in Odoo 20. Rename to `_report_engine_*`.
+
+**`sum_if_pos` / `sum_if_neg` / `count_rows` no longer exist**
+Domain expressions using them must be converted to `aggregation` with `if_above` / `if_below` bounds. There is no replacement for `count_rows`.
+
+**Lines are dataclasses, not dicts**
+`line['name']` still works but logs "Use of slow `__getitem__` on report data object". In custom handlers, use `line.name`. Serialise with `.as_dict()` when passing data to the client or to code that expects dicts.
 
 **Cash Flow is fully dynamic**
 The Cash Flow Statement has no static `account.report.line` rows with expressions. All lines come from `_dynamic_lines_generator()`. You cannot add a line by adding an `account.report.line` record — you must modify the handler.
+
+---
+
+## What Changed in Odoo 20
+
+Everything below is a behaviour or API change from Odoo 19 that affects custom reports or day-to-day reading of the standard ones.
+
+| Area | Odoo 19 | Odoo 20 |
+|---|---|---|
+| Engine method names | `_compute_formula_batch_with_engine_<engine>` | `_report_engine_<engine>`, resolved through `_get_custom_report_function` |
+| Engine signature | `(options, date_scope, formulas_dict, current_groupby, next_groupby, offset, limit, warnings)` | `(options, date_scope, formulas_dict, current_groupby, warnings)` |
+| Engine count | 6 | 8 — `text` and `reference` added |
+| `domain` subformulas | `sum`, `-sum`, `sum_if_pos`, `sum_if_neg`, `count_rows` | `sum`, `-sum` only |
+| `formula` / `subformula` type | `Char` | `Text` |
+| Currency conversion | `currency_table` option + SQL JOIN | `consolidation_rate` / `consolidation_balance` computed-SQL fields on `account.move.line` |
+| CTA | implicit in the currency table | explicit rate rules by account type, plus a CTA line on the Balance Sheet and Trial Balance |
+| Hierarchy | `account.group` prefix ranges | `account.account.parent_id` tree |
+| Analytic filter | `filter_analytic` on `account.report` | `filter_analytic_groupby`, declared in `account_analytic_report.py` |
+| Line folding | `foldable` boolean | `foldability` selection (`always_unfolded` / `never_unfolded` / `foldable`) |
+| Prefix groups | `prefix_groups_threshold` + its initializer | removed |
+| Lines and columns | plain dicts | `AccountReportLineData` / `AccountReportColumnData` dataclasses |
+| Aged residual | inline partial-reconciliation SQL | `account.move.line.residual_at_date` |
+| Trial Balance | one initial/end pair | comparison **blocks**, each with its own fiscal-year start, plus a CTA row |
+| Balance Sheet equity | `UNAFFECTED_EARNINGS` + `RETAINED_EARNINGS` | `EQU` + `EAR` (`PYE`/`CYE`) + `OCI` (`CTA`) |
+| Caching | none | `account.report.snapshot` + `@snapshotable_engine` |
+| New reports | — | Interco Comparison |
+| Security files | `ir.model.access.csv` + `ir.rule` | unified `ir.access.csv` (affects any custom report module) |
+
+**Migration checklist for a custom report module:**
+
+1. Rename `_compute_formula_batch_with_engine_*` → `_report_engine_*` and drop `next_groupby`/`offset`/`limit`.
+2. Replace `sum_if_pos` / `sum_if_neg` / `count_rows` subformulas.
+3. Replace `foldable` with `foldability` in XML data.
+4. Replace `filter_analytic` with `filter_analytic_groupby`.
+5. Drop any `_init_options_currency_table` override or `options['currency_table']` read; use `consolidation_balance` in SQL.
+6. In handlers, access line attributes (`line.name`) instead of `line['name']`.
+7. Convert `ir.model.access.csv` and `ir.rule` records to `ir.access.csv`.
 
 ---
 
@@ -997,3 +1314,5 @@ The Cash Flow Statement has no static `account.report.line` rows with expression
 
 - [INDEX.md](INDEX.md)
 - [accounting_coa.md](accounting_coa.md) — account types determine which domain expressions match
+- [accounting_multicompany_branches.md](accounting_multicompany_branches.md) — company filter, consolidation and the Interco Comparison report
+- [accounting_migration.md](accounting_migration.md) — which reports to validate before go-live

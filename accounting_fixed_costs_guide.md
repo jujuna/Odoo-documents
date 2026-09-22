@@ -3,6 +3,12 @@
 > **Who this is for:** Accountants, finance managers, and business owners using Odoo — not developers.
 > **What you'll learn:** How to set up your chart of accounts correctly, when to use journal entries, how to handle fixed monthly costs, how to control them with budgets, how taxes work, how reconciliation works, and how year-end closing happens.
 > **Modules covered:** `account` · `account_budget` · `account_asset` · `account_accountant`
+> **Verified against Odoo 20 source (2026-09-22).**
+>
+> **Three things changed in Odoo 20 that affect this guide:**
+> 1. **Account groups are gone.** The `account.group` model was deleted; accounts now form their own tree via `parent_id`. See [Account hierarchy](#account-hierarchy--parent-accounts-replaces-account-groups).
+> 2. **Budget vocabulary changed.** "Budgeted" is now **Commitment**, and a new **Liquidation** amount sits between Commitment and Achieved. See [Part 10](#part-10--budgets-planning-and-tracking-fixed-costs).
+> 3. **Fixed assets were restructured** around `account.asset.variant` and `account.depreciation.model`. The user-facing flow in Option D is unchanged, but the internals differ — see [`account_asset.md`](account_asset.md).
 
 ---
 
@@ -72,9 +78,9 @@ The type is the most important setting. It answers two questions Odoo needs to k
 
 ---
 
-### All 18 account types — reference table
+### All 19 account types — reference table
 
-Source: [account_account.py:44–70](../addons/account/models/account_account.py#L44)
+Source: [account_account.py:66–90](../addons/account/models/account_account.py#L66). Unchanged between Odoo 19 and 20.
 
 | Type (technical name) | Label in Odoo | Family | Carries Over | Can Be Matched | Use For |
 |---|---|---|---|---|---|
@@ -150,25 +156,40 @@ Source: [account_account.py:44–70](../addons/account/models/account_account.py
 
 ---
 
-### Account groups — automatic subtotals in reports
+### Account hierarchy — parent accounts (replaces account groups)
 
-Groups let you see subtotals in your P&L and Balance Sheet without configuring anything complex.
+> **Changed in Odoo 20.** The separate `account.group` model, with its code-prefix ranges, was removed.
+> Accounts now point at each other: an account can have a **Parent Account**.
 
-Source: [account_account.py:1484–1628](../addons/account/models/account_account.py#L1484)
+Source: [account_account.py:133](../addons/account/models/account_account.py#L133)
 
-**How it works:** Define a group with a code range. Every account whose code falls in that range is automatically in that group. Reports show the group subtotal — no further setup needed.
+**How it works:** on the account form, set "Parent Account". The Chart of Accounts list then renders an
+indented, foldable tree, and reports subtotal by branch.
 
 **Example structure:**
 
 ```
-Operating Expenses   (group: codes 6000–6999)       TOTAL: 45,000
-  └─ Personnel       (group: codes 6100–6199)        subtotal: 30,000
-       6100 Salaries                                           28,000
-       6110 Bonuses                                             2,000
-  └─ Facilities      (group: codes 6200–6299)        subtotal: 15,000
-       6200 Rent                                               12,000
-       6210 Utilities                                           3,000
+Operating Expenses            6000     (parent, often inactive — a header)
+  └─ Personnel                6100     parent_id -> Operating Expenses
+       ├─ Salaries            6101     parent_id -> Personnel        28,000
+       └─ Bonuses             6110     parent_id -> Personnel         2,000
+  └─ Facilities               6200     parent_id -> Operating Expenses
+       ├─ Rent                6201     parent_id -> Facilities       12,000
+       └─ Utilities           6210     parent_id -> Facilities        3,000
 ```
+
+What is different in practice:
+
+| | Odoo 19 (account groups) | Odoo 20 (parent accounts) |
+|---|---|---|
+| Set up by | defining a code range, accounts fall in automatically | setting "Parent Account" on each account |
+| Codes | mandatory, and must be designed around the ranges | optional; the tree ignores them |
+| Can you post to a group? | No — it was not an account | Yes, if the parent account is active |
+| Header-only node | a group | an account with **Active = off** |
+| Where to configure | Accounting → Configuration → Account Groups | Accounting → Accounting → Chart of Accounts, on the account itself |
+
+> If your localization ships a tree (37 `l10n_*` modules do, e.g. UAE, Argentina, Canada, China, Georgia), you get it for
+> free. The generic US chart ships **no** parents — it stays flat until you build the hierarchy yourself.
 
 ---
 
@@ -188,7 +209,7 @@ Each repartition line says:
 - Which **account** receives that portion
 - Which **tax tag** marks it for the tax report (VAT declaration)
 
-Source: [account_tax.py:4923–4992](../addons/account/models/account_tax.py#L4923)
+Source: [account_tax.py:5135–5170](../addons/account/models/account_tax.py#L5135)
 
 **Example — 20% VAT on a 1,000 sale:**
 
@@ -215,7 +236,7 @@ Account tags (with `applicability = taxes`) mark which line of your VAT return a
 | What it does | When the tax is applied, the tag flows to the journal entry line |
 | Where it appears | In the Tax Report (VAT return) — each report line sums all entries carrying that tag |
 
-Source: [account_account_tag.py:12](../addons/account/models/account_account_tag.py#L12), [account_move_line.py:229](../addons/account/models/account_move_line.py#L229)
+Source: [account_account_tag.py:12](../addons/account/models/account_account_tag.py#L12), [account_move_line.py:267](../addons/account/models/account_move_line.py#L267)
 
 **In practice:** You don't set up tax tags manually unless you're building a localization. Your country's module (e.g., `l10n_de`, `l10n_gb`) installs the correct tags and wires them to the tax repartition lines. Your job is to choose the correct tax on the invoice — the tags flow automatically.
 
@@ -238,7 +259,7 @@ Without reconciliation: the Receivable account shows both the +1,000 (invoice) a
 
 With reconciliation: the two entries are linked. The residual (remaining) amount becomes zero. The invoice is marked as paid. It disappears from the outstanding invoice report.
 
-Source: [account_partial_reconcile.py:14–66](../addons/account/models/account_partial_reconcile.py#L14), [account_move_line.py:241–289](../addons/account/models/account_move_line.py#L241)
+Source: [account_partial_reconcile.py:12–70](../addons/account/models/account_partial_reconcile.py#L12), [account_move_line.py:280–312](../addons/account/models/account_move_line.py#L280)
 
 ---
 
@@ -260,7 +281,7 @@ Reconciliation created:
   Status: "Reconciled" (appears as paid)
 ```
 
-Source: [account_move_line.py:773–838](../addons/account/models/account_move_line.py#L773)
+Source: [`_compute_amount_residual()`](../addons/account/models/account_move_line.py#L1159)
 
 ---
 
@@ -303,7 +324,7 @@ You can also reconcile one payment against multiple invoices, or multiple paymen
 
 When invoice and payment are in different currencies, reconciliation also creates an **exchange difference entry** automatically — a journal entry that absorbs the gain or loss from the rate difference. This is booked to a dedicated exchange gain/loss account configured in your company settings.
 
-Source: [account_move_line.py:2943](../addons/account/models/account_move_line.py#L2943)
+Source: [`_prepare_exchange_difference_move_vals()`](../addons/account/models/account_move_line.py#L3315) and [`_create_exchange_difference_moves()`](../addons/account/models/account_move_line.py#L3414)
 
 ---
 
@@ -325,11 +346,11 @@ Odoo creates most journal entries **automatically** when you work with invoices,
 
 ---
 
-### The five types of journals
+### The six types of journals
 
 Journals are labeled folders where Odoo files entries based on what they relate to.
 
-Source: [account_journal.py:106–119](../addons/account/models/account_journal.py#L106)
+Source: [account_journal.py:95–108](../addons/account/models/account_journal.py#L95)
 
 | Journal | What goes in it | Who creates entries here |
 |---|---|---|
@@ -337,6 +358,7 @@ Source: [account_journal.py:106–119](../addons/account/models/account_journal.
 | **Purchase** | Vendor bills and credit notes | Odoo, when you post a bill |
 | **Bank** | Payments in and out of bank | Odoo, when you register a payment or import a bank statement |
 | **Cash** | Cash payments in and out | Odoo, when you register a cash transaction |
+| **Credit Card** | Card charges and repayments | Odoo, when you register a card transaction or import a card statement |
 | **Miscellaneous** (General) | Everything else — corrections, accruals, adjustments | Accountant — manually |
 
 ---
@@ -372,7 +394,7 @@ Odoo creates journal entries automatically in all these cases. Creating them man
 
 ### What Odoo creates automatically — reference
 
-Source: [account_move.py:292–313](../addons/account/models/account_move.py#L292), [account_payment.py:1004](../addons/account/models/account_payment.py#L1004), [account_asset.py:638–649](../enterprise/account_asset/models/account_asset.py#L638)
+Source: [account_move.py:297–316](../addons/account/models/account_move.py#L297), [`account_payment._prepare_move_line_default_vals()`](../addons/account/models/account_payment.py#L430), [`account_asset.compute_depreciation_board()`](../enterprise/account_asset/models/account_asset.py#L465)
 
 | What you do | What Odoo creates automatically |
 |---|---|
@@ -396,7 +418,7 @@ A payment term defines **when** and **how much** a customer or vendor must pay. 
 
 When you apply a payment term to an invoice, Odoo creates **multiple lines** on the Receivable/Payable account — one per installment — each with its own **due date**.
 
-Source: [account_payment_term.py:286–307](../addons/account/models/account_payment_term.py#L286)
+Source: [`_compute_terms()`](../addons/account/models/account_payment_term.py#L169)
 
 **Example — "40/60 net 30":**
 
@@ -418,7 +440,7 @@ If you offer a discount for paying early (e.g., 2% off if paid within 10 days), 
 - The **discount date** on the receivable line
 - The **discounted amount** that would settle the invoice if paid before that date
 
-Source: [account_move_line.py:423–448](../addons/account/models/account_move_line.py#L423)
+Source: [account_move_line.py:508–520](../addons/account/models/account_move_line.py#L508) (`discount_date`, `discount_amount_currency`)
 
 **Important:** Early payment discount can handle taxes in three ways (depends on your country's rules):
 - Tax included in the discount
@@ -443,7 +465,7 @@ Once you've closed a period and filed your VAT return or submitted financial sta
 
 Odoo has five separate lock dates:
 
-Source: [company.py:77–113](../addons/account/models/company.py#L77)
+Source: [company.py:79–115](../addons/account/models/company.py#L79)
 
 | Lock Date | What it protects | Who can override |
 |---|---|---|
@@ -467,10 +489,14 @@ Source: [company.py:77–113](../addons/account/models/company.py#L77)
 
 | Automatic | Manual |
 |---|---|
-| Tax lock date: set automatically when you post the tax closing (VAT closing) entry | Fiscal year lock: set manually in Accounting → Configuration → Settings → Lock Dates |
+| Tax lock date: set automatically when you validate the tax return (Enterprise) | Fiscal year lock: set manually in Accounting → Configuration → Settings → Lock Dates |
 | | Hard lock: set manually — with caution |
 
 **Path:** Accounting → Configuration → Settings → Lock Date section (or Accounting → Accounting → Lock Dates)
+
+> **Changed in Odoo 20:** reopening a filed tax return no longer rolls the tax lock date back for you.
+> Validation still moves `tax_lock_date` forward automatically; resetting the return refuses outright while the
+> lock still covers the period. Lower the lock first, then reset. Details in [`account_returns.md`](account_returns.md#reopening-a-validated-return).
 
 ---
 
@@ -488,7 +514,7 @@ Many people expect Odoo to "zero out" income and expense accounts at year-end wi
 
 Odoo's approach: **P&L accounts accumulate entries forever. Reports filter them by fiscal year date range.**
 
-Source: [account_account.py:638–641](../addons/account/models/account_account.py#L638)
+Source: [account_account.py:679–686](../addons/account/models/account_account.py#L679)
 
 ---
 
@@ -514,7 +540,7 @@ This is the most important account you might not know about. It is type `equity_
 
 **Why it's on the Balance Sheet:** Profit belongs to the owners (equity). As the year progresses, your running profit lives in this account. At year-end, your accountant typically creates one manual entry that moves the year's profit into a "Retained Earnings" account — but Odoo doesn't force you to do this.
 
-Source: [company.py:822–852](../addons/account/models/company.py#L822)
+Source: [`get_unaffected_earnings_account()`](../addons/account/models/company.py#L977)
 
 ---
 
@@ -574,7 +600,7 @@ What is the nature of this cost?
 
 **What happens next:** Odoo automatically creates the next month's draft bill. Every night at 2 AM, a scheduled job posts any recurring bills whose date has arrived.
 
-Source: [account_move.py:292–302](../addons/account/models/account_move.py#L292), [service_cron.xml:3–11](../addons/account/data/service_cron.xml#L3)
+Source: [account_move.py:297–316](../addons/account/models/account_move.py#L297) (`auto_post`, `auto_post_until`, `auto_post_origin_id`), [service_cron.xml:3–11](../addons/account/data/service_cron.xml#L3)
 
 | Setting | What it does |
 |---|---|
@@ -640,7 +666,7 @@ Full details: [deferred_expenses_revenue.md](deferred_expenses_revenue.md)
 4. Click **Confirm** → Odoo computes the board: 500/month for 60 months
 5. Each month: Debit Depreciation Expense 500 / Credit Accumulated Depreciation 500 — posted automatically
 
-Source: [account_asset.py:638–649](../enterprise/account_asset/models/account_asset.py#L638)
+Source: [`compute_depreciation_board()`](../enterprise/account_asset/models/account_asset.py#L465) — in Odoo 20 this delegates to `current_selected_variant_id`, part of the new `account.asset.variant` / `account.depreciation.model` structure.
 
 Full details: [account_asset.md](account_asset.md)
 
@@ -680,7 +706,7 @@ You can have multiple plans active at once. A single bill line can be distribute
 
 When you post a bill line with analytic distribution, Odoo writes a JSON value on that line and creates **analytic line records** automatically.
 
-Source: [analytic_mixin.py:16–21](../addons/analytic/models/analytic_mixin.py#L16), [account_move_line.py:3076](../addons/account/models/account_move_line.py#L3076)
+Source: [analytic_mixin.py:17–22](../addons/analytic/models/analytic_mixin.py#L17), [`_create_analytic_lines()`](../addons/account/models/account_move_line.py#L3546)
 
 **The JSON format:**
 
@@ -732,7 +758,7 @@ Path: Accounting → Analytic → Analytic Accounts → open an account → clic
 
 Shows all spending (and income) tagged to that analytic account.
 
-Source: [analytic_line_views.xml:145–169](../addons/analytic/views/analytic_line_views.xml#L145)
+Source: [analytic_line_views.xml:122–170](../addons/analytic/views/analytic_line_views.xml#L122)
 
 ---
 
@@ -742,18 +768,29 @@ Source: [analytic_line_views.xml:145–169](../addons/analytic/views/analytic_li
 
 A budget answers: **"Did we spend what we planned?"**
 
-You set a planned amount for a period. As you post bills and journal entries with analytic distribution, Odoo tracks the actual spend. You see three numbers at any point:
+You set a planned amount for a period. As you post bills and journal entries with analytic distribution, Odoo tracks the actual spend.
 
-| Column | What it means | Example (rent budget: 36,000/year, checked Feb 15) |
-|---|---|---|
-| **Planned** | What you said you'd spend for the full period | 36,000 |
-| **Achieved** | What you've actually posted so far (via analytic lines) | 6,000 (Jan + Feb bills) |
-| **Theoretical** | What you *should* have spent by today, proportionally | 4,520 (46 days ÷ 365 × 36,000) |
+> **Renamed in Odoo 20.** The planned figure, the field `budget_amount`, is now labelled **Commitment** (it was "Budgeted"),
+> and a new **Liquidation** amount was added alongside it. `achieved_percentage` is now measured against Liquidation,
+> not against Commitment.
+
+| Column | Field | What it means | Example (rent budget: 36,000/year, checked Feb 15) |
+|---|---|---|---|
+| **Commitment** | `budget_amount` | What you said you'd spend for the full period | 36,000 |
+| **Liquidation** | `liquidation_amount` | The amount you expect to actually settle. Defaults to Commitment, editable | 36,000 |
+| **Achieved** | `achieved_amount` | What you've actually posted so far (via analytic lines) | 6,000 (Jan + Feb bills) |
+| **Theoretical** | `theoritical_amount` | What you *should* have spent by today, proportionally | 4,520 (46 days ÷ 365 × 36,000) |
+| **Committed** | `committed_amount` | Confirmed POs not yet invoiced (needs `account_budget_purchase`) | 0 |
 
 If Achieved > Theoretical → spending faster than planned.
-If Achieved > Planned → over budget → red alert.
+If Achieved > Commitment → over budget → `is_above_budget`, red highlight.
 
-Source: [budget_line.py:22–40](../enterprise/account_budget/models/budget_line.py#L22), [budget_line.py:71–83](../enterprise/account_budget/models/budget_line.py#L71)
+Source: [budget_line.py:22–45](../enterprise/account_budget/models/budget_line.py#L22), [`_compute_all`](../enterprise/account_budget/models/budget_line.py#L82), [`_compute_theoritical_amount`](../enterprise/account_budget/models/budget_line.py#L94)
+
+> **What counts as Achieved.** Only analytic lines whose general account is income/expense or
+> `asset_current` / `asset_non_current` / `asset_fixed` (or that carry no general account at all) are summed
+> — a filter added in Odoo 20 ([budget_report.py:65](../enterprise/account_budget/reports/budget_report.py#L65)).
+> An analytic line posted against, say, a payable account no longer inflates Achieved.
 
 ---
 
@@ -761,13 +798,13 @@ Source: [budget_line.py:22–40](../enterprise/account_budget/models/budget_line
 
 Source: [budget_analytic.py](../enterprise/account_budget/models/budget_analytic.py)
 
-| State | Meaning | Can You Edit? |
-|---|---|---|
-| Draft | Being prepared | Yes — add/edit budget lines |
-| Confirmed | Active — tracking is live | No — locked. Create a revision to adjust |
-| Revised | A newer version replaced this one | No |
-| Done | Manually closed | No |
-| Canceled | Abandoned | No |
+| State (technical) | Label in the UI | Meaning | Can You Edit? |
+|---|---|---|---|
+| `draft` | Draft | Being prepared | Yes — add/edit budget lines |
+| `confirmed` | **Open** | Active — tracking is live | No — locked. Create a revision to adjust |
+| `revised` | Revised | A newer version replaced this one | No |
+| `done` | Done | Manually closed | No |
+| `canceled` | Canceled | Abandoned | No |
 
 > A draft budget does not track anything. You must confirm it before spending is counted.
 
@@ -799,7 +836,7 @@ Click **Split Budget** → Period: Month → Odoo creates 12 lines of 3,000 each
 
 Use this if you want to see monthly Planned / Achieved / Theoretical (e.g., if some months are higher than others).
 
-Source: [budget_split_wizard.py:11–68](../enterprise/account_budget/wizards/budget_split_wizard.py#L11)
+Source: [`action_budget_split()`](../enterprise/account_budget/wizards/budget_split_wizard.py#L33)
 
 **Step 4 — Confirm the budget**
 
@@ -824,7 +861,7 @@ Path: Accounting → Accounting → Budgets → open your budget
 
 ### Budget alerts — where they appear
 
-Source: [budget_analytic_views.xml:63](../enterprise/account_budget/views/budget_analytic_views.xml#L63), [purchase_order_line.py:57–63](../enterprise/account_budget_purchase/models/purchase_order_line.py#L57)
+Source: [budget_analytic_views.xml:59](../enterprise/account_budget/views/budget_analytic_views.xml#L59), [`purchase_order_line._compute_above_budget()`](../enterprise/account_budget_purchase/models/purchase_order_line.py#L56)
 
 | Where | What you see | When |
 |---|---|---|
@@ -846,7 +883,7 @@ Source: [budget_analytic_views.xml:63](../enterprise/account_budget/views/budget
 - Only the **uninvoiced quantity** — if you've invoiced 3 out of 10 units, only 7 units' worth counts as committed
 - Formula: `(quantity_ordered - quantity_invoiced) × unit_price × analytic_distribution_%`
 
-Source: [budget_report.py:59–64](../enterprise/account_budget_purchase/reports/budget_report.py#L59)
+Source: [budget_report.py:50–75](../enterprise/account_budget_purchase/reports/budget_report.py#L50) — the PO line query joins confirmed orders to matching budget lines and keeps only `product_qty > qty_invoiced`
 
 > Requires the `account_budget_purchase` enterprise module.
 
@@ -856,7 +893,7 @@ Source: [budget_report.py:59–64](../enterprise/account_budget_purchase/reports
 
 Path: **Accounting → Reporting → Budget Report**
 
-Source: [budget_report_view.xml:77–83](../enterprise/account_budget/reports/budget_report_view.xml#L77)
+Source: [budget_report_view.xml:81–94](../enterprise/account_budget/reports/budget_report_view.xml#L81)
 
 This report opens in **Pivot view by default** (the best view for comparison):
 
@@ -866,11 +903,11 @@ This report opens in **Pivot view by default** (the best view for comparison):
 | **List** | Flat list of all budget lines and analytic lines — filter to "Budgeted" or "Achieved" |
 | **Graph** | Time-series of budget vs actual |
 
-**Default filter:** Only confirmed budgets are shown (`state = 'confirmed'`).
+**Default filter:** `search_default_open_budget` — only budgets in the `confirmed` ("Open") state. Odoo 20 also groups by budget line by default (`search_default_group_by_budget_line_id`).
 
 **Drill-down from Achieved:** Click on an achieved amount → Odoo opens the original business document (the vendor bill, journal entry, etc.) that generated that analytic line.
 
-Source: [budget_report.py:138–149](../enterprise/account_budget/reports/budget_report.py#L138)
+Source: [`action_open_reference()`](../enterprise/account_budget/reports/budget_report.py#L181)
 
 ---
 
@@ -893,7 +930,7 @@ If an expense IS tagged → it appears in both.
 
 ### Financial budget vs. analytic budget — the confusion explained
 
-You may hear these terms used as if they're two different systems. In Odoo 19, there is **one budget system**.
+You may hear these terms used as if they're two different systems. In Odoo 20, as in 19, there is **one budget system**.
 
 - **"Financial budget"** = the overall concept of tracking planned vs actual money
 - **"Analytic budget"** = the Odoo implementation, which uses analytic accounts as dimensions
@@ -982,6 +1019,8 @@ Balance sheet shows Accounts Payable with any outstanding rent bills
 - **Not setting a lock date after closing a period.** Without a lock, anyone can accidentally post into the closed period and corrupt your filed financials.
 - **Expecting Odoo to zero out income/expense accounts at year-end.** It doesn't. Reports filter by date range. Entries stay in the database forever.
 - **Thinking committed amount includes all POs.** Only confirmed purchase orders (`state = 'purchase'`) count. Draft POs are not in committed.
+- **Expecting account groups to still exist (Odoo 20).** There are no code-range groups any more. If your reports relied on them, rebuild the hierarchy with parent accounts.
+- **Expecting a budget reset when you reopen a tax return (Odoo 20).** Reopening a return no longer lowers the tax lock date — do that yourself first, or the reset is refused.
 
 ---
 

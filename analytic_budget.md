@@ -1,477 +1,185 @@
-# Analytic Budget
+# Analytic Budget — Odoo 20
 
-> **Modules:** `account_budget` (enterprise) + `project_account_budget` (enterprise)
-> **Paths:** [`enterprise/account_budget/`](../enterprise/account_budget/) | [`enterprise/project_account_budget/`](../enterprise/project_account_budget/)
-> **Odoo Apps category:** Accounting / Project
+> Reviewed against this checkout on 2026-09-22. [`odoo/release.py`](../odoo/release.py) identifies it as 20.0; this document describes the local source, including Enterprise modules, rather than assuming the inherited Odoo 19 behavior.
+> **Modules:** [`account_budget`](../enterprise/account_budget/), [`account_budget_purchase`](../enterprise/account_budget_purchase/), [`project_account_budget`](../enterprise/project_account_budget/).
 
 ## What It Does
 
-Analytic budget lets you set a planned spending (or revenue) ceiling on an analytic account and track how much has actually been spent against it in real time. Each budget is divided into lines, each line pointing at one or more analytic accounts for a date range. "Achieved" amount is computed live from posted journal entries that carry an analytic distribution matching that line. Projects linked to analytic accounts get a budget panel showing allocated vs. spent vs. progress.
+An analytic budget compares planned amounts with analytic entries over a date range. Each budget line can constrain one or several analytic dimensions. Actuals come from `account.analytic.line`, including journal-linked entries, timesheets and manual entries. They are not limited to invoices.
 
----
+The base Enterprise module depends on `accountant`. Purchase commitment tracking requires `account_budget_purchase`; project integration requires `project_account_budget`. Timesheet costs come from `hr_timesheet`.
 
-## Dependencies
+## Models and Amounts
 
-### Requires
-| Module | Why |
+Sources: [`budget_analytic.py`](../enterprise/account_budget/models/budget_analytic.py), [`budget_line.py`](../enterprise/account_budget/models/budget_line.py), [`purchase budget_line.py`](../enterprise/account_budget_purchase/models/budget_line.py).
+
+| Model / field | Meaning in this checkout |
 |---|---|
-| `analytic` | provides `account.analytic.account`, `account.analytic.plan`, `account.analytic.line` |
-| `account` | journal entries post analytic lines; `account.move.line` is the source of achieved amounts |
-| `project` | `project_account_budget` links projects to budgets via `project.project.account_id` |
+| `budget.analytic` | Header: name, responsible user, company, dates, type, state and revision links |
+| `budget_type` | `expense` (default), `revenue`, or `both` |
+| `budget.line` | Analytic plan columns and amounts; dates and company are stored related fields from the header |
+| `budget_amount` | Planned amount, labeled **Commitment** |
+| `liquidation_amount` | **Liquidation**; stored, editable computed amount, initially equal to commitment and recomputed when commitment changes |
+| `achieved_amount` | Sum of matching report actuals |
+| `achieved_percentage` | Achieved / **liquidation**, or zero when liquidation is zero |
+| `theoritical_amount` / `theoritical_percentage` | Date-based planned progress; these are the actual, misspelled field names |
+| `is_above_budget` | Simple `achieved_amount > budget_amount` comparison, without budget-type adjustment |
+| `committed_amount` | Purchase integration only: achieved plus outstanding purchase commitments |
+| `committed_percentage` | Committed / commitment (`budget_amount`), or zero for a zero denominator |
 
-### Optional Integrations
-| Module | What it enables |
-|---|---|
-| `account_budget_purchase` | adds "committed" amount from purchase orders (not yet posted) |
-| `hr_timesheet` | timesheet hours create analytic lines that count towards expense budgets |
+**Commitment** (`budget_amount`, a plan) and **Committed** (`committed_amount`, actuals plus outstanding purchases) are distinct. Liquidation is another planned amount; it is not computed from payments.
 
----
+## Business Flow and States
 
-## Business Flow
+1. Create a budget with a period and budget type.
+2. Add lines with analytic accounts, commitment and liquidation amounts.
+3. Open the budget (`confirmed`).
+4. Matching analytic entries contribute to achieved amounts; qualifying purchase orders also contribute to committed amounts when the purchase extension is installed.
+5. Inspect the report or project budget panel.
 
-```
-Create Budget (draft)
-      ↓
-Add Budget Lines (each line = analytic account + date range + budget amount)
-      ↓
-Confirm Budget → state = 'confirmed'
-      ↓
-Real transactions posted (vendor bills, invoices, timesheets) → analytic lines created
-      ↓
-budget.report SQL view joins analytic lines → achieved_amount computed live
-      ↓
-Project panel shows allocated / spent / progress %
-```
+The states are `draft`, `confirmed` (UI label **Open**), `revised`, `done`, and `canceled`. In the standard form, Open and Cancel Budget are available in draft, Done in confirmed, and Reset to Draft outside draft. These button conditions are not a strict server-side transition matrix: the action methods mostly assign the state directly.
 
-### Budget States
-| State | Meaning | Can Transition To |
-|---|---|---|
-| `draft` | created, not active | `confirmed`, `canceled` |
-| `confirmed` | active, being tracked | `done`, `canceled`, `revised` (if a child revision is confirmed) |
-| `revised` | superseded by a child revision | `done`, `canceled` |
-| `done` | closed manually | — |
-| `canceled` | discarded | — |
+Creating a revision copies the budget into a new draft and sets `parent_id`; it does **not** immediately mark the parent revised. Confirming the child marks a confirmed parent revised. Confirming a budget that already has children sets that budget to revised. Deletion is restricted to draft/canceled budgets. See [`budget_analytic.py`](../enterprise/account_budget/models/budget_analytic.py) and [`budget_analytic_views.xml`](../enterprise/account_budget/views/budget_analytic_views.xml).
 
-Source: [`enterprise/account_budget/models/budget_analytic.py:29-42`](../enterprise/account_budget/models/budget_analytic.py#L29)
+Budget actual calculations do not inherently exclude draft, revised or canceled budgets. The project panel and project aggregate fields explicitly select confirmed/done budgets.
 
-### State Transitions
-- **Confirm** → [`action_budget_confirm()`](../enterprise/account_budget/models/budget_analytic.py#L73) — sets this budget to `confirmed`; if parent exists and is confirmed, parent becomes `revised`
-- **Create Revision** → [`create_revised_budget()`](../enterprise/account_budget/models/budget_analytic.py#L87) — copies the budget, links it as child, parent becomes `revised`
-- **Done / Cancel** → [`action_budget_done()`](../enterprise/account_budget/models/budget_analytic.py#L84) / [`action_budget_cancel()`](../enterprise/account_budget/models/budget_analytic.py#L81)
+## How Report Matching Works
 
----
+[`budget.report`](../enterprise/account_budget/reports/budget_report.py) is an `_auto = False` model with a dynamic `_table_sql` query, not a stored total or a materialized PostgreSQL view. It combines planned budget rows and analytic actual rows; the purchase extension adds commitment rows.
 
-## Key Models
+For an analytic entry to contribute to a particular budget line:
 
-### `budget.analytic` — The budget header
-> [`enterprise/account_budget/models/budget_analytic.py`](../enterprise/account_budget/models/budget_analytic.py)
+- Its date must be inside the header's inclusive date range.
+- Its company must equal the budget company, unless the budget company is empty.
+- Every populated plan column on the budget line must match the entry. Empty plan columns impose no restriction.
+- Its financial account must pass the report's eligibility domain.
+- Its `analytic_profitability` must match the budget type as described below.
 
-| Field | Type | Purpose |
-|---|---|---|
-| `name` | `Char` | Budget name |
-| `state` | `Selection` | draft / confirmed / revised / done / canceled |
-| `budget_type` | `Selection` | `expense`, `revenue`, or `both` — controls which analytic lines count |
-| `date_from` / `date_to` | `Date` | Budget period; analytic lines outside this range are ignored |
-| `budget_line_ids` | `One2many → budget.line` | The line items |
-| `parent_id` / `children_ids` | `Many2one / One2many` | Revision chain |
+The query groups budget lines by which plan columns are populated and builds joins for those shapes. It separately handles company-specific and company-empty budgets. A single analytic entry can match multiple overlapping budget lines, so adding overlapping budgets together can count the same entry more than once. Unfiltered reports also have a branch for entries without a matching budget line. See [`_shape_join()`](../enterprise/account_budget/models/analytic_plan_fields_mixin.py).
 
----
+## Odoo 20 Eligibility and Profitability
 
-### `budget.line` — One budget line item
-> [`enterprise/account_budget/models/budget_line.py`](../enterprise/account_budget/models/budget_line.py)
+The report first accepts lines with **no financial account**, accounts with `internal_group` income/expense, and the explicit asset types **`asset_current`, `asset_non_current`, `asset_fixed`**. Cash, receivable, liability and equity accounts are not accepted by that domain.
 
-| Field | Type | Purpose |
-|---|---|---|
-| `budget_analytic_id` | `Many2one → budget.analytic` | Parent budget |
-| `account_id` | `Many2one → account.analytic.account` | Project-plan analytic account (dynamic via `analytic.plan.fields.mixin`) |
-| `x_plan2_id`, `x_plan3_id` | `Many2one` | Additional plan columns (auto-generated per plan) |
-| `budget_amount` | `Monetary` | The planned amount |
-| `achieved_amount` | `Monetary` (computed) | Actual amount from posted transactions — see below |
-| `theoritical_amount` | `Monetary` (computed) | `budget_amount × (elapsed_days / total_days)` — what should have been spent by today |
-| `achieved_percentage` | `Float` (computed) | `achieved / budget` |
-| `is_above_budget` | `Boolean` (computed) | `achieved > budget` |
+It then selects expense-budget entries where `analytic_profitability = 'loss'`, revenue-budget entries where it is `'revenue'`, and all eligible entries for `both`. Classification is defined in [`account_analytic_line.py`](../addons/account/models/account_analytic_line.py), with both Python and SQL implementations.
 
-**Computed fields:**
-- `achieved_amount` — [`_compute_all()`](../enterprise/account_budget/models/budget_line.py#L59) — queries `budget.report` view, sums `achieved` per budget line
-- `theoritical_amount` — [`_compute_theoritical_amount()`](../enterprise/account_budget/models/budget_line.py#L71) — linear interpolation over the budget date range
-
----
-
-### `budget.report` — SQL view (no real table)
-> [`enterprise/account_budget/reports/budget_report.py`](../enterprise/account_budget/reports/budget_report.py)
-
-This is the **core engine**. It is `_auto = False` — a read-only SQL view built fresh each query. It is a `UNION ALL` of two subqueries:
-
-**Part 1 — `_get_bl_query()`**: Budget lines themselves (`line_type = 'budget'`).
-
-**Part 2 — `_get_aal_query()`**: `account.analytic.line` records (`line_type = 'achieved'`).
-
-The JOIN condition matching analytic lines to budget lines:
-```sql
-aal.date >= bl.date_from AND aal.date <= bl.date_to
-AND aal.[plan_column] = bl.[plan_column]   -- e.g. aal.account_id = bl.account_id
-AND aal.company_id = bl.company_id         -- or bl.company_id IS NULL
-```
-
-The filter determining which analytic lines count, based on `budget_type`:
-```sql
-WHEN ba.budget_type = 'expense' THEN (
-    SPLIT_PART(aa.account_type, '_', 1) = 'expense'          -- expense GL account
-    OR (aa.account_type IS NULL AND aal.category NOT IN ('invoice', 'other'))  -- e.g. vendor_bill (no GL)
-    OR (aa.account_type IS NULL AND aal.category = 'other' AND aal.amount < 0) -- negative timesheets
-)
-WHEN ba.budget_type = 'revenue' THEN (
-    SPLIT_PART(aa.account_type, '_', 1) = 'income'            -- income GL account
-    OR (aa.account_type IS NULL AND aal.category = 'other' AND aal.amount > 0) -- positive timesheets
-)
-ELSE TRUE   -- 'both': income + expense + NULL account types; asset/liability/equity always excluded
-```
-
-Global additional filter (applies to all budget types):
-```sql
-AND (SPLIT_PART(aa.account_type, '_', 1) IN ('income', 'expense') OR aa.account_type IS NULL)
-```
-Asset, liability, equity, payable, receivable GL accounts are **always excluded** regardless of budget type.
-
-The `achieved` value formula:
-```sql
-aal.amount * CASE WHEN ba.budget_type = 'expense' THEN -1 ELSE 1 END AS achieved
-```
-Expense negation: analytic lines for expenses store **negative** amounts (debit to expense account → `amount = -balance`). The `-1` factor makes them positive for display against `budget_amount`.
-For `revenue` and `both`: no negation — amounts are used as-is.
-
-Source: [`enterprise/account_budget/reports/budget_report.py:59-119`](../enterprise/account_budget/reports/budget_report.py#L59)
-
----
-
-## Budget Types — Full Comparison
-
-Source: [`budget_report.py:94-106`](../enterprise/account_budget/reports/budget_report.py#L94), [`test_commited_achieved_amount.py`](../enterprise/account_budget_purchase/tests/test_commited_achieved_amount.py), [`test_project.py`](../enterprise/project_account_budget/tests/test_project.py)
-
-### `expense` — Cost Ceiling
-
-**Business use:** "We have $10,000 to spend on this project. Alert when approaching the limit."
-
-**What analytic lines are counted:**
-| Source | GL Account Type | Category | Counted? | Achieved sign |
+| Analytic entry | Profitability | Expense budget | Revenue budget | Both budget |
 |---|---|---|---|---|
-| Vendor bill posted | `expense_*` | `vendor_bill` | YES | `amount * -1` → positive |
-| Vendor bill posted | `expense_*` | `vendor_bill` | partial bills also YES | positive |
-| Customer invoice posted | `income_*` | `invoice` | NO | — |
-| Manual journal entry | `expense_*` | `other` | YES | `amount * -1` → positive |
-| Manual journal entry | `asset_*` / `liability_*` | any | NO | — |
-| Timesheet (positive hours) | NULL | `other`, amount > 0 | NO | — |
-| Timesheet (negative hours) | NULL | `other`, amount < 0 | YES | `amount * -1` → positive |
-| Manual AAL, no GL, `vendor_bill` | NULL | NOT 'invoice'/'other' | YES | `amount * -1` |
+| Expense financial account (`expense`, `expense_*`) | loss | Included | Excluded | Included |
+| Income financial account (`income`, `income_*`) | revenue | Excluded | Included | Included |
+| `asset_current`, `asset_non_current`, `asset_fixed` | loss | Included | Excluded | Included |
+| No financial account, category `other`, negative amount | loss | Included | Excluded | Included |
+| No financial account, category `other`, positive amount | revenue | Excluded | Included | Included |
+| No financial account, category other than `invoice`/`other` | loss | Included | Excluded | Included |
+| No financial account, category `invoice`; or `other` with zero amount | uncategorized | Excluded | Excluded | Included |
+| Cash, receivable, liability or equity financial account | Excluded by report domain | Excluded | Excluded | Excluded |
 
-**Progress direction:** Starts at 1.0 (full budget remaining), drops to 0 as spending hits 100%, goes negative when over budget.
+Classification for expense, income and qualifying asset accounts follows the account type, even when the amount reverses sign. Budget report amounts use:
 
-**Progress formula** (from `_get_budget_items`, `project_project.py:132`):
 ```python
-progress = (spent - allocated) / abs(allocated) * -1
-# spent=0, allocated=500 → (0-500)/500 * -1 = 1.0   → green
-# spent=375, allocated=500 → (375-500)/500 * -1 = 0.25 → green boundary
-# spent=500, allocated=500 → (500-500)/500 * -1 = 0.0  → orange (warning)
-# spent=600, allocated=500 → (600-500)/500 * -1 = -0.2  → red (danger)
+achieved = analytic_line.amount * (-1 if budget_type == 'expense' else 1)
 ```
 
-**Credit notes reduce the achieved amount** — a credit note posted against a vendor bill creates a positive analytic line on the expense account (positive balance → `amount = -balance < 0`), which after `* -1` becomes negative, reducing total achieved. Proven in `test_budget_analytic_expense_with_credit_note`.
+Therefore an expense debit creates a negative analytic amount and a positive expense-budget actual. An income credit creates a positive analytic amount and a positive revenue-budget actual. `both` keeps signed net amounts, including eligible asset movements; it is not necessarily an income-statement profit measure.
 
----
+A vendor credit note on an expense account has a **negative GL balance**, hence a positive analytic amount and a negative expense-budget contribution. A customer credit note reduces revenue achieved. For `both`, vendor refunds increase the net amount and customer refunds decrease it.
 
-### `revenue` — Revenue Target
+## Transaction Scenarios
 
-**Business use:** "We need to invoice $50,000 this quarter. Show how close we are."
+### Vendor bills and customer invoices
 
-**What analytic lines are counted:**
-| Source | GL Account Type | Category | Counted? | Achieved sign |
-|---|---|---|---|---|
-| Customer invoice posted | `income_*` | `invoice` | YES | `amount * 1` → positive |
-| Vendor bill posted | `expense_*` | `vendor_bill` | NO | — |
-| Manual journal entry | `income_*` | `other` | YES | `amount * 1` → positive |
-| Timesheet (positive hours) | NULL | `other`, amount > 0 | YES | positive |
-| Timesheet (negative hours) | NULL | `other`, amount < 0 | NO | — |
-| Purchase order (committed) | — | — | NO effect on revenue budget | — |
+[`account.move._post()`](../addons/account/models/account_move.py) calls [`_create_analytic_lines()`](../addons/account/models/account_move_line.py). A distributed vendor-bill expense debit contributes positive expense achieved. A distributed customer-invoice income credit contributes positive revenue achieved. The analytic amount is `-balance × percentage / 100`, subject to currency rounding.
 
-**Progress direction:** Starts at -1.0 (nothing achieved), rises toward 0 as invoices are posted, goes positive when over target.
+Draft journal entries do not generate these postings. Resetting a posted entry to draft deletes its analytic lines and removes their achieved contribution. Canceling a posted entry first calls `button_draft()`, so the same removal applies. Independent manual analytic lines and timesheets do not require posting a journal entry.
 
-**Progress formula:**
-```python
-progress = (spent - allocated) / abs(allocated) * 1
-# spent=0, allocated=500 → (0-500)/500 = -1.0    → gray "Budget allocated" (special case)
-# spent=375, allocated=500 → (375-500)/500 = -0.25 → still tracking
-# spent=500, allocated=500 → (500-500)/500 = 0.0   → orange (barely met, on boundary)
-# spent=625, allocated=500 → (625-500)/500 = 0.25  → green (target exceeded by 25%)
-```
+### Timesheets
 
-Note: "progress >= 0.25" = green for revenue means **exceeded the target by 25%**. For revenue budgets, going "over" is good.
+[`hr_timesheet` postprocessing](../addons/hr_timesheet/models/account_analytic_line.py) computes `amount = -unit_amount * hourly_cost`, with currency conversion. With a positive hourly cost, **positive hours produce a negative cost** and count toward expense budgets. Negative hours produce a positive amount. For a no-financial-account line with category `other`, that positive correction is classified as revenue, so it contributes to revenue/`both`, rather than reducing an expense budget's actuals. Zero-cost timesheets have no monetary effect.
 
----
+### Miscellaneous journal entries
 
-### `both` — Net Position
+The entry must be posted and the relevant line must have analytic distribution. A debit to an expense account or an eligible asset account can consume an expense budget; its balancing line contributes separately only if it also has distribution and passes the filters.
 
-**Business use:** "Track both revenues and costs on the same budget. Show net profitability."
+The previous example involving `asset_cash` and `asset_current` cannot be explained by saying all assets are excluded: **cash is excluded, current assets are included** in this source. Diagnosing an actual record still requires checking its distribution, posting state, date, company and plan matches.
 
-**What analytic lines are counted:**
-| Source | GL Account Type | Category | Counted? | Achieved sign |
-|---|---|---|---|---|
-| Customer invoice posted | `income_*` | `invoice` | YES | `amount * 1` → positive |
-| Vendor bill posted | `expense_*` | `vendor_bill` | YES | `amount * 1` → **negative** (expenses stored negative) |
-| Manual journal entry | `income_*` OR `expense_*` | `other` | YES | `amount * 1` |
-| Timesheet | NULL | `other` | YES | `amount * 1` |
-| Asset/liability GL accounts | `asset_*` / `liability_*` | any | NO | — |
+### Asset purchase and depreciation
 
-**Key difference from `expense`:** The sign is **not negated** (`* 1`). Expense analytic lines are already negative in storage, so they reduce the achieved total. Revenue lines are positive, they increase it.
+A bill for a $1,400 fixed asset with 100% distribution creates a -$1,400 analytic amount on `asset_fixed`. It can immediately contribute **+$1,400** to an expense budget.
 
-**From test `test_budget_analytic_both_committed_achieved_amount`:**
-- Bill lines: -100, -300 (expenses) → achieved contribution: -100, -300
-- Invoice lines: 200, 400 (revenues) → achieved contribution: +200, +400
-- Manual AALs: +200, -100
-- Total achieved = -100 + (-300) + 200 + 400 + 200 + (-100) = **+300**
+The asset module's [`_prepare_move_for_asset_depreciation()`](../enterprise/account_asset/models/account_move.py) copies a nonempty asset-variant distribution onto both depreciation move lines. If a $100 depreciation credits a qualifying asset account and debits an expense account, with the same budget matches:
 
-**From test `test_budget_analytic_misc_entry` (misc journal entry on expense account):**
-- Entry: debit expense 100, credit asset 70 (asset excluded by global filter)
-- `both` budget: `achieved = -100 * 1 = -100` (net negative — cash out)
-- `expense` budget: `achieved = -100 * -1 = 100` (positive — cost consumed)
-
-**Progress formula:** Same as revenue (`type_factor = 1`).
-
-**Budget amount meaning for `both`:** The `budget_amount` is the target net position (revenues minus expenses). Setting `budget_amount = 0` and watching achieved go positive means profitable; negative means loss.
-
----
-
-### Quick Reference
-
-| | `expense` | `revenue` | `both` |
-|---|---|---|---|
-| **Purpose** | Cost ceiling | Revenue target | Net position |
-| **Expense GL lines** | YES (positive) | NO | YES (negative) |
-| **Revenue GL lines** | NO | YES (positive) | YES (positive) |
-| **No-GL lines (timesheets)** | negative only | positive only | all |
-| **Amount sign in achieved** | `* -1` (flipped) | `* 1` (as-is) | `* 1` (as-is) |
-| **Starting progress (empty)** | 1.0 (green) | -1.0 (gray) | -1.0 (gray) |
-| **"On track" means** | budget not overspent | revenue target exceeded | net positive |
-| **Credit note effect** | reduces achieved | reduces achieved | increases achieved |
-| **Default** | YES (default value) | — | — |
-
----
-
-### `account.analytic.line` — The source of "achieved"
-> [`addons/analytic/models/analytic_line.py:154`](../addons/analytic/models/analytic_line.py#L154)
-
-| Field | Purpose |
-|---|---|
-| `amount` | Monetary amount — negative for expenses (follows accounting balance sign) |
-| `date` | Must fall within `budget.line.date_from` → `date_to` to be counted |
-| `account_id` / `x_plan*_id` | Must match the analytic account on the budget line |
-| `general_account_id` | The GL account — determines account_type for expense/revenue filtering |
-| `category` | `invoice`, `vendor_bill`, `other` — affects filtering when no GL account |
-| `move_line_id` | FK back to the journal entry line that created it |
-
----
-
-## When Does the Budget "Decrease" (Achieved Amount Increases)?
-
-"Achieved" increasing means you are consuming the budget. It happens when an `account.analytic.line` is created that matches a budget line.
-
-### Trigger 1: Posting a Vendor Bill / Expense
-- User posts a vendor bill (or expense report) with analytic distribution pointing to the project's analytic account
-- [`account_move.action_post()`](../addons/account/models/account_move.py#L5586) calls `line_ids._create_analytic_lines()`
-- [`_create_analytic_lines()`](../addons/account/models/account_move_line.py#L3076) loops over move lines that have `analytic_distribution`, creates `account.analytic.line` records
-- For a vendor bill: `category = 'vendor_bill'`, `general_account_id` = expense GL account (account_type starts with `expense_`)
-- The analytic line `amount = -balance` where balance > 0 (debit on expense) → amount is **negative**
-- In `budget.report`, expense budget: `achieved = amount * -1` → **positive**, consumed from budget
-
-### Trigger 2: Posting a Customer Invoice (revenue budget)
-- User posts an invoice with analytic distribution on a revenue/income account
-- `category = 'invoice'`, `general_account_id` = income GL account (account_type starts with `income_`)
-- `amount = -balance` where balance < 0 (credit on income account) → amount is **positive**
-- Revenue budget: `achieved = amount * 1` → positive, counted as revenue achieved
-
-### Trigger 3: Timesheets (if hr_timesheet installed)
-- Timesheet entries create `account.analytic.line` with `category = 'other'`, no `general_account_id`
-- For expense budget: only counted if `amount < 0` (negative time cost entries)
-- For revenue budget: counted if `amount > 0`
-- Normal positive timesheet hours: counted towards revenue budgets, NOT expense budgets
-
-### Trigger 4: Manual Journal Entry (Misc Entry)
-A manual `entry` type journal entry counts **only if at least one line meets all conditions:**
-
-**Conditions for a journal entry line to register on the budget:**
-
-| Condition | Requirement |
-|---|---|
-| Entry state | Must be **posted** (`state = 'posted'`) — draft entries create no analytic lines |
-| Line has analytic distribution | `analytic_distribution` field must be set on the move line |
-| GL account type | Must be `expense_*` or `income_*` — **asset, liability, equity, payable, receivable are all excluded** |
-| Budget type match | `expense` budget → line must be on an `expense_*` account; `revenue` → `income_*`; `both` → either |
-| Date in range | `move.date` must fall within `budget.line.date_from` → `budget.line.date_to` |
-| Analytic account match | The analytic account in `analytic_distribution` must match the plan column on the budget line |
-| Company | `move.company_id` must match `budget.analytic.company_id` (or budget company = NULL) |
-
-**Correct structure for a misc entry targeting an expense budget:**
-```
-DEBIT  → expense account (e.g. "Expenses", "Rent", "Office Supplies")
-           + analytic_distribution = {"<analytic_account_id>": 100}
-CREDIT → any account (asset, payable, etc.) — no analytic required
-```
-
-**Why `MISC/2026/02/0003` did NOT count:**
-- Both lines used `asset_cash` and `asset_current` accounts
-- `SPLIT_PART('asset_cash', '_', 1) = 'asset'` → not in `('income', 'expense')` → global filter excludes it
-- The analytic distribution on asset lines is stored but never read by the budget engine
-
-**Correct structure for a misc entry targeting a revenue budget:**
-```
-DEBIT  → any account (asset, receivable, etc.) — no analytic required
-CREDIT → income account (e.g. "Product Sales", "Other Income")
-           + analytic_distribution = {"<analytic_account_id>": 100}
-```
-
-**Accounts that NEVER count regardless of budget type:**
-
-| account_type | Examples | Budget visible? |
+| Line | Analytic amount | Expense-budget achieved |
 |---|---|---|
-| `asset_cash` | Bank, Cash | NO |
-| `asset_current` | Outstanding Payments, Prepaid Expenses | NO |
-| `asset_fixed` | Buildings, Computers | NO |
-| `asset_non_current` | Long-term investments | NO |
-| `liability_payable` | Accounts Payable | NO |
-| `liability_current` | Current liabilities | NO |
-| `equity` | Share capital | NO |
-| `expense` | Expenses, Rent, Salary | YES (expense/both budgets) |
-| `expense_direct_cost` | Cost of Goods Sold | YES (expense/both budgets) |
-| `expense_other` | Foreign Exchange Loss, Taxes | YES (expense/both budgets) |
-| `income` | Product Sales, FX Gain | YES (revenue/both budgets) |
-| `income_other` | Other Income | YES (revenue/both budgets) |
+| Credit accumulated depreciation / eligible asset | +100 | -100 |
+| Debit depreciation expense | -100 | +100 |
+| Net contribution | 0 | 0 |
 
-### Trigger 5: Direct Analytic Lines
-- A user manually creates an `account.analytic.line` via Accounting → Analytic → Analytic Items
-- No GL account → `general_account_id = NULL` → filtered by category and amount sign instead (see budget type tables above)
-- Same date range and analytic account matching applies
+This depends on configured accounts, distributions and matching dates. The credit account is the variant's depreciation account, not necessarily the original asset account. The old claim that asset costs only reach the budget as depreciation posts does not match this Odoo 20 implementation.
 
-### NOT counted:
-- Draft or cancelled journal entries (not yet posted)
-- Journal entry lines on asset / liability / equity accounts — even with analytic distribution set
-- Analytic lines outside the budget date range
-- Analytic lines pointing to a different analytic account than the budget line
-- Analytic lines from a different company (unless budget line has `company_id = NULL`)
+### Manual analytic entries
 
----
+Manual entries can contribute without a journal item. Use the profitability table above: account type, or category and monetary sign when no financial account exists, determines eligibility. Quantity alone does not determine budget behavior.
 
-## How Analytic Lines Are Created — By Transaction Type
+## Purchase Commitments
 
-Every posted journal entry with `analytic_distribution` on a move line creates `account.analytic.line` records. But **which GL account the line uses** determines whether the analytic entry affects budgets, reports, and what sign it carries.
+Sources: [`purchase budget report`](../enterprise/account_budget_purchase/reports/budget_report.py), [`purchase budget line`](../enterprise/account_budget_purchase/models/budget_line.py).
 
-### Quick Reference: Analytic Effect by Transaction Type
+The extension includes purchase lines whose order state is `purchase`, whose order date is inside the budget period, whose company and analytic dimensions match, and whose ordered quantity exceeds the quantity billed on **posted** vendor bills net of posted refunds. Draft bills do not reduce the outstanding quantity. Bill quantities are converted to the purchase line's unit when needed.
 
-| Transaction | GL Account Type | Analytic Line Created? | Amount Sign | Visible in Expense Budget? | Visible in Analytic Items? |
-|---|---|---|---|---|---|
-| Vendor bill (expense account) | `expense_*` | YES | negative | YES (flipped to positive) | YES |
-| Vendor bill (fixed asset account) | `asset_fixed` | YES | negative | NO (asset type excluded) | YES |
-| Customer invoice (income account) | `income_*` | YES | positive | NO | YES |
-| Depreciation entry — expense line | `expense_*` | YES | negative | YES (flipped to positive) | YES |
-| Depreciation entry — asset line | `asset_fixed` | YES | positive | NO (asset type excluded) | YES |
-| Payment (bank account) | `asset_cash` | NO (typically no analytic) | — | NO | — |
-| Payable line on bill | `liability_payable` | NO (typically no analytic) | — | NO | — |
+The outstanding amount is approximately:
 
-### The Asset Depreciation Flow — Why Analytic Looks "Delayed"
-
-When a vendor bill uses a **Fixed Asset** account with analytic distribution:
-
-```
-STEP 1: Bill posted (e.g., laptop $1,400 on "Fixed Asset" account)
-  → Analytic line created: amount = -$1,400, GL type = asset_fixed
-  → Shows in Analytic Items list: YES
-  → Counts toward expense budget: NO (asset type excluded by budget SQL filter)
-
-STEP 2: Depreciation entry posted (e.g., $984 depreciation)
-  → TWO analytic lines created:
-     a) Fixed Asset account: +$984 (offsets part of Step 1)
-     b) Expense account:    -$984 (the real cost recognition)
-  → Line (b) counts toward expense budget: YES
-
-STEP 3: After ALL depreciation entries post:
-  → Fixed Asset analytic lines net to $0 (-1400 + 1400 = 0)
-  → Expense analytic lines total -$1,400 (the full cost, now on expense)
+```text
+(subtotal + non-deductible tax) / ordered quantity
+    × (ordered quantity − posted net billed quantity)
+    / order currency rate
+    × analytic allocation rate
 ```
 
-**Key insight:** The bill's analytic on the asset account is a "parking" entry. It gets fully offset by depreciation entries. The real analytic cost only appears on the **expense account** as each depreciation posts.
+The implementation has fallbacks for missing subtotal and zero quantity. It expands `analytic_json` into plan columns and allocation rates. Outstanding purchases contribute positively to expense budgets and negatively to `both`; they are excluded from revenue budgets. Achieved rows also populate the committed column, so **committed = achieved + outstanding purchase commitments**. For revenue budgets, committed can still equal achieved even though purchases add nothing.
 
-**If using 1-month depreciation** (immediate expense): both steps happen quickly, so the delay is minimal. With multi-month depreciation, the analytic cost is spread across months — matching the accounting treatment.
+Example: a matching expense purchase of 1,000 with a posted matching bill of 400 normally yields achieved 400, outstanding commitment 600, total committed 1,000, assuming the same valuation, dates and allocations.
 
-**Practical consequence:** If you set an analytic account on a vendor bill that auto-creates an asset, the analytic cost does NOT appear in expense budgets at bill time. It appears gradually as depreciation entries post.
+## Theoretical Amount and Percentage
 
----
+The Python `budget.line` calculation uses inclusive days, clamps today between the start/end dates, and multiplies the elapsed fraction by `budget_amount`. This means **before the start date it already returns one day's allocation**. The report SQL's `theoretical` expression instead returns **zero before the start date**. Both reach the full planned amount at/after the end date. This source discrepancy matters when comparing the budget-line field with the report measure.
+
+Theoretical percentage uses commitment as its denominator. Achieved percentage uses liquidation. Neither measures cash payments, and neither models uneven spending schedules. Sources: [`budget_line.py`](../enterprise/account_budget/models/budget_line.py), [`budget_report.py`](../enterprise/account_budget/reports/budget_report.py).
 
 ## Project Integration
 
-> [`enterprise/project_account_budget/models/project_project.py`](../enterprise/project_account_budget/models/project_project.py)
+Sources: [`project_project.py`](../enterprise/project_account_budget/models/project_project.py), [`project views`](../enterprise/project_account_budget/views/project_project_views.xml).
 
-A project is linked to a budget via `project.project.account_id` (the project's analytic account).
+Projects select matching budget lines through their analytic account. Both `_compute_budget()` and `_get_budget_items()` restrict budgets to **confirmed/done**. The aggregate fields include `total_budget_amount`, `total_budget_achieved_amount`, `total_budget_progress`, `total_budget_achieved_progress`, and `budget_count`.
 
-The budget panel shows data from budget lines where the plan column matches `project.account_id`.
+For an individual budget:
 
-Only budgets in `confirmed` or `done` state are shown in the project panel.
+```python
+progress = (spent - allocated) / abs(allocated) * type_factor if allocated else 0
+# type_factor = -1 for expense, +1 for revenue/both
+```
 
-| Field | Computed by | Logic |
+For a positive allocation of 500:
+
+| Achieved | Expense progress | Revenue / both progress |
 |---|---|---|
-| `total_budget_amount` | [`_compute_budget()`](../enterprise/project_account_budget/models/project_project.py#L21) | Sum of `budget_amount` from ALL matching `budget.line` records (any state) |
-| `total_budget_progress` | [`_compute_budget()`](../enterprise/project_account_budget/models/project_project.py#L21) | `(achieved_fp - allocated_fp) / abs(allocated_fp)` adjusted for budget type |
+| 0 | 1.0 | -1.0 |
+| 375 | 0.25 | -0.25 |
+| 500 | 0 | 0 |
+| 625 | -0.25 | 0.25 |
 
-For **expense** budgets: `type_factor = -1` is applied to both amounts so spending = positive progress.
+The kanban icon uses exact `-1.0` → muted, otherwise `>= 0.25` → green, `>= 0` → warning, and lower values → danger. The exact `-1.0` special case is numerical, not a reliable universal test for no spending. Mixed-budget totals sign-adjust both allocated and achieved amounts before computing progress; offsetting allocations can make that denominator zero and return zero progress. A zero target can still show achieved amounts, but its individual progress is zero.
 
-Progress interpretation (used for kanban icon color):
-- `>= 0.25` → green (on track)
-- `0` to `0.25` → orange (soon overspent)
-- `< 0` → red (over budget)
-- `== -1.0` → gray (no spending yet)
+The Add Budget flow uses `project_update` context. [`budget.line.default_get()`](../enterprise/project_account_budget/models/budget_line.py) fills the project's plan column. [`budget.analytic.create()`](../enterprise/project_account_budget/models/budget_analytic.py) auto-confirms when exactly one budget is created with that context. Detail actions require allowed-company access and the accounting-readonly or analytic group; adding requires `account.group_account_user`.
 
-**Add Budget flow from project panel:**
-1. User clicks **Add Budget** in the right side panel
-2. OWL opens `FormViewDialog` for `budget.analytic` with `context = {project_update: True, ...}`
-3. `budget_line.default_get()` detects `project_update` → pre-fills plan column with `project.account_id` — [`budget_line.py:9`](../enterprise/project_account_budget/models/budget_line.py#L9)
-4. On save, `budget_analytic.create()` detects `project_update` → auto-calls `action_budget_confirm()` — [`budget_analytic.py:10`](../enterprise/project_account_budget/models/budget_analytic.py#L10)
-5. Budget is auto-confirmed immediately — no manual confirm needed from project panel
-6. Panel reloads via `loadBudgets()` RPC call to `get_budget_items()`
+## UI and Operational Notes
 
-**Project Update report** injects budget data via `project_update._get_template_values()` — requires `account.group_account_readonly`. Shows `percentage` spent and `remaining_budget_percentage`.
-
----
-
-## UI Entry Points
-
-| Entry Point | Path in UI | What It Does |
-|---|---|---|
-| Budget list | Accounting → Management → Budgets | Create/view budgets, see achieved vs planned |
-| Budget form | Budget form → Budget Lines | Add lines with analytic accounts and amounts |
-| Confirm button | Budget form | Sets state to `confirmed`, makes it active |
-| Project budget panel | Project → Update → Budget section | Shows per-budget allocated/spent/progress |
-| Add Budget (project) | Project Update panel | Creates and auto-confirms a budget linked to project's analytic account |
-| Budget Report | Budget form → Budget Report button | Opens `budget.report` pivot/list showing each analytic line |
-
----
-
-## Edge Cases & Gotchas
-
-- **Budget must be `confirmed` or `done` to appear in the project panel.** Draft budgets are invisible there. Source: [`project_project.py:85`](../enterprise/project_account_budget/models/project_project.py#L85)
-
-- **Achieved amount does NOT decrease when a posted invoice is reset to draft.** Cancelling a posted entry deletes the analytic lines — achieved drops. But resetting to draft also removes analytic lines, so the achieved goes back down.
-
-- **Expense amounts are stored as negative in analytic lines.** The budget report negates them for display. If you query `account_analytic_line` directly, expense entries show negative `amount`.
-
-- **The budget type determines which GL accounts count.** If `budget_type = 'expense'` and an analytic line has a revenue GL account — it is excluded. The filter is strict: `SPLIT_PART(account_type, '_', 1)` must match the budget type.
-
-- **`budget.report` is a live SQL view.** There is no caching. Every time `achieved_amount` is computed on a budget line, a query runs against the view which joins `budget_line` and `account_analytic_line`. On large datasets this can be slow.
-
-- **Analytic account must be in the correct plan.** The budget line uses plan-specific columns (e.g., `account_id` for the project plan). If you assign a non-project analytic account to a project's budget line, the join won't match the project's `account_id`.
-
-- **`theoritical_amount` is date-based only, not transaction-based.** It is a simple linear interpolation. It does not know if spending is front-loaded or back-loaded.
-
-- **Deleting a budget only allowed in draft or canceled state.** See [`_unlink_except_draft_or_cancel()`](../enterprise/account_budget/models/budget_analytic.py#L68).
-
----
+- The budget menu is attached to Accounting's Transactions menu in [`budget_analytic_views.xml`](../enterprise/account_budget/views/budget_analytic_views.xml). It provides the budget form, Budget Report, Budget Lines and per-line Audit actions.
+- Actuals are non-stored ORM computed fields backed by report queries. Normal ORM caching still applies; “live SQL” does not mean every field access bypasses cache.
+- Budget matching uses all populated dimensions. A department-only budget can span many projects; a project-and-department budget requires both to match.
+- The journal-entry Budgets smart link uses a plan-column join in [`account_move.py`](../enterprise/account_budget/models/account_move.py). That link alone does not prove the entry contributes to achieved: the report additionally applies date, company and eligibility filters.
+- These are standard-source behaviors. Installed custom overrides and actual database configuration may change results.
 
 ## Related Docs
 
-- [`INDEX.md`](INDEX.md)
+- [Analytic accounting](analytic_accounting.md)
+- [Documentation index](INDEX.md)

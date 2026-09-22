@@ -2,7 +2,9 @@
 
 > **Modules:** `account`, `account_inter_company_rules`, `account_reports`, `account_accountant`, `analytic`
 > **Paths:** [`addons/account/`](../addons/account/), [`enterprise/account_inter_company_rules/`](../enterprise/account_inter_company_rules/), [`enterprise/account_reports/`](../enterprise/account_reports/), [`addons/analytic/`](../addons/analytic/)
-> **Odoo Version:** 19
+> **Odoo Version:** 20
+>
+> Odoo 20 changed two things that matter a lot here: record rules moved to the unified `ir.access` model, and the Interco Comparison report was added. See [What Changed in Odoo 20](#what-changed-in-odoo-20).
 
 ---
 
@@ -99,15 +101,15 @@ Atlas Group (root company)        <-- CoA, taxes, fiscal positions live here
   |-- Kutaisi Warehouse (branch)  <-- inherits CoA, gets own journals + bank
 ```
 
-**Source:** [`res_company.py:36-41`](../odoo/addons/base/models/res_company.py#L36-L41) -- `parent_id`, `child_ids`, `root_id` fields define the hierarchy.
+**Source:** [`res_company.py:87-92`](../odoo/addons/base/models/res_company.py#L87-L92) -- `parent_id`, `child_ids`, `all_child_ids`, `parent_ids`, `root_id` define the hierarchy.
 
-**Important:** Once you create a branch under a parent, you **cannot change the parent later**. The hierarchy is locked at creation. **Source:** [`res_company.py:342-343`](../odoo/addons/base/models/res_company.py#L342-L343) -- raises UserError: "The company hierarchy cannot be changed."
+**Important:** Once you create a branch under a parent, you **cannot change the parent later**. The hierarchy is locked at creation. **Source:** [`res_company.py:400`](../odoo/addons/base/models/res_company.py#L400) -- raises UserError: "The company hierarchy cannot be changed."
 
 ### Chart of Accounts: ONE shared CoA
 
 All 3 locations use the same accounts. When the CoA template loads on the root company, it recursively loads on all children.
 
-**Source:** [`chart_template.py:253-254`](../addons/account/models/chart_template.py#L253-L254)
+**Source:** [`_load() — chart_template.py:259-260`](../addons/account/models/chart_template.py#L259-L260)
 
 ```
 110000  Accounts Receivable     --> shared by all 3 locations
@@ -118,11 +120,21 @@ All 3 locations use the same accounts. When the CoA template loads on the root c
 620000  Rent Expense            --> shared by all 3 locations
 ```
 
-**How sharing works technically:** `account.account` uses `company_ids` (Many2many) -- one account record is linked to multiple companies. **Source:** [`account_account.py:97-99`](../addons/account/models/account_account.py#L97-L99)
+**How sharing works technically:** `account.account` uses `company_ids` (Many2many) -- one account record is linked to multiple companies. **Source:** [`account_account.py:120`](../addons/account/models/account_account.py#L120)
 
-The `code_store` field is `company_dependent=True` -- the same account can show different codes per company if needed. **Source:** [`account_account.py:40`](../addons/account/models/account_account.py#L40)
+The `code_store` field is `company_dependent=True` -- the same account can show different codes per company if needed, exposed through the computed `code` field and the `code_mapping_ids` tab. **Source:** [`code` / `code_store` — account_account.py:46-47`](../addons/account/models/account_account.py#L46-L47)
 
-**Exception:** Bank/Cash accounts CANNOT be shared between companies. If an account has type `asset_cash` and `len(company_ids) > 1`, Odoo raises an error. **Source:** [`account_account.py:278-279`](../addons/account/models/account_account.py#L278-L279)
+**Exception:** Bank/Cash accounts CANNOT be shared between companies. If an account has type `asset_cash` and `len(company_ids) > 1`, Odoo raises "Bank & Cash accounts cannot be shared between companies." **Source:** [`account_account.py:258-259`](../addons/account/models/account_account.py#L258-L259)
+
+**Odoo 20 additions that change branch COA work:**
+
+| Change | Effect on branches |
+|---|---|
+| `account.account` is a tree (`parent_id`, `_parent_store`); `account.group` removed | The hierarchy shown in reports comes from parent accounts, and parent accounts are shared through `company_ids` like any other account |
+| A code is no longer required for every company | A grouping account can exist without a code in a branch that does not use it |
+| Creating an `asset_cash` / `liability_credit_card` account auto-creates a journal in that account's first company | Adding a branch bank account creates the branch's bank journal for you — [`_create_default_journals() — account_account.py:1129`](../addons/account/models/account_account.py#L1129) |
+| Account codes may contain dashes | `1100-BAT` style branch-suffixed codes are now legal |
+| `account.account.account_stock_variation_id` / `account_stock_expense_id` | Periodic inventory closing accounts, set per account and therefore shared by branches |
 
 ### Journals: Each Branch Gets Its Own
 
@@ -137,35 +149,42 @@ Each branch gets its own set of journals so entries are traceable and sequences 
 | Bank | Batumi Office | BNK2 | -- |
 | Petty Cash | Kutaisi Warehouse | CSH1 | -- |
 
-Journal entries automatically assign to the branch the user is working in via `_compute_company_id()`. **Source:** [`account_move.py:874-878`](../addons/account/models/account_move.py#L874-L878)
+Journal entries automatically assign to the branch the user is working in via `_compute_company_id()`. **Source:** [`account_move.py:932-939`](../addons/account/models/account_move.py#L932-L939)
 
 ```python
-# How company auto-assigns on journal entries:
+# How company auto-assigns on journal entries (Odoo 20):
 @api.depends('journal_id')
 def _compute_company_id(self):
     for move in self:
         if move.journal_id.company_id not in move.company_id.parent_ids:
-            move.company_id = (move.journal_id.company_id or self.env.company)._accessible_branches()[:1]
+            move.company_id = (
+                (move.journal_id.company_id in self.env.company.parent_ids and self.env.company)
+                or move.journal_id.company_id
+                or self.env.company
+            )
 ```
 
-**Key insight:** Branches can ACCESS journals from the parent company via the `parent_of` security rule. But the entry's `company_id` will still be set to the user's branch. **Source:** [`account_security.xml:146-150`](../addons/account/security/account_security.xml#L146-L150)
+Odoo 19 resolved this through `._accessible_branches()[:1]`. Odoo 20 states the intent directly: **if the journal belongs to an ancestor of the company you are working in, the entry stays in your company**; otherwise it follows the journal.
+
+**Key insight:** Branches can ACCESS journals from the parent company via the `parent_of` access rule. But the entry's `company_id` will still be set to the user's branch. **Source:** [`journal_comp_rule — ir.access.csv:49`](../addons/account/security/ir.access.csv#L49)
 
 ### Fiscal Year & Lock Dates: Inherited from Root
 
 **Root-delegated fields** (set once on root, automatically inherited by all branches):
 
-| Field | Purpose | Source |
-|---|---|---|
-| `fiscalyear_last_day` | Last day of fiscal year | [`company.py:75`](../addons/account/models/company.py#L75) |
-| `fiscalyear_last_month` | Last month of fiscal year | [`company.py:76`](../addons/account/models/company.py#L76) |
-| `account_storno` | Use storno accounting (reversal entries) | [`company.py:320-326`](../addons/account/models/company.py#L320-L326) |
-| `tax_exigibility` | Cash-basis vs accrual VAT | Same source |
+| Field | Purpose |
+|---|---|
+| `currency_id` | Company currency — delegated at the base level |
+| `fiscalyear_last_day` | Last day of fiscal year |
+| `fiscalyear_last_month` | Last month of fiscal year |
+| `account_storno` | Use storno accounting (reversal entries) |
+| `tax_exigibility` | Cash-basis vs accrual VAT |
 
-**Source:** [`company.py:320-326`](../addons/account/models/company.py#L320-L326) -- `_get_company_root_delegated_field_names()` enforces these match root.
+**Source:** [`_get_company_root_delegated_field_names() — company.py:401`](../addons/account/models/company.py#L401), base list at [`res_company.py:163`](../odoo/addons/base/models/res_company.py#L163) -- the values are copied from the root and shown readonly on branches.
 
-**Lock dates:** Each branch CAN technically have its own lock date value, but the effective lock date is the **maximum across all ancestors**. The `_get_user_lock_date()` method iterates over `parent_ids` and takes the strictest (latest) date.
+**Lock dates:** Each branch CAN technically have its own lock date value, but the effective lock date is the **maximum across all ancestors**, less any active `account.lock_exception` for the current user. `_get_user_lock_date()` iterates over `parent_ids` and takes the strictest (latest) date.
 
-**Source:** [`company.py:596-606`](../addons/account/models/company.py#L596-L606)
+**Source:** [`_get_user_lock_date() — company.py:749`](../addons/account/models/company.py#L749)
 
 **Example:** If Atlas Group (root) sets `fiscalyear_lock_date = 2025-12-31`, then Batumi and Kutaisi also cannot post entries on or before 2025-12-31, even if they haven't set their own lock date.
 
@@ -185,7 +204,7 @@ def _compute_company_id(self):
 **How to get this:**
 1. Go to Accounting > Reporting > Profit & Loss
 2. In the company filter (top-right), select all branches
-3. Reports automatically include all accessible branches via `_accessible_branches()`. **Source:** [`res_company.py:425-446`](../odoo/addons/base/models/res_company.py#L425-L446)
+3. Reports automatically include all accessible branches via `_accessible_branches()`. **Source:** [`res_company.py:502`](../odoo/addons/base/models/res_company.py#L502)
 
 **P&L -- Batumi Office only:** Switch active company to "Batumi Office" -- the report filters to that branch's journal entries automatically.
 
@@ -217,7 +236,7 @@ def _compute_company_id(self):
 
 ONE tax return for the entire entity. All branch transactions roll up. The VAT is shared (or inherited from parent if branch has none).
 
-**Source:** [`enterprise/account_reports/models/res_company.py:133-177`](../enterprise/account_reports/models/res_company.py#L133-L177) -- `_get_branches_with_same_vat()` collects all branches sharing the same VAT number.
+**Source:** [`_get_branches_with_same_vat() — enterprise/account_reports/models/res_company.py:207`](../enterprise/account_reports/models/res_company.py#L207) -- collects all branches sharing the same VAT number. `get_options()` uses it to decide whether export buttons stay enabled when only some branches are selected.
 
 ### Pros and Cons
 
@@ -278,7 +297,7 @@ Kutaisi Logistics LLC    <-- company 3
 
 Each company loads its own CoA template independently. They CAN use the same template (e.g., all install Georgian CoA) but the resulting account records are physically separate.
 
-**Source:** [`chart_template.py:172-254`](../addons/account/models/chart_template.py#L172-L254) -- `_load()` creates accounts per company.
+**Source:** [`_load() — chart_template.py:184`](../addons/account/models/chart_template.py#L184) -- creates accounts per company, then recurses into `company.child_ids`.
 
 | | Atlas Group | Batumi Trading | Kutaisi Logistics |
 |---|---|---|---|
@@ -345,10 +364,15 @@ When Atlas Group sells goods to Batumi Trading for 10,000:
 
 | Field | Purpose | Source |
 |---|---|---|
-| `intercompany_generate_bills_refund` | Enable auto-bill creation when invoiced by another company | [`res_company.py:7-28`](../enterprise/account_inter_company_rules/models/res_company.py#L7-L28) |
-| `intercompany_document_state` | `'draft'` (review first) or `'posted'` (auto-post) | Same file |
-| `intercompany_purchase_journal_id` | Which journal receives the auto-generated bills | Same file |
-| `intercompany_user_id` | User context for creating the mirror document | Same file |
+| `intercompany_generate_bills_refund` | Enable auto-bill creation when invoiced by another company | [`res_company.py:7`](../enterprise/account_inter_company_rules/models/res_company.py#L7) |
+| `intercompany_document_state` | `'draft'` (review first) or `'posted'` (auto-post) | [`res_company.py:11`](../enterprise/account_inter_company_rules/models/res_company.py#L11) |
+| `intercompany_purchase_journal_id` | Which journal receives the auto-generated bills | [`res_company.py:19`](../enterprise/account_inter_company_rules/models/res_company.py#L19) |
+
+**Removed in Odoo 20:** `intercompany_user_id`. The mirror document is now created with `SUPERUSER_ID` and the target company in context, so there is no per-company technical user to configure (or to get wrong).
+Source: [`_post() — account_inter_company_rules/models/account_move.py:11`](../enterprise/account_inter_company_rules/models/account_move.py#L11)
+
+The company behind a partner is resolved with `_find_company_from_partner()`, which matches on `('partner_id', 'parent_of', partner_id)` — so invoicing a *contact* of another company also triggers the mirror bill.
+Source: [`_find_company_from_partner() — res_company.py:27`](../enterprise/account_inter_company_rules/models/res_company.py#L27)
 
 **Example journal entries for 10,000 intercompany sale:**
 
@@ -374,7 +398,9 @@ To see the group-wide picture, use the consolidation feature in `account_reports
 3. Enable the "Consolidation" toggle
 4. Report groups by account code across companies
 
-**Source:** [`enterprise/account_reports/models/account_report.py:1983-1990`](../enterprise/account_reports/models/account_report.py#L1983-L1990)
+**Source:** [`_init_options_consolidation() — enterprise/account_reports/models/account_report.py:2220`](../enterprise/account_reports/models/account_report.py#L2220)
+
+The toggle only appears when more than one company is selected **and** the report groups by `account_id`. It is on by default, and switching from one company to several turns it back on.
 
 **Consolidated P&L -- simple (January 2026)**
 
@@ -398,11 +424,26 @@ To see the group-wide picture, use the consolidation feature in `account_reports
 
 Odoo's consolidation toggle is additive only (sum by account code). For IFRS-compliant elimination, you need manual consolidation journal entries.
 
+**Odoo 20 gives you the detection half of the problem.** The new **Interco Comparison** report lists, per counterpart company and per account-type bucket, what each side booked and the difference — so you can find the intercompany balances that need eliminating instead of reconciling them in a spreadsheet. It does not post the elimination entries for you.
+
+```
+Currency → Counterpart company → Account type bucket → Account
+                                   Main Company | Counterpart | Difference
+```
+
+Buckets are mirror pairs: receivable ↔ payable, income ↔ expense, current assets ↔ current liabilities, non-current assets ↔ equity & non-current liabilities, liquidity ↔ liquidity.
+
+**Source:** [`interco_comparison_report.py`](../enterprise/account_reports/models/interco_comparison_report.py), [`interco_comparison_report.xml`](../enterprise/account_reports/data/interco_comparison_report.xml)
+
+Defaults worth knowing: tax lines are hidden (`hide_tax_lines`), exchange-difference moves are excluded, and selecting a single company produces a warning because the report needs a counterpart.
+
 ### Tax Returns
 
 Each company files its own tax return independently. Unless you set up a **Tax Unit** (group VAT filing) which groups companies sharing one VAT return.
 
-**Source:** [`enterprise/account_reports/models/account_return.py:225-243`](../enterprise/account_reports/models/account_return.py#L225-L243)
+A `account.tax.unit` groups companies that file one VAT return: it carries the unit's `country_id`, `vat`, `company_ids` and a `main_company_id` (the one actually reporting and paying). Creating one also creates an `account.report.horizontal.group` so the tax report can show the member companies side by side.
+
+**Source:** [`account.tax.unit` — enterprise/account_reports/models/account_tax.py:8](../enterprise/account_reports/models/account_tax.py#L8)
 
 ### Pros and Cons
 
@@ -464,8 +505,10 @@ Atlas Group LLC (single company, no branches)
 | Model | What it is | Company-scoped? | Source |
 |---|---|---|---|
 | `account.analytic.plan` | A reporting dimension (Location, Department, Project) | Applicability rules are company-dependent | [`analytic_plan.py:14`](../addons/analytic/models/analytic_plan.py#L14) |
-| `account.analytic.account` | A value within a plan (e.g., "Batumi Office") | YES -- `company_id` required | [`analytic_account.py:61-65`](../addons/analytic/models/analytic_account.py#L61-L65) |
-| `analytic_distribution` | JSON field on `account.move.line` storing the distribution | Stored as JSON dict | [`account_move_line.py:417-419`](../addons/account/models/account_move_line.py#L417-L419) |
+| `account.analytic.account` | A value within a plan (e.g., "Batumi Office") | Optional -- `company_id` defaults to the active company but is **not required**; leave it empty to share the account across companies | [`analytic_account.py:61`](../addons/analytic/models/analytic_account.py#L61) |
+| `analytic_distribution` | JSON field on `account.move.line` storing the distribution | Stored as JSON dict | [`account_move_line.py:502`](../addons/account/models/account_move_line.py#L502) |
+
+A company-less analytic account is usable from every company, which is what makes "same Department/Project plans across all three entities" practical in a multi-company setup.
 
 **How distribution is stored:** The `analytic_distribution` field is a JSON dictionary. Keys are analytic account IDs (comma-separated if combined), values are percentages:
 
@@ -500,7 +543,7 @@ You can have multiple analytic plans active at once. Each plan creates its own c
 
 This gives you multi-dimensional analysis: "Show me all Sales department costs in Batumi for Project Alpha" -- a single report filter.
 
-**Source:** Plans support hierarchy via `parent_id` and `parent_store=True`. [`analytic_plan.py:30-37`](../addons/analytic/models/analytic_plan.py#L30-L37)
+**Source:** Plans support hierarchy via `parent_id` and `_parent_store = True`. [`analytic_plan.py:14`](../addons/analytic/models/analytic_plan.py#L14), [`parent_id — analytic_plan.py:27`](../addons/analytic/models/analytic_plan.py#L27)
 
 ### Can You Force Users to Tag Entries? (Mandatory Analytics)
 
@@ -512,11 +555,11 @@ This gives you multi-dimensional analysis: "Show me all Sales department costs i
 | `mandatory` | Users MUST tag 100% of the amount. Posting fails otherwise. |
 | `unavailable` | Plan doesn't appear on this document type |
 
-**Source:** [`analytic_plan.py:78-87`](../addons/analytic/models/analytic_plan.py#L78-L87) -- `default_applicability` is `company_dependent=True`
+**Source:** [`default_applicability — analytic_plan.py:75`](../addons/analytic/models/analytic_plan.py#L75) -- `company_dependent=True`, so each company (and therefore each branch) can set its own value
 
 Enforcement happens in `_validate_analytic_distribution()` on `account.move.line`. If a mandatory plan doesn't have 100% distribution, Odoo raises a `RedirectWarning` and blocks posting.
 
-**Source:** [`account_move_line.py:3043-3074`](../addons/account/models/account_move_line.py#L3043-L3074)
+**Source:** [`_validate_analytic_distribution() — account_move_line.py:3513`](../addons/account/models/account_move_line.py#L3513)
 
 **You can also set per-document-type rules** via `account.analytic.applicability` records. Example: Location is mandatory on customer invoices but optional on journal entries.
 
@@ -661,15 +704,44 @@ Each company is independent for accounting. Inside each company, analytic accoun
 
 ## Security Model: How Company Filtering Works
 
-Every multi-company rule in Odoo uses one of these patterns:
+### Odoo 20 replaced `ir.model.access` and `ir.rule` with `ir.access`
+
+This is a framework-level change, and every security file in every module moved. There is no `ir.model.access.csv` and no `ir.rule` model left in Odoo 20 — both are now rows in **`security/ir.access.csv`** backed by the `ir.access` model.
+
+| | Odoo 19 | Odoo 20 |
+|---|---|---|
+| Group permissions | `ir.model.access` rows in `ir.model.access.csv` (`perm_read/write/create/unlink`) | `ir.access` rows with `group_id` set and an `operation` string |
+| Record rules | `ir.rule` records in XML (`domain_force`, `groups`, `global`) | the same `ir.access` rows, with a `domain` column |
+| Operation flags | four booleans | one `operation` string: any subset of `c`, `r`, `u`, `d` (e.g. `crud`, `cru`, `r`) |
+| Global vs group rule | `ir.rule` with no groups = global | `ir.access` row with **no** `group_id` = a *restriction* |
+
+```csv
+id,name,model_id,group_id/id,operation,domain
+access_account_cash_rounding_uinvoice,account.cash.rounding,account.cash.rounding,account.group_account_invoice,crud,
+account_cash_rounding_comp_rule,Account cash rounding multi-company,account.cash.rounding,,crud,"['|', ('company_id', '=', False), ('company_id', 'parent_of', company_ids)]"
+```
+
+The first row is a permission (it has a group). The second has no group, so it is a restriction applying to everyone.
+
+**How they combine:**
+
+- **Permissions** (rows with a `group_id`) are **OR-ed**. A user needs at least one permission granting the operation, and the record must satisfy at least one of the matching permissions' domains.
+- **Restrictions** (rows without a `group_id`) are **AND-ed**. Every restriction on the model must be satisfied. Multi-company rules are restrictions.
+
+Source: [`ir.access` — ir_access.py:64](../odoo/addons/base/models/ir_access.py#L64), `kind` computed at [ir_access.py:129](../odoo/addons/base/models/ir_access.py#L129)
+
+**Practical consequence for this document:** everything below about `in` vs `parent_of` still holds exactly as it did in 19 — the *domains* did not change. What changed is where you read and write them. To inspect a multi-company rule now, open `security/ir.access.csv` in the module (or Settings → Technical → Access) instead of hunting for an `ir.rule` in an XML file.
+
+### The three company-domain patterns
 
 | Pattern | Meaning | Used For |
 |---|---|---|
 | `('company_id', 'in', company_ids)` | User sees records ONLY in their assigned companies | Transactional data (SO, PO, invoices, pickings, payslips) |
-| `('company_id', 'parent_of', company_ids)` | User sees records from their company AND all ancestors | Config data (journals, accounts, taxes, fiscal positions) |
-| `('company_id', 'in', company_ids + [False])` | User sees company-scoped OR shared records | Master data (locations, routes, products) |
+| `('company_id', 'parent_of', company_ids)` | User sees records from their company AND all ancestors | Config data (journals, taxes, fiscal positions, payment terms) |
+| `('company_ids', 'parent_of', company_ids)` | Same, for models linked to several companies | `account.account` |
+| `('company_id', 'in', company_ids + [False])` or `'|' ('company_id','=',False)` | User sees company-scoped OR shared records | Master data (locations, routes, products, cash rounding) |
 
-**Source:** [`account_security.xml:128-228`](../addons/account/security/account_security.xml#L128-L228)
+**Source:** [`addons/account/security/ir.access.csv`](../addons/account/security/ir.access.csv) — e.g. `journal_comp_rule` (line 49), `account_comp_rule` (line 58), `tax_comp_rule` (line 61)
 
 **`company_ids`** is a context variable (not a field) automatically populated with the user's allowed companies. When the user switches companies in the top-right selector, `company_ids` changes and all record visibility re-evaluates instantly.
 
@@ -677,12 +749,12 @@ Every multi-company rule in Odoo uses one of these patterns:
 
 | Scenario | Can See? | Why |
 |---|---|---|
-| Branch user sees parent's config (journals, taxes, CoA) | **YES** | `parent_of` rule on config records |
-| Branch user sees parent's transactions (invoices, SOs) | **NO** | `in` rule -- parent not in branch user's `company_ids` by default |
+| Branch user sees parent's config (journals, taxes, CoA) | **YES** | `parent_of` restriction on config records |
+| Branch user sees parent's transactions (invoices, SOs) | **NO** | `in` restriction -- parent not in branch user's `company_ids` by default |
 | Branch user sees sibling branch's records | **NO** | Siblings don't have `parent_of` or `in` relationship |
 | Parent user sees branch records | Only if assigned | User must have the branch in their `company_ids` |
 
-**Source:** [`res_company.py:425-443`](../odoo/addons/base/models/res_company.py#L425-L443) -- `_accessible_branches()` method
+**Source:** [`_accessible_branches() — res_company.py:502`](../odoo/addons/base/models/res_company.py#L502)
 
 ### User Company Assignment
 
@@ -700,9 +772,9 @@ Each user has two fields:
 
 | Aspect | Behavior | Source |
 |---|---|---|
-| SO `company_id` default | `self.env.company` (user's active company) | [`sale_order.py:60-63`](../addons/sale/models/sale_order.py#L60-L63) |
+| SO `company_id` default | `self.env.company` (user's active company) | [`sale_order.py:73`](../addons/sale/models/sale_order.py#L73) |
 | Changeable? | Yes in draft, locked after confirmation | Same |
-| Warehouse must match company | Enforced | [`sale_stock/models/sale_order.py:74-77`](../addons/sale_stock/models/sale_order.py#L74-L77) |
+| Warehouse must match company | Enforced by `_check_company_auto` on the warehouse | [`sale_stock/models/sale_order.py`](../addons/sale_stock/models/sale_order.py) |
 
 **Branch behavior:** When Luka (Batumi salesman) creates an SO:
 1. SO gets `company_id = Batumi Office`
@@ -726,9 +798,11 @@ When SO in Company A is confirmed for a partner that IS Company B:
    -> auto_generated = True prevents infinite loop
 ```
 
-**Source:** [`enterprise/sale_purchase_inter_company_rules/models/sale_order.py:11-21`](../enterprise/sale_purchase_inter_company_rules/models/sale_order.py#L11-L21)
+**Source:** [`_action_confirm() — enterprise/sale_purchase_inter_company_rules/models/sale_order.py:50`](../enterprise/sale_purchase_inter_company_rules/models/sale_order.py#L50)
 
-Reverse works too: PO in Company B can auto-create SO in Company A.
+Reverse works too: PO in Company B can auto-create SO in Company A (`intercompany_generate_sales_orders`).
+
+Odoo 20 also keeps the two orders in sync after confirmation: adding a line to the source order propagates it to the mirror order, and cancelling one posts a message on the other. The sync can be suppressed with the `skip_intercompany_sync` context key.
 
 ### Practical Issues
 
@@ -746,8 +820,8 @@ Reverse works too: PO in Company B can auto-create SO in Company A.
 
 | Aspect | Behavior | Source |
 |---|---|---|
-| PO `company_id` default | `self.env.company` | [`purchase_order.py:160`](../addons/purchase/models/purchase_order.py#L160) |
-| Vendor bill from PO | Bill created with `company_id = PO.company_id` | [`purchase_order.py:941`](../addons/purchase/models/purchase_order.py#L941) |
+| PO `company_id` default | `self.env.company` | [`purchase_order.py:177`](../addons/purchase/models/purchase_order.py#L177) |
+| Vendor bill from PO | Bill created with `company_id = PO.company_id` | [`purchase_order.py`](../addons/purchase/models/purchase_order.py) — `action_create_invoice()` |
 
 ### Practical Issues
 
@@ -767,11 +841,11 @@ Inventory is the most strictly company-scoped module. Key rules:
 
 | Model | Shared Allowed? | Source |
 |---|---|---|
-| `stock.warehouse` | NO -- one per company, required | [`stock_warehouse.py:37-40`](../addons/stock/models/stock_warehouse.py#L37-L40) |
-| `stock.picking` | NO -- company from picking type | [`stock_picking.py:634-636`](../addons/stock/models/stock_picking.py#L634-L636) |
-| `stock.move` | NO | [`stock_security.xml:108-112`](../addons/stock/security/stock_security.xml#L108-L112) |
-| `stock.quant` | Via location (company-scoped) | [`stock_quant.py:56`](../addons/stock/models/stock_quant.py#L56) |
-| `stock.location` | YES (`company_id` can be NULL) | [`stock_location.py:60-63`](../addons/stock/models/stock_location.py#L60-L63) |
+| `stock.warehouse` | NO -- one per company, required | [`stock_warehouse.py:37`](../addons/stock/models/stock_warehouse.py#L37) |
+| `stock.picking` | NO -- company related from picking type | [`stock_picking.py:114`](../addons/stock/models/stock_picking.py#L114) |
+| `stock.move` | NO | [`addons/stock/security/ir.access.csv`](../addons/stock/security/ir.access.csv) |
+| `stock.quant` | Via location (company-scoped) | [`addons/stock/models/stock_quant.py`](../addons/stock/models/stock_quant.py) |
+| `stock.location` | YES (`company_id` can be NULL) | [`addons/stock/models/stock_location.py`](../addons/stock/models/stock_location.py) |
 
 **Warehouse:** Each branch MUST have its own warehouse. Cannot share. Name and code must be unique per company.
 
@@ -806,10 +880,13 @@ Atlas Group (root)
 
 Requires `sale_purchase_stock_inter_company_rules` (Enterprise).
 
+**Simplified in Odoo 20.** The per-company `intercompany_warehouse_id` and `intercompany_receipt_type_id` fields are gone. One boolean remains:
+
 | Field | Purpose | Source |
 |---|---|---|
-| `intercompany_warehouse_id` | Default warehouse for incoming transfers | [`enterprise/sale_purchase_stock_inter_company_rules/models/res_company.py:8-14`](../enterprise/sale_purchase_stock_inter_company_rules/models/res_company.py#L8-L14) |
-| `intercompany_receipt_type_id` | Receipt operation type in target company | Same file |
+| `intercompany_sync_delivery_receipt` | On by default. When a Sale or Purchase Order is confirmed with another company, links the delivery to the matching receipt in the other company | [`res_company.py:8`](../enterprise/sale_purchase_stock_inter_company_rules/models/res_company.py#L8) |
+
+The warehouse is now resolved from the mirror order's own company rather than from a dedicated setting, so there is no longer a "forgot to set `intercompany_warehouse_id`" failure mode.
 
 ---
 
@@ -819,9 +896,9 @@ Requires `sale_purchase_stock_inter_company_rules` (Enterprise).
 
 | Aspect | Behavior | Source |
 |---|---|---|
-| `company_id` default | `self.env.company` (user's active company at creation) | [`hr_expense.py:86-92`](../addons/hr_expense/models/hr_expense.py#L86-L92) |
-| `company_id` readonly | YES -- locked after creation | Same, line 90 |
-| `_check_company_auto` | YES | [`hr_expense.py:46`](../addons/hr_expense/models/hr_expense.py#L46) |
+| `company_id` default | `self.env.company` (user's active company at creation) | [`hr_expense.py:89`](../addons/hr_expense/models/hr_expense.py#L89) |
+| `company_id` readonly | YES -- locked after creation | Same field, `readonly=True` |
+| Record visibility | `[('company_id', 'in', company_ids)]` | [`hr_expense_comp_rule — ir.access.csv:18`](../addons/hr_expense/security/ir.access.csv#L18) |
 
 ### How Expense Approval Works Across Branches
 
@@ -831,16 +908,16 @@ Approval rules check employee relationships (department manager, expense manager
 1. The manager has Batumi in their `company_ids` AND
 2. The employee relationship allows it (department manager, expense manager)
 
-**Source:** [`ir_rule.xml:13-23`](../addons/hr_expense/security/ir_rule.xml#L13-L23)
+**Source:** [`addons/hr_expense/security/ir.access.csv`](../addons/hr_expense/security/ir.access.csv) -- the multi-company restriction `hr_expense_comp_rule` is the backstop; the approval logic itself lives in `hr_expense.py`.
 
 ### Expense to Journal Entry Flow
 
 1. Expenses grouped by `company_id`
-2. Journal selected from `company.expense_journal_id` or first purchase journal in that company
+2. Journal selected from `company.expense_journal_id` (constrained to type `purchase`) or the first purchase journal in that company
 3. Journal entry created in the expense's company
 4. Analytic distribution from expense line carries through to the journal entry
 
-**Source:** [`hr_expense.py:1536-1553`](../addons/hr_expense/models/hr_expense.py#L1536-L1553)
+**Source:** [`expense_journal_id — hr_expense/models/res_company.py:10`](../addons/hr_expense/models/res_company.py#L10), [`hr_expense.py`](../addons/hr_expense/models/hr_expense.py) -- `action_post()` / move-creation helpers
 
 **Key:** Journal entry always goes to the expense's company (set at creation, readonly). Employee traveling to another branch still gets the expense in their home branch.
 
@@ -871,23 +948,23 @@ Approval rules check employee relationships (department manager, expense manager
 
 | Aspect | Behavior | Source |
 |---|---|---|
-| Payslip `company_id` | **Computed from `employee_id.company_id`** -- not user's active company | [`hr_payslip.py:92-95`](../enterprise/hr_payroll/models/hr_payslip.py#L92-L95) |
-| Payslip Run `company_id` | `self.env.company` (one run per company/branch) | [`hr_payslip_run.py:58-59`](../enterprise/hr_payroll/models/hr_payslip_run.py#L58-L59) |
-| Employee belongs to one company | YES -- enforced by constraint | [`hr_employee.py:247-248`](../addons/hr/models/hr_employee.py#L247-L248) |
+| Payslip `company_id` | **Computed from `employee_id.company_id`** -- not user's active company | [`hr_payslip.py:98`](../enterprise/hr_payroll/models/hr_payslip.py#L98) |
+| Payslip Run `company_id` | `self.env.company` (one run per company/branch) | [`hr_payslip_run.py:59`](../enterprise/hr_payroll/models/hr_payslip_run.py#L59) |
+| Employee belongs to one company | YES -- `company_id` is `required` on `hr.employee` | [`hr_employee.py:147`](../addons/hr/models/hr_employee.py#L147) |
 
 ### Salary Structures: Shared by Country, Not Company
 
 Structures are scoped by **country**, not company. All companies in the same country share structures.
 
-**Source:** [`hr_payroll_structure.py:44-51`](../enterprise/hr_payroll/models/hr_payroll_structure.py#L44-L51)
+**Source:** [`country_id — hr_payroll_structure.py:48`](../enterprise/hr_payroll/models/hr_payroll_structure.py#L48) -- the domain restricts the choice to countries of `self.env.companies`.
 
 **This means:** Whether you use branches or multi-company, if all entities are in Georgia, they share the same salary structures. The difference is only in how payslip runs and journal entries are organized.
 
 ### Contracts: Tied to Employee's Company
 
-Contract `company_id` is computed from `employee_id.company_id`. Cannot be overridden.
+Version (contract) `company_id` is computed from the employee and stored.
 
-**Source:** [`hr_version.py:196-200`](../addons/hr/models/hr_version.py#L196-L200)
+**Source:** [`company_id — hr_version.py:66`](../addons/hr/models/hr_version.py#L66)
 
 ### Practical Example
 
@@ -934,16 +1011,18 @@ Analytic accounts work the SAME way regardless of whether you use branches, mult
 
 ### What Reports Can Filter By Analytic
 
-| Report | Analytic Filter Available? | Source |
-|---|---|---|
-| P&L | YES -- via analytic groupby/filter | [`enterprise/account_reports/models/account_analytic_report.py:12-15`](../enterprise/account_reports/models/account_analytic_report.py#L12-L15) |
-| Balance Sheet | Partial -- only for P&L-type accounts | Same |
-| General Ledger | YES | Same |
-| Trial Balance | YES | Same |
+The switch is the `filter_analytic_groupby` boolean on `account.report`. **This is a rename: Odoo 19 called it `filter_analytic` and declared it in `account`; Odoo 20 calls it `filter_analytic_groupby` and declares it in `account_reports`.** Any custom report setting `filter_analytic` must be updated.
 
-**How report filtering works:** When `options['analytic_accounts']` is set, the report adds filters on `account.move.line.analytic_distribution`. With groupby enabled, it creates a shadowing query that projects `account.analytic.line` data into move line schema.
+| Report | Analytic Filter Available? |
+|---|---|
+| P&L | YES -- via analytic groupby/filter |
+| Balance Sheet | Partial -- only meaningful for P&L-type accounts |
+| General Ledger | YES |
+| Trial Balance | YES |
 
-**Source:** [`enterprise/account_reports/models/account_analytic_report.py:99-165`](../enterprise/account_reports/models/account_analytic_report.py#L99-L165)
+**How report filtering works:** `_init_options_analytic_groupby` (forced to sequence 995, i.e. after column headers and before columns) adds the analytic account and analytic plan groupby options. The report then filters on `account.move.line.analytic_distribution`; with groupby enabled it builds a shadowing query that projects `account.analytic.line` data into the move-line schema.
+
+**Source:** [`filter_analytic_groupby — account_analytic_report.py:14`](../enterprise/account_reports/models/account_analytic_report.py#L14), [`_init_options_analytic_groupby() — account_analytic_report.py:26`](../enterprise/account_reports/models/account_analytic_report.py#L26)
 
 ### Analytics + Branches: Best of Both Worlds
 
@@ -974,12 +1053,12 @@ This gives you:
 
 | Module | `company_id` Source | Readonly? | Source |
 |---|---|---|---|
-| Sale Order | `self.env.company` (user's active company) | No (draft) | [`sale_order.py:60`](../addons/sale/models/sale_order.py#L60) |
-| Purchase Order | `self.env.company` | No (draft) | [`purchase_order.py:160`](../addons/purchase/models/purchase_order.py#L160) |
-| Invoice | Computed from `journal_id.company_id` | No (editable but recomputed) | [`account_move.py:875`](../addons/account/models/account_move.py#L875) |
-| Stock Picking | Related from `picking_type_id.company_id` | YES | [`stock_picking.py:634`](../addons/stock/models/stock_picking.py#L634) |
-| Expense | `self.env.company` | YES | [`hr_expense.py:86`](../addons/hr_expense/models/hr_expense.py#L86) |
-| Payslip | Computed from `employee_id.company_id` | YES | [`hr_payslip.py:92`](../enterprise/hr_payroll/models/hr_payslip.py#L92) |
+| Sale Order | `self.env.company` (user's active company) | No (draft) | [`sale_order.py:73`](../addons/sale/models/sale_order.py#L73) |
+| Purchase Order | `self.env.company` | No (draft) | [`purchase_order.py:177`](../addons/purchase/models/purchase_order.py#L177) |
+| Invoice | Computed from `journal_id.company_id`, preferring the active company when the journal belongs to an ancestor | No (editable but recomputed) | [`account_move.py:932`](../addons/account/models/account_move.py#L932) |
+| Stock Picking | Related from `picking_type_id.company_id`, stored | YES | [`stock_picking.py:114`](../addons/stock/models/stock_picking.py#L114) |
+| Expense | `self.env.company` | YES | [`hr_expense.py:89`](../addons/hr_expense/models/hr_expense.py#L89) |
+| Payslip | Computed from `employee_id.company_id` | YES | [`hr_payslip.py:98`](../enterprise/hr_payroll/models/hr_payslip.py#L98) |
 
 ### What Branches Share vs Isolate
 
@@ -1036,11 +1115,13 @@ This gives you:
 
 ### 5. "Inter-Company Transfer Creates Nothing"
 
-**Root cause:** Missing module or configuration:
+**Root cause (Odoo 20):** Missing module or configuration:
 - `sale_purchase_stock_inter_company_rules` not installed
-- `intercompany_generate_purchase_orders` not enabled on target company
-- `intercompany_user_id` not set
-- `intercompany_warehouse_id` not set
+- `intercompany_generate_purchase_orders` (or `intercompany_generate_sales_orders`) not enabled on the target company
+- `intercompany_sync_delivery_receipt` turned off
+- The customer/vendor partner is not linked to a company — `_find_company_from_partner()` found nothing
+
+`intercompany_user_id` and `intercompany_warehouse_id` no longer exist in Odoo 20; if a checklist still mentions them, it is a 19-era checklist.
 
 ### 6. "Branch User Sees Parent's Journals but Not Parent's Invoices"
 
@@ -1179,8 +1260,10 @@ A: The effective lock date for a branch is the **maximum** across itself and all
 | Inter-company invoicing | `account_inter_company_rules` | Enterprise |
 | Inter-company SO/PO | `sale_purchase_inter_company_rules` | Enterprise |
 | Inter-company stock transfers | `sale_purchase_stock_inter_company_rules` | Enterprise |
+| Inter-company POS | `pos_sale_purchase_stock_inter_company_rules` | Enterprise |
 | Report consolidation | `account_reports` | Enterprise |
-| Tax units (group VAT) | `account_reports` | Enterprise |
+| Interco balance comparison | `account_reports` (Interco Comparison report) | Enterprise |
+| Tax units (group VAT) | `account_reports` (`account.tax.unit`) | Enterprise |
 | Analytic accounting | `analytic` + `account` | Community |
 
 ---
@@ -1196,6 +1279,27 @@ A: The effective lock date for a branch is the **maximum** across itself and all
 
 ---
 
+## What Changed in Odoo 20
+
+| Area | Odoo 19 | Odoo 20 | Why it matters here |
+|---|---|---|---|
+| Security files | `ir.model.access.csv` + `ir.rule` XML | unified `ir.access.csv` / `ir.access` model; a row with a group is a *permission*, a row without is a *restriction* | Every multi-company rule quoted in this doc now lives in `security/ir.access.csv`. The domains are unchanged |
+| Invoice company resolution | `(journal.company_id or env.company)._accessible_branches()[:1]` | explicit: keep `env.company` when the journal belongs to an ancestor | Same outcome for branches, clearer to reason about |
+| Chart of accounts | `account.group` prefix ranges | `account.account.parent_id` tree; `account.group` removed | The shared branch COA now carries its own hierarchy; report hierarchy follows it |
+| Bank/cash accounts | journal created manually | creating the account auto-creates the journal in its first company | Adding a branch bank account is one step, not two |
+| Company accounting defaults | product-category and partner properties | company fields backed by `ir.default` via `company_default_for` (`receivable_account_id`, `payable_account_id`, `income_account_id`, `expense_account_id`, `account_stock_valuation_id`, `cost_method`, …) | Each branch can carry its own default accounts without touching product data |
+| Intercompany rules | `intercompany_user_id` per company | removed — mirror documents are created with `SUPERUSER_ID` | One less piece of configuration to get wrong |
+| Intercompany reconciliation | manual / spreadsheet | **Interco Comparison** report | The elimination workstream finally has a report |
+| Report analytic filter | `filter_analytic` | `filter_analytic_groupby` | Custom reports must be updated |
+| Report currency conversion | `currency_table` JOIN | `consolidation_rate` / `consolidation_balance` on `account.move.line`, with CTA rules per account type | Consolidated multi-currency reports balance via an explicit CTA line |
+| Multi-ledger | — | `account.journal.group` drives `res.company.has_ledger`; assets get per-ledger variants | Relevant if a group needs statutory and tax books side by side |
+
+Everything else in this document — the branch vs multi-company decision, the `in` / `parent_of` domain patterns, the per-module company scoping, the pitfalls — behaves the same in 20 as in 19.
+
+---
+
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
+- [`accounting_reports.md`](accounting_reports.md) -- consolidation, the company filter, and the Interco Comparison report
+- [`accounting_migration.md`](accounting_migration.md) -- opening balances and lock dates per company

@@ -1,234 +1,649 @@
-# Work Entries — The Core Engine
+# Work Entries — The Time→Money Engine
 
-> **Module:** `hr_work_entry` (community) + payroll extensions in `hr_payroll` (enterprise) + bridges `hr_work_entry_holidays`, `hr_work_entry_attendance`, `hr_work_entry_planning`, `hr_payroll_planning`, `hr_work_entry_planning_attendance`, `hr_work_entry_enterprise`, `hr_work_entry_holidays_enterprise` | **Path:** [`addons/hr_work_entry/`](../addons/hr_work_entry/)
-> **Updated by Codex and verified from source 2026-07-12.** Related docs: [`public_holidays_flow.md`](public_holidays_flow.md), [`payroll_wage_types.md`](payroll_wage_types.md), [`attendance_work_entry.md`](attendance_work_entry.md), [`hr_payroll.md`](hr_payroll.md).
+> **Module:** `hr_work_entry` (community) | **Path:** [`addons/hr_work_entry/`](../addons/hr_work_entry/)
+> Live integrations: [`hr_attendance`](../addons/hr_attendance/), [`hr_holidays`](../addons/hr_holidays/),
+> [`hr_holidays_attendance`](../addons/hr_holidays_attendance/), [`hr_payroll`](../enterprise/hr_payroll/),
+> [`hr_payroll_attendance`](../enterprise/hr_payroll_attendance/)
+> **Verified against Odoo 20 source 2026-09-22.** Related docs: [`public_holidays_flow.md`](public_holidays_flow.md),
+> [`payroll_wage_types.md`](payroll_wage_types.md), [`attendance_work_entry.md`](attendance_work_entry.md),
+> [`hr_payroll.md`](hr_payroll.md).
+
+---
+
+## Read This First — Odoo 20 Removed the `hr.work.entry` Model
+
+**`hr.work.entry` does not exist in Odoo 20.** There is no work-entry table, no work-entry
+calendar view, no work-entry state machine, no conflict engine, no generation cron and no
+regeneration wizard. The only models left with "work entry" in the name are
+`hr.work.entry.type` ([hr_work_entry_type.py:10](../addons/hr_work_entry/models/hr_work_entry_type.py#L10))
+and the vestigial calendar filter `hr.user.work.entry.employee`
+([hr_user_work_entry_employee.py:9](../addons/hr_work_entry/models/hr_user_work_entry_employee.py#L9)).
+
+The whole bridge-module family is **deleted**: `hr_work_entry_holidays`,
+`hr_work_entry_attendance`, `hr_work_entry_planning`, `hr_work_entry_planning_attendance`,
+`hr_work_entry_enterprise`, `hr_work_entry_holidays_enterprise`, all `hr_work_entry_contract_*`,
+`hr_payroll_holidays` and `hr_payroll_planning`. Those directories still exist in this checkout
+but contain **nothing but stale `__pycache__`** left over from the v19 tree copy — `git ls-tree 20.0`
+returns zero tracked files for every one of them. Do not import from them.
+
+**Planning is no longer a payroll time source at all.** `planning.slot` has no work entry type
+and no payroll bridge in v20.
+
+**`hr.leave.type` is also gone.** Time-off types *are* work entry types now: `hr.leave.work_entry_type_id`
+([hr_leave.py:167](../addons/hr_holidays/models/hr_leave.py#L167)), and `hr_holidays` bolts the
+old leave-type fields (`requires_allocation`, `request_unit`, `leave_validation_type`,
+`allows_negative`, …) onto `hr.work.entry.type`
+([hr_work_entry_type.py:31](../addons/hr_holidays/models/hr_work_entry_type.py#L31)).
+
+| Odoo 19 | Odoo 20 |
+|---|---|
+| `hr.work.entry` records, stored, with a lifecycle | **Nothing stored.** Real records (`hr.attendance`, `hr.leave`) carry the classification |
+| `hr.work.entry.state` (draft / validated / conflict / cancelled) | `hr.attendance.state` (draft / validated / refused), `hr.leave.state`, plus `hr.payroll.warning` rows on the pay run |
+| 4-check conflict engine, `_check_if_error` | Gone. Attendance overlap constraint + attendance validation policy + pay-run warnings |
+| Cron "Generate Missing Work Entries" | Gone. Nothing is generated ahead of time |
+| `date_generated_from` / `date_generated_to`, delta generation | Gone. Every consumer recomputes from scratch |
+| Regeneration wizard | Gone |
+| `hr.version.work_entry_source` (calendar / attendance / planning) | `hr.version.attendance_based` boolean ([hr_version.py:10](../addons/hr_attendance/models/hr_version.py#L10)) |
+| `hr.work.entry.type.is_leave` / `is_work` | `count_as` = `working_time` \| `absence` ([hr_work_entry_type.py:36](../addons/hr_work_entry/models/hr_work_entry_type.py#L36)) |
+| `hr.leave.type` | merged into `hr.work.entry.type` |
+| `hr.attendance.overtime` + overtime rulesets | `hr.time.rule` ([hr_time_rule.py:110](../addons/hr_work_entry/models/hr_time_rule.py#L110)) |
+| `struct.unpaid_work_entry_type_ids` | removed |
+| Codes `WORK100` / `LEAVE100` everywhere | numeric codes: `002.00` Work, `006.00` Public holiday, `000.00` Out of contract ([hr_work_entry_type_data.xml](../addons/hr_work_entry/data/hr_work_entry_type_data.xml)) |
+
+---
 
 ## What It Does & Why It Exists
 
-Work entries are the middle layer between "time" (schedules, attendances, planning shifts, leaves) and "money" (payslips). The payslip never reads a schedule, an attendance, or a leave directly — it only reads `hr.work.entry` records. Every time source is normalized into this one model, so payroll has a single, conflict-checked, validated representation of what an employee did in a period. HR officers see work entries in a calendar view (Payroll → Work Entries), fix conflicts there, and payslips consume them.
+A work entry is still the unit that sits between "time" (schedules, attendances, leaves) and
+"money" (payslips): *this employee, this day, this many hours, of this type*. What changed is
+**where it lives**. In v20 it is never a record. It exists in two forms:
 
-**Key v19 fact: work entries are day-based.** The model stores `date` (a Date) + `duration` (hours, 0 < d ≤ 24) — there are **no** `date_start`/`date_stop` datetime fields on the record anymore ([hr_work_entry.py:28-29](../addons/hr_work_entry/models/hr_work_entry.py#L28)). Generation internally computes datetime intervals but flattens them to (date, duration) before creating records. Multiple entries per employee per day are legal as long as the day's total stays within 24h.
+1. **As a classification on a real record.** An `hr.attendance` and an `hr.leave` each carry a
+   `work_entry_type_id`. That field *is* the work entry type of those hours. Payroll rates,
+   absence-vs-working-time semantics and the payslip line all follow from it.
+2. **As a transient dict, produced at the moment someone asks for it.**
+   `hr.version.generate_work_entries(date_from, date_to)` returns a plain `list[dict]` of
+   `{date, duration, work_entry_type_id, employee_id, version_id, company_id}`
+   ([hr_version.py:303](../addons/hr_work_entry/models/hr_version.py#L303)). It creates nothing.
+   The payslip calls it, consumes the list, and throws it away.
+
+The piece that makes this work is the new **time rule engine** (`hr.time.rule`). Where v19 solved
+"these 3 hours are overtime at 150%" by generating an extra work-entry record, v20 solves it by
+**splitting the attendance or leave record itself** and stamping the overtime type on the split-off
+part. The overtime is a real `hr.attendance` row you can see on the employee's attendance list,
+not a shadow record in a separate table.
+
+Who uses it: HR/Payroll managers configure Time Types and Time Rules once; attendance officers and
+time-off approvers work with ordinary attendance and leave records; the payslip reads the
+projection at compute time.
 
 ---
 
 ## The Big Picture — How It Works
 
 ```
-time source (calendar | attendance | planning | validated leaves | manual)
-   → hr.work.entry records (one per employee / day / type; date + duration)
-      → conflict engine (4 checks; batch payroll blocks, individual flow can silently exclude/ignore)
-         → payslip pulls entries (state draft|validated) and groups per type
-            → worked-days lines → amounts → BASIC
+CONFIG (once)
+  hr.work.entry.type  ("Time Type": code, count_as, amount_rate)
+  hr.time.rule        ("Automatic Rules": condition -> excess/deficit -> output type)
+  resource.calendar.attendance.work_entry_type_id   (per schedule line)
+
+LAYER 1 — classification, on real records, as they are saved
+  hr.attendance (validated) ──┐
+  hr.leave      (validated) ──┤─> hr.time.rule._evaluate_rules()
+                              │     builds _Iv interval pipeline per employee
+                              │     each rule, in sequence order, reclassifies slices
+                              └─> _apply_output(): WRITES BACK
+                                    - source record's own work_entry_type_id / end trimmed
+                                    - new child records (source_attendance_id / source_leave_id)
+                                    - optional leave allocation credit + log row
+
+LAYER 2 — projection, at payslip time only
+  hr.version.generate_work_entries(date_from, date_to)
+      calendar theoretical attendance   (resource.calendar.attendance -> its own type)
+    - resource.calendar.leaves          (public holidays + validated hr.leave)
+    - days knocked out by attendances   (hr_holidays_attendance)
+    + hr.attendance segments            (their own work_entry_type_id)
+      -> split at local midnight, convert to (date, duration), merge per key
+      -> list[dict]   <-- nothing persisted
+
+CONSUMPTION
+  hr.payslip._compute_worked_days_line_ids()
+      -> version.get_work_hours() sums duration per (type, category options)
+      -> one hr.payslip.worked_days line per type
+      -> amount = hourly_rate x hours x type.amount_rate
 ```
 
-The employee's `work_entry_source` on `hr.version` picks the automatic source (`calendar` default; `attendance`/`planning` added by their bridge modules). Leaves overlay any source. Manual entries can always be added on top.
-
 ### Key Decision Points
-- **`work_entry_source` (per employee version):** what fills the layer automatically. Changing it (or the calendar) force-regenerates the already-generated period ([hr_version.py:689-691](../addons/hr_work_entry/models/hr_version.py#L689)).
-- **Work entry type per entry:** decides the payslip line the hours land on, the pay rate multiplier, and whether the hours dilute a fixed wage (see Type Anatomy).
+
+- **`hr.version.attendance_based`** ([hr_version.py:10](../addons/hr_attendance/models/hr_version.py#L10)) —
+  the replacement for `work_entry_source`. `False` (default, from
+  `res.company.attendance_based`): the theoretical schedule supplies the baseline hours.
+  `True`: the schedule contributes nothing and badge records are the entire baseline
+  ([hr_version.py:15](../addons/hr_holidays_attendance/models/hr_version.py#L15)).
+  It is only a *baseline* switch — see the gotcha below: attendances win on days they exist either way.
+- **A record's `work_entry_type_id`** decides the payslip line it lands on, its `amount_rate`,
+  and whether it counts as working time or absence.
+- **A time rule's `sequence`** ([hr_time_rule.py:119](../addons/hr_work_entry/models/hr_time_rule.py#L119)) —
+  rules fire in order and each one sees what the previous ones already classified. Lowest
+  sequence wins a contested interval.
+- **`hr.work.entry.type.count_as`** — `absence` types are subtracted from working time by the
+  resource engine ([resource_calendar.py:38](../addons/hr_work_entry/models/resource_calendar.py#L38));
+  `working_time` types add to it.
 
 ---
 
-## All the Ways Work Entries Get Created
+## Layer 1 — The Time Rule Engine
 
-| # | Trigger | Mechanism |
+This is the genuinely new machinery and the reason this doc exists.
+
+### What a rule is
+
+`hr.time.rule` ([hr_time_rule.py:110](../addons/hr_work_entry/models/hr_time_rule.py#L110)) is
+*condition → effect* over time intervals. UI: **Attendances → Configuration → Automatic Rules**
+or **Time Off → Configuration → Automatic Rules**
+([hr_attendance_view.xml:649](../addons/hr_attendance/views/hr_attendance_view.xml#L649),
+[hr_time_rule_views.xml:59](../addons/hr_holidays/views/hr_time_rule_views.xml#L59)).
+
+| Part | Fields | What it does |
 |---|---|---|
-| 1 | **Daily cron** "Generate Missing Work Entries" | Covers 1st of current month → last day of next month, 100 versions per run, re-triggers itself until done; one company per run, calendar-source versions batch first, versions already generated today are skipped ([hr_version.py:693-724](../addons/hr_work_entry/models/hr_version.py#L693)) |
-| 2 | **Creating a payslip** | `_compute_worked_days_line_ids` first calls `generate_work_entries(date_from-1, date_to+1)` — a payslip auto-fills its own period ([hr_payslip.py:1439-1441](../enterprise/hr_payroll/models/hr_payslip.py#L1439)) |
-| 3 | **Version edits** | Calendar or source change → force regeneration via the wizard; contract date change → entries outside the contract are hard-deleted, **raising** if any of them is validated ([hr_version.py:660-673](../addons/hr_work_entry/models/hr_version.py#L660), [hr_version.py:621-639](../addons/hr_work_entry/models/hr_version.py#L621)); version deletion deletes its non-validated entries ([hr_version.py:641-658](../addons/hr_work_entry/models/hr_version.py#L641)) |
-| 4 | **Leave validation** | `hr_work_entry_holidays` replaces the affected interval with the leave's work entry type |
-| 5 | **Attendance / planning bridges** | Check-out → entries; overtime approval → OVERTIME entries; published slots → entries (see [`attendance_work_entry.md`](attendance_work_entry.md)) |
-| 6 | **Manual** | Work Entries calendar → New: pick employee, date, duration, type. `create()` auto-resolves the version from the date, snapshots the type's rate, then runs the conflict check ([hr_work_entry.py:240-259](../addons/hr_work_entry/models/hr_work_entry.py#L240)) |
+| **Scope** | `company_id`, `country_id`, `employee_domain` | Which employees the rule can touch ([_get_applicable_employees](../addons/hr_work_entry/models/hr_time_rule.py#L336)). Attendance narrows it further to employees with a calendar when `calendar_source='employee'` ([hr_time_rule.py:13](../addons/hr_attendance/models/hr_time_rule.py#L13)) |
+| **Input filter** | `condition_work_entry_type_ids` (required) | Only intervals currently carrying one of these types are considered. This is what lets rules chain: rule 2 can match the output type of rule 1 |
+| **Threshold** | `threshold_operator` (`exceed`/`less_than`), `working_hours_mode` | `schedule_day` / `schedule_week` compare against the calendar; `day` / `week` compare against a flat `expected_hours` ([hr_time_rule.py:130-163](../addons/hr_work_entry/models/hr_time_rule.py#L130)) |
+| **Baseline** | `calendar_source` (`employee`/`reference`), `resource_calendar_id` | Whose schedule is "expected". `reference` falls back to company calendar then `env.company`'s ([_get_schedule_calendar](../addons/hr_work_entry/models/hr_time_rule.py#L364)) |
+| **Timing window** | `apply_monday…apply_sunday`, `apply_on_public_holidays`, `timing_start`/`timing_stop` | Restricts the rule to certain weekdays and hours of the day. `timing_start > timing_stop` inverts the window, i.e. a night-shift band ([_build_hour_window_intervals](../addons/hr_work_entry/models/hr_time_rule.py#L485)) |
+| **Tolerance** | `employer_tolerance` (exceed), `employee_tolerance` (less_than) | Excess/deficit below tolerance produces nothing ([hr_time_rule.py:798](../addons/hr_work_entry/models/hr_time_rule.py#L798), [:831](../addons/hr_work_entry/models/hr_time_rule.py#L831)) |
+| **Effect: type** | `work_entry_type_id` ("Set Excess/Deficit to") | The type stamped on the matched portion. **Leave it empty** and the rule keeps the source type but still credits allocation / premium-pay categories |
+| **Effect: pay** | `amount_rate` (read-only mirror of the output type's rate, [hr_time_rule.py:211](../addons/hr_work_entry/models/hr_time_rule.py#L211)), `premium_pay_category_ids` (payroll, [hr_time_rule.py:10](../enterprise/hr_payroll/models/hr_time_rule.py#L10)) | Rate lives on the **type**, not the rule. Premium-pay categories are pushed onto the output record as `category_options_ids` |
+| **Effect: time off** | `leave_compensation_rate`, `allocation_type_id` (holidays, [hr_time_rule.py:26](../addons/hr_holidays/models/hr_time_rule.py#L26)) | Convert excess hours into a leave allocation (or claw back on deficit) |
 
-Custom code creating entries only needs `employee_id`, `date`, `duration`, `work_entry_type_id` — the version is resolved automatically. This makes custom bridges (e.g. timesheet → work entry) far simpler than the old datetime-interval model.
+Ships with 24 rules in [hr_time_rule_data.xml](../addons/hr_work_entry/data/hr_time_rule_data.xml):
+one generic "Employee Schedule Rule" (anything beyond the daily schedule → Overtime) plus
+localised stacks for ID, AE, EG, IQ, JO, OM, SA.
 
-### The generation algorithm (calendar source)
+### The pipeline
 
-Generation is **delta-based**, not idempotent-regenerate. Each version tracks `date_generated_from` / `date_generated_to`; `_generate_work_entries` only produces the missing head/tail intervals and widens the tracked window ([hr_version.py:466-478](../addons/hr_work_entry/models/hr_version.py#L466)). The middle is never re-examined — fixing the past is the regeneration wizard's job (`force=True` nullifies non-validated entries in range and rebuilds). New versions start with a **collapsed window** (both bounds = today midnight, [hr_employee.py:28-34](../addons/hr_work_entry/models/hr_employee.py#L28)); the first generation snaps a collapsed window to its requested start instead of backfilling years of history ([hr_version.py:429-435](../addons/hr_work_entry/models/hr_version.py#L429)).
+`_evaluate_rules(records, start_dt, end_dt)`
+([hr_time_rule.py:862](../addons/hr_work_entry/models/hr_time_rule.py#L862)) is the heart.
 
-For the interval, it builds theoretical attendance intervals from the calendar, subtracts `resource.calendar.leaves`, resolves each leave interval's work entry type via hooks (`_get_leave_work_entry_type`, overridden by the holidays bridge for public-holiday priority), then postprocesses: split at local midnights, convert to (date, duration), **merge everything sharing (date, type, employee, version, company) into one entry**, drop zero-duration ([hr_version.py:500-619](../addons/hr_work_entry/models/hr_version.py#L500)). Result: one entry per employee/day/type.
+1. **Build the pipeline.** Each source record becomes one or more `_Iv` tuples
+   ([hr_time_rule.py:21](../addons/hr_work_entry/models/hr_time_rule.py#L21)) —
+   `(start, end, work_entry_type, source, classifying_rule, acc, pp)` in the employee's local
+   naive time. `classifying_rule=None` means "untouched".
+   Absence-type leaves are clipped to the working schedule first so lunch breaks and overnight
+   gaps do not count toward thresholds
+   ([_get_pipeline_intervals_local](../addons/hr_holidays/models/hr_leave.py#L1692));
+   attendances keep their raw span.
+2. **Each rule, in `sequence` order, over the whole pipeline.** The rule filters to intervals
+   whose current type is in `condition_work_entry_type_ids`, clips them to its weekday/hour
+   window, groups by day or week, and calls `_evaluate_period`
+   ([hr_time_rule.py:744](../addons/hr_work_entry/models/hr_time_rule.py#L744)).
+3. **`_evaluate_period` does the arithmetic.** Expected = schedule hours in the window (or flat
+   `expected_hours`). Worked = union of the record intervals **minus a prorated share of the
+   attendance's `break_duration`** — a 2 h break inside an 8 h attendance contributes 1 h to a
+   4 h timing window ([hr_time_rule.py:772-790](../addons/hr_work_entry/models/hr_time_rule.py#L772)).
+   On `exceed`, the excess is taken from the **end** of the day's intervals. On `less_than`, the
+   deficit is materialised in the **gap** between schedule and worked time.
+4. **Reclassify.** Matched slices are split at the excess boundaries and get the rule's output
+   type. The previously classifying rule is pushed onto `acc` so its premium-pay categories and
+   its allocation credit survive being displaced
+   ([hr_time_rule.py:991-1014](../addons/hr_work_entry/models/hr_time_rule.py#L991)).
+   A rule with no output type and no schedule threshold short-circuits: it tags everything it
+   matched without loading schedule data ([hr_time_rule.py:940](../addons/hr_work_entry/models/hr_time_rule.py#L940)).
+5. **Extract.** Anything left with `rule is not None` is the excess set.
 
-**Flexible-calendar trap:** an employee with no `resource_calendar_id` gets entries with `duration = 0.0` from calendar generation ([hr_version.py:576-578](../addons/hr_work_entry/models/hr_version.py#L576)) — consistent with the "flexible employees break hour math" gotcha in [`payroll_wage_types.md`](payroll_wage_types.md).
+### What "applying" a rule does to your data
 
-### The schedule itself chooses the type
+`_apply_output` ([hr_time_rule.py:582](../addons/hr_work_entry/models/hr_time_rule.py#L582)) is
+where it stops being a computation and starts being writes. This is the part to internalise:
 
-Every working-schedule line (`resource.calendar.attendance` — "Monday morning", "Saturday shift"...) carries its own `work_entry_type_id`, defaulting to Attendance ([resource_calendar_attendance.py:9-15](../addons/hr_work_entry/models/resource_calendar_attendance.py#L9)). Generation reads the type from the interval's calendar lines ([_get_interval_work_entry_type](../addons/hr_work_entry/models/hr_version.py#L139)); fallback is the structure type's `default_work_entry_type_id`, then global Attendance ([hr_version.py:275](../enterprise/hr_payroll/models/hr_version.py#L275)). Consequence: a schedule can emit **custom types automatically** — e.g. Saturday slots configured with a "Site Day" type generate that type every week, no manual entry. Global time off records (`resource.calendar.leaves`) carry a type the same way ([resource_calendar_leaves.py:9-11](../addons/hr_work_entry/models/resource_calendar_leaves.py#L9)). Schedule lines whose type `is_leave` are excluded from `hours_per_week` and "work period" math ([resource_calendar.py:10-15](../addons/hr_work_entry/models/resource_calendar.py#L10)).
+- **The source record is mutated in place** when the first output slice starts at or before the
+  source's own start: its `work_entry_type_id`, `time_rule_id` and end datetime are overwritten
+  ([hr_time_rule.py:690-707](../addons/hr_work_entry/models/hr_time_rule.py#L690)). The original
+  8 h attendance literally becomes the 8 h "Work" part.
+- **Later slices become new child records** of the same model —
+  `hr.attendance` with `source_attendance_id`, or `hr.leave` with `source_leave_id`
+  ([hr_attendance.py:103](../addons/hr_attendance/models/hr_attendance.py#L103),
+  [hr_leave.py:284](../addons/hr_holidays/models/hr_leave.py#L284)).
+  Generated attendance children are auto-validated on create
+  ([hr_attendance.py:689](../addons/hr_attendance/models/hr_attendance.py#L689)); generated leave
+  children are created directly in `state='validate'`
+  ([hr_time_rule.py:66](../addons/hr_holidays/models/hr_time_rule.py#L66)).
+- **Deficit output goes into free slots**, not on top of existing records:
+  `_get_time_rule_deficit_occupied` returns what is already there and the engine fills the
+  complement, deducting hours already covered by a previous run so repeats are idempotent
+  ([hr_time_rule_source_mixin.py:71](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L71)).
+- **Allocation credit** (holidays): excess hours × `leave_compensation_rate` ÷ `hours_per_day`
+  are added to an open-ended allocation of `allocation_type_id`, creating and approving one if
+  none exists; every credit is logged in `hr.time.rule.allocation.log`
+  ([hr_time_rule.py:76](../addons/hr_holidays/models/hr_time_rule.py#L76),
+  [hr_time_rule_allocation_log.py:6](../addons/hr_holidays/models/hr_time_rule_allocation_log.py#L6)).
+  Before a batch is re-evaluated, prior credits for those sources are **reversed** from the log
+  ([_reverse_allocation_credits](../addons/hr_holidays/models/hr_time_rule.py#L245)) — and if the
+  employee has already *spent* that balance, the reversal raises a `ValidationError` naming the
+  employee, the type and the manager to talk to. Deficit is pre-filtered so an over-draw drops
+  the deficit output entirely rather than pushing a balance negative
+  ([_filter_deficit_exceeding_allocation](../addons/hr_holidays/models/hr_time_rule.py#L160)).
+
+### When rules run
+
+Triggered by ordinary CRUD on the source models, via the mixin's `create`/`write`
+([hr_time_rule_source_mixin.py:330](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L330)):
+
+| Trigger | Which rules |
+|---|---|
+| Attendance/leave create, or write to span / employee / type / state / break | `_trigger_time_rules` → `_trigger_time_rules_for_affected` ([:297](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L297)): **past days** get all day rules; **today** gets only `exceed` day rules; **past weeks** get only `exceed` week rules |
+| Cron "Process daily time rules" (daily, on `hr.attendance` and `hr.leave`) | Yesterday's records, `less_than` day rules only ([:182](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L182)) |
+| Cron "Process weekly time rules" | The week that ended yesterday, only rules whose `week_start` matches ([:195](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L195)) |
+
+The split exists so undertime is never charged while the employee is still working the day or
+the week. Only **validated** sources are eligible:
+`[('state','=','validated')]` for attendance
+([hr_attendance.py:660](../addons/hr_attendance/models/hr_attendance.py#L660)) and
+`[('state','=','validate')]` for leaves
+([hr_leave.py:1711](../addons/hr_holidays/models/hr_leave.py#L1711)).
+
+`skip_time_rules=True` in the context disables the whole trigger path — the engine sets it on
+its own writes, and you must set it on any bulk data fix you do not want re-evaluated.
 
 ---
 
-## The State Machine & Conflict Engine
+## Layer 2 — The Payslip-Time Projection
 
-States: `draft` → `validated` (via `action_validate`, only if error-free) | `conflict` | `cancelled` (= `active = False`, archived; excluded from pay).
+`generate_work_entries` ([hr_version.py:303](../addons/hr_work_entry/models/hr_version.py#L303))
+is a pure function from versions + a date range to a list of vals dicts. Nothing is written,
+nothing is cached, and there is no notion of a "generated window" — it always recomputes.
 
-Every create/write touching `date`, `duration`, `employee_id`, `work_entry_type_id`, or `active` re-runs the check over the affected date range: conflicts in range are reset to draft, then re-evaluated ([hr_work_entry.py:292-328](../addons/hr_work_entry/models/hr_work_entry.py#L292)).
+### The algorithm
 
-The 4 checks ([_check_if_error](../addons/hr_work_entry/models/hr_work_entry.py#L138)):
+`_get_version_work_entries_values` ([hr_version.py:122](../addons/hr_work_entry/models/hr_version.py#L122)):
 
-| # | Check | Detail |
+1. **Theoretical attendance** from `resource.calendar.attendance` for each version
+   ([_get_attendance_intervals](../addons/hr_work_entry/models/hr_version.py#L72)). Fully flexible
+   versions get the whole span as one interval.
+2. **Subtract `resource.calendar.leaves`** in range. Each calendar leave is routed by its own
+   `count_as`: `absence` reduces working time, `working_time` (e.g. paid training booked as a
+   leave) replaces it ([hr_version.py:172](../addons/hr_work_entry/models/hr_version.py#L172)).
+3. **Resolve each leave interval to a type**
+   ([_get_interval_leave_work_entry_type](../addons/hr_work_entry/models/hr_version.py#L44),
+   overridden in [hr_version.py:264](../addons/hr_holidays/models/hr_version.py#L264)). Priority:
+   a country "bypass" code (`_get_bypassing_work_entry_type_codes`, non-empty only in BE and HK)
+   > **global calendar leave** (public holiday) > employee leave > the generic
+   `generic_work_entry_type_leave` fallback.
+4. **Postprocess** ([_generate_work_entries_postprocess](../addons/hr_work_entry/models/hr_version.py#L412)):
+   split every interval at local midnight, convert `(date_start, date_stop)` to `(date, duration)`,
+   drop zero-duration, and **merge** everything sharing the merge key into one dict. The key is
+   `(date, work_entry_type_id, employee_id, version_id, company_id)`
+   ([:386](../addons/hr_work_entry/models/hr_version.py#L386)), extended with
+   `category_options_ids` when payroll is installed
+   ([hr_version.py:713](../enterprise/hr_payroll/models/hr_version.py#L713)).
+
+Absence-type intervals get their duration from the calendar's theoretical hours rather than the
+raw clock difference — that is what `_generate_work_entries_postprocess_adapt_to_calendar`
+selects ([:405](../addons/hr_work_entry/models/hr_version.py#L405)).
+
+### The schedule line chooses the type
+
+Every `resource.calendar.attendance` row ("Monday morning", "Saturday shift") carries its own
+`work_entry_type_id` ([resource_calendar_attendance.py:13](../addons/hr_work_entry/models/resource_calendar_attendance.py#L13)),
+restricted to types flagged `resource_calendar_selectable` (auto-true for `working_time` types,
+[hr_work_entry_type.py:112](../addons/hr_work_entry/models/hr_work_entry_type.py#L112)).
+Generation reads it ([_get_interval_work_entry_type](../addons/hr_work_entry/models/hr_version.py#L91));
+fallback is the structure type's `default_work_entry_type_id`
+([hr_version.py:609](../enterprise/hr_payroll/models/hr_version.py#L609)), then the country's
+`002.00` type, then the generic Work type
+([_get_default_work_entry_type_id](../addons/hr_work_entry/models/hr_version.py#L18)).
+
+So a schedule can emit **custom types automatically and with no rule at all** — a Saturday slot
+configured as "Site Day" produces that type every week. A schedule line whose type is an
+`absence` is excluded from `hours_per_week` / `days_per_week` / `hours_per_day` and from
+`_is_work_period` ([resource_calendar_attendance.py:64](../addons/hr_work_entry/models/resource_calendar_attendance.py#L64),
+[resource_calendar.py:11](../addons/hr_work_entry/models/resource_calendar.py#L11)) — but the day
+still counts in full toward `_get_reference_hours_per_day`
+([resource_calendar.py:23](../addons/hr_work_entry/models/resource_calendar.py#L23)).
+
+### Attendances override the schedule
+
+`hr_holidays_attendance` is `auto_install` with `hr_attendance` + `hr_holidays`, so on any
+database with both, it rewrites generation
+([hr_version.py:35](../addons/hr_holidays_attendance/models/hr_version.py#L35)):
+
+- Validated attendances with a check-out are pulled in and become work-entry vals in their own
+  right, carrying their own `work_entry_type_id`
+  ([:115](../addons/hr_holidays_attendance/models/hr_version.py#L115)). `break_duration` is cut
+  off the end ([:94](../addons/hr_holidays_attendance/models/hr_version.py#L94)).
+- For a **calendar-based** version, every local day that has an attendance is "knocked out" of
+  the theoretical schedule wholesale
+  ([:88](../addons/hr_holidays_attendance/models/hr_version.py#L88) →
+  [_get_real_attendances:143](../addons/hr_holidays_attendance/models/hr_version.py#L143)).
+  **Consequence: one badge record replaces the entire scheduled day.** `attendance_based`
+  therefore only changes what happens on days with *no* attendance.
+- `working_time` leaves and attendances that overlap are resolved by **work entry type
+  sequence**, lowest wins, via `resolve_intervals_by_sequence`
+  ([:103](../addons/hr_holidays_attendance/models/hr_version.py#L103),
+  [hr_time_rule.py:31](../addons/hr_work_entry/models/hr_time_rule.py#L31)). Absence leaves lose
+  to any worked time that overlaps them
+  ([_get_valid_leave_intervals:165](../addons/hr_holidays_attendance/models/hr_version.py#L165)).
+
+---
+
+## Validation & State — What Replaced the Conflict Engine
+
+There is no conflict state and nothing blocks a payslip on "missing work entries". Validity is
+now enforced on the real records, at three different places.
+
+**1. Attendance state machine** ([hr_attendance.py:95](../addons/hr_attendance/models/hr_attendance.py#L95)):
+`draft` → `validated` → `refused`. What creates a draft is the company's
+`attendance_validation` policy ([res_company.py:37](../addons/hr_attendance/models/res_company.py#L37)):
+
+| Policy | Effect on create |
+|---|---|
+| `no_validation` (default) | Everything is created `validated` |
+| `tolerance_validation` | `_update_tolerance_state` auto-validates only if worked hours are within `attendance_validation_tolerance` of the day's expected hours; otherwise the record stays `draft` and waits for approval ([hr_attendance.py:669](../addons/hr_attendance/models/hr_attendance.py#L669)) |
+| (any) | Records the engine itself creates (`time_rule_id` or `source_attendance_id` set) always auto-validate ([hr_attendance.py:692](../addons/hr_attendance/models/hr_attendance.py#L692)) |
+
+Draft and refused attendances are invisible to both layers. The old "overlap" check survives as a
+hard SQL-level constraint: `_check_validity` forbids overlapping or double-open attendances for
+an employee ([hr_attendance.py:198](../addons/hr_attendance/models/hr_attendance.py#L198)) —
+bypassed under `skip_time_rules` so the engine can split records.
+
+**2. The `source_stale` flag** — the closest thing left to a conflict badge. Editing or deleting
+a source attendance marks its surviving rule outputs stale
+([_STALE_TRIGGER_FIELDS:243](../addons/hr_attendance/models/hr_attendance.py#L243),
+[_mark_outputs_stale_on_delete:264](../addons/hr_attendance/models/hr_attendance.py#L264)). The
+attendance list/kanban shows a warning and a **Mark Reviewed** button
+([hr_attendance_view.xml:41](../addons/hr_attendance/views/hr_attendance_view.xml#L41),
+[action_mark_reviewed:269](../addons/hr_attendance/models/hr_attendance.py#L269)). It is advisory
+— it blocks nothing.
+
+**3. Pay-run warnings** — `_get_start_payrun_warnings`
+([hr_payslip_run.py:428](../enterprise/hr_payroll/models/hr_payslip_run.py#L428)) surfaces
+"Time Offs to Review" (unapproved or deferred leaves in the period) and "No Time Offs"
+(nothing recorded at all) before the run starts. `hr_payroll_attendance` adds an
+"Attendance Discrepancies" warning for employees who have attendances but are not
+`attendance_based`
+([hr_payroll_attendance_warning_data.xml:4](../enterprise/hr_payroll_attendance/data/hr_payroll_attendance_warning_data.xml#L4)).
+These pre-run warnings are dashboard guidance and block nothing by themselves. The hard gate is
+`hr.payslip.run.action_validate`: a user who is not a Payroll Officer (or system/superuser)
+cannot validate a run whose slips still carry warnings or errors
+([hr_payslip_run.py:376](../enterprise/hr_payroll/models/hr_payslip_run.py#L376)).
+
+**Leave deferral** survives, moved from the deleted `hr_payroll_holidays` into `hr_payroll`
+itself: a leave overlapping an already-validated payslip gets `payslip_state='blocked'`
+([hr_leave.py:17](../enterprise/hr_payroll/models/hr_leave.py#L17)) and its
+`resource.calendar.leaves` are filtered out of generation entirely
+([hr_version.py:707](../enterprise/hr_payroll/models/hr_version.py#L707)).
+
+---
+
+## How the Payslip Consumes Them
+
+1. `_compute_worked_days_line_ids` ([hr_payslip.py:2162](../enterprise/hr_payroll/models/hr_payslip.py#L2162))
+   collects every version overlapping the slip (including mid-period version swaps) and calls
+   `all_versions_to_generate.generate_work_entries(date_from - 1, date_to + 1)` **once for the
+   whole batch** ([:2217](../enterprise/hr_payroll/models/hr_payslip.py#L2217)), then splits the
+   resulting vals per version. Refund slips copy and negate the origin's lines instead.
+2. `get_work_hours` ([hr_version.py:559](../enterprise/hr_payroll/models/hr_version.py#L559) →
+   [_get_work_hours:580](../enterprise/hr_payroll/models/hr_version.py#L580)) filters the list to
+   this version and this date range and sums `duration` keyed by
+   `(work_entry_type_id, category_options_ids)`. Pure Python over the dicts — no query, no state
+   filter, nothing to exclude.
+3. `_get_worked_day_lines_values` ([hr_payslip.py:1374](../enterprise/hr_payroll/models/hr_payslip.py#L1374))
+   makes one worked-days line per key. `number_of_days = hours / hours_per_day`, rounded per
+   `work_entry_type.round_days_type` unless the type's `request_unit` is `hour`
+   ([_round_days:1344](../enterprise/hr_payroll/models/hr_payslip.py#L1344)); the rounding
+   remainder is dumped on the biggest line. **Hours produced by a time-rule split
+   (`trimmed_duration`) are excluded from rounding** and keep their exact fraction
+   ([hr_payslip.py:1385-1400](../enterprise/hr_payroll/models/hr_payslip.py#L1385),
+   tagged at [hr_version.py:721](../enterprise/hr_payroll/models/hr_version.py#L721)).
+4. An **Out Of Contract** line (code `000.00`, `amount_rate` 0) is appended for stretches of the
+   period outside the contract ([hr_payslip.py:1462](../enterprise/hr_payroll/models/hr_payslip.py#L1462)).
+5. `hr.payslip.worked_days._compute_amount` prices it:
+   `amount = hourly_rate × number_of_hours × work_entry_type.amount_rate`, zero when
+   `amount_rate == 0` ([hr_payslip_worked_days.py:123](../enterprise/hr_payroll/models/hr_payslip_worked_days.py#L123),
+   [:51](../enterprise/hr_payroll/models/hr_payslip_worked_days.py#L51)). Types in the
+   `EXTRA_HOURS` salary-rule category are `is_extra_hours` and stay out of the fixed-wage
+   denominator ([hr_work_entry_type.py:37](../enterprise/hr_payroll/models/hr_work_entry_type.py#L37),
+   [hr_payslip_worked_days.py:108](../enterprise/hr_payroll/models/hr_payslip_worked_days.py#L108)).
+   Full pricing chain: [`payroll_wage_types.md`](payroll_wage_types.md) §2.
+
+Because the projection is recomputed on every `_compute_worked_days_line_ids`, a draft slip
+picks up new attendances or leaves as soon as it is refreshed —
+`action_refresh_from_work_entries` ([hr_payslip.py:1326](../enterprise/hr_payroll/models/hr_payslip.py#L1326))
+drops the lines and recomputes; `_recompute_payslips` does it automatically when wage fields
+change ([hr_version.py:683](../enterprise/hr_payroll/models/hr_version.py#L683)). There is still
+**no staleness detection** for time data changing after a slip was computed.
+
+There is **no state choreography between payslip and time records** any more. Validating a
+payslip does not lock, validate or archive anything; cancelling it releases nothing. The only
+back-pressure is `payslip_state` on the leave and the `_unlink_except_valid_payslips` guard on
+the version ([hr_version.py:649](../enterprise/hr_payroll/models/hr_version.py#L649)).
+
+---
+
+## Time Type Anatomy (`hr.work.entry.type`)
+
+Labelled **"Time Type"** in the UI now, and it is the single classification table for worked time,
+absence *and* time-off types.
+
+| Field | Where | What it controls |
 |---|---|---|
-| 1 | Missing type | Entry without `work_entry_type_id` |
-| 2 | Day overload | Per employee/day, SUM(duration) ≤ 0 or > 24h — **all** that day's entries flag. Overlap as such no longer exists; two entries same day are fine within 24h ([hr_work_entry.py:148-179](../addons/hr_work_entry/models/hr_work_entry.py#L148)) |
-| 3 | Leave outside schedule | Leave-type entries entirely outside the calendar's theoretical schedule (skipped for flexible calendars) |
-| 4 | Already-validated day | New entries on a day that already has validated entries |
+| `code` | base | Payroll code referenced by salary rules. Unique per country (NULL country included), enforced with a readable error ([_check_code_unicity](../addons/hr_work_entry/models/hr_work_entry_type.py#L52)). Core types now use numeric codes |
+| `count_as` | base | `working_time` \| `absence`. Replaces `is_work`/`is_leave`. Drives the resource engine, the pipeline clipping and `_is_work_period` |
+| `amount_rate` | base | The pay multiplier, read at pay time. 0 = unpaid, 1.5 = 150% |
+| `display_code` / `color` | base | 3-char badge and colour on attendance/leave/calendar views |
+| `external_code` | base | Third-party payroll provider code, consumed by the export wizard |
+| `resource_calendar_selectable` | base | Whether the type can be put on a schedule line. Defaults to `count_as == 'working_time'` |
+| `country_id` | base | Scopes the type. Leave empty for your own types; a company with **any** localised type sees only that country's types ([res_company.py:23](../addons/hr_work_entry/models/res_company.py#L23)) |
+| `requires_allocation`, `time_off_selectable`, `request_unit`, `leave_validation_type`, `allows_negative`, `include_public_holidays_in_duration`, … | `hr_holidays` | The whole former `hr.leave.type` surface ([hr_work_entry_type.py:31](../addons/hr_holidays/models/hr_work_entry_type.py#L31)) |
+| `category_ids` / `optional_category_ids` | `hr_payroll` | Salary rule categories. `EXTRA_HOURS` in `category_ids` computes `is_extra_hours` ([hr_work_entry_type.py:24](../enterprise/hr_payroll/models/hr_work_entry_type.py#L24)) |
+| `round_days_type`, `display_hours` | `hr_payroll` | Day rounding on the payslip line |
+| `modified_by_user` | `hr_payroll` | Set when a user edits a critical field of a system-created type; it then stops being overwritten by data reloads, and **Reset** restores it ([hr_work_entry_type.py:106](../enterprise/hr_payroll/models/hr_work_entry_type.py#L106)) |
 
-Payroll adds a 5th, payslip-side check: for calendar-source employees, every scheduled slot must be covered by an entry, else a UserError blocks the payslip ("missing work entries", [hr_work_entry.py:30-51](../enterprise/hr_payroll/models/hr_work_entry.py#L30)).
+With payroll installed, types can only be archived, never deleted
+([_unlink_except_work_entry_type](../enterprise/hr_payroll/models/hr_work_entry_type.py#L98)).
+Duplicating one auto-suffixes the code with a uuid fragment
+([hr_work_entry_type.py:104](../addons/hr_work_entry/models/hr_work_entry_type.py#L104)).
 
-Locks: validated entries can't be deleted ([hr_work_entry.py:279-282](../addons/hr_work_entry/models/hr_work_entry.py#L279)) and — with payroll installed — can't be modified except to conflict/archive them ([hr_work_entry.py:57-63](../enterprise/hr_payroll/models/hr_work_entry.py#L57)). Entries become validated when their payslip is validated.
+Generic types shipped ([hr_work_entry_type_data.xml](../addons/hr_work_entry/data/hr_work_entry_type_data.xml)):
+Work `002.00`, Overtime 150% `040.00`, Out Of Contract `000.00` (rate 0), Generic Time Off
+`LEAVE100`, Compensatory `LEAVE105`, Work from home `002.08`, Leave without pay `158.00`,
+Illness `013.00`, Legal leave `016.00`, Public holiday `006.00`.
 
----
-
-## Work Entry Type Anatomy
-
-`hr.work.entry.type` is small but every field is a pay-behavior switch:
-
-| Field | What it controls |
-|---|---|
-| `code` | Payroll code — how salary rules reference the line (`worked_days.CODE`). Unique per country (NULL country included) ([hr_work_entry_type.py:46-59](../addons/hr_work_entry/models/hr_work_entry_type.py#L46)) |
-| `display_code` | 3-char badge in calendar/payslip views. Cosmetic |
-| `external_code` | Provider code consumed by the export-mixin l10n modules — irrelevant unless exporting ([hr_work_entry_type.py:14](../addons/hr_work_entry/models/hr_work_entry_type.py#L14)) |
-| `is_leave` / `is_work` | Inverses of each other. `is_leave=True` makes the type linkable to time-off types and subject to conflict check #3 |
-| `amount_rate` | Pay multiplier for the whole worked-days line (1.5 = 150%) — read from the **type** at pay time |
-| `is_extra_hours` | Keeps the type's hours **out of the fixed-wage denominator** — the anti-dilution flag; mandatory on any paid extra type for monthly employees |
-| `round_days` + `round_days_type` | Payroll ext.: how the line's day count displays/rounds (NO/HALF/FULL × closest/up/down) ([hr_work_entry_type.py:17-29](../enterprise/hr_payroll/models/hr_work_entry_type.py#L17)) |
-| `unpaid_structure_ids` | Payroll ext.: structures in which this type pays 0 — same relation as `struct.unpaid_work_entry_type_ids`, seen from the type side |
-| `is_unforeseen` | Payroll ext.: counts the type in the absenteeism report; SQL constraint forces it to be a leave type ([hr_work_entry_type.py:11-16](../enterprise/hr_payroll/models/hr_work_entry_type.py#L11)) |
-| `country_id` | Scopes the type; can't change once entries exist. Leave empty for own types |
-
-Types can never be deleted once payroll is installed — archive only ([hr_work_entry_type.py:39-43](../enterprise/hr_payroll/models/hr_work_entry_type.py#L39)).
-
-**Dead field warning:** `hr.work.entry.amount_rate` (on the *entry*) is snapshotted from the type at creation ([hr_work_entry.py:246-250](../addons/hr_work_entry/models/hr_work_entry.py#L246)) but **never read by pay computation** — the worked-days line uses the type's current rate ([hr_payslip_worked_days.py:47](../enterprise/hr_payroll/models/hr_payslip_worked_days.py#L47)). Editing it on an entry changes nothing. Different rates therefore require different **types** — this is why overtime rulesets map rates to separate work entry types, and why per-type rate routing is the right extension seam.
-
-Standard types shipped by `hr_work_entry` ([hr_work_entry_type_data.xml](../addons/hr_work_entry/data/hr_work_entry_type_data.xml)): Attendance `WORK100`, Overtime `OVERTIME` (rate 1.0, not extra — pays nothing extra by default), Out of Contract `OUT`, Generic Time Off `LEAVE100`, Unpaid `LEAVE90`, Sick `LEAVE110`, Home Working `WORK110`, and more leave variants.
+**Different rates still require different types** — `amount_rate` is read from the type at pay
+time and there is no per-record rate override. That is why the shipped overtime rule stacks map
+each rate band to its own type.
 
 ---
 
-## How the Payslip Consumes Entries
+## The Sources in Depth
 
-1. `_compute_worked_days_line_ids` generates missing entries, loads the period's entries per version, runs the coverage check ([hr_payslip.py:1429-1466](../enterprise/hr_payroll/models/hr_payslip.py#L1429)).
-2. `get_work_hours` aggregates with one `_read_group`: entries with `state IN (draft, validated)` — conflicts and cancelled are invisible to pay — summed as `duration` per `work_entry_type_id` ([hr_version.py:216-273](../enterprise/hr_payroll/models/hr_version.py#L216)).
-3. One worked-days line per type; `number_of_days = hours / calendar.hours_per_day`, per-type rounding, remainder dumped on the biggest line ([hr_payslip.py:845-870](../enterprise/hr_payroll/models/hr_payslip.py#L845)); an OUT line is appended for out-of-contract stretches.
-4. `_compute_amount` prices each line (hourly vs monthly proration — full chain in [`payroll_wage_types.md`](payroll_wage_types.md) §2).
+### Attendances (`hr_attendance`)
 
-Drafts recompute from entries only when refreshed (`action_refresh_from_work_entries` / "Recompute Whole Sheet", [hr_payslip.py:804-814](../enterprise/hr_payroll/models/hr_payslip.py#L804)) — otherwise entry edits after compute leave the slip silently stale. There is **no** staleness detection for changed entries; the only "wrong data" banner tracks version (contract) changes ([hr_payslip.py:398-403](../enterprise/hr_payroll/models/hr_payslip.py#L398)).
+`hr.attendance` inherits the source mixin
+([hr_attendance.py:26](../addons/hr_attendance/models/hr_attendance.py#L26)) with
+`check_in`/`check_out` as the span. `work_entry_type_id` is **required**, defaulting to
+`res.company.attendance_work_entry_type_id` — itself computed from the company country's
+`002.00` type ([res_company.py:46](../addons/hr_attendance/models/res_company.py#L46)).
+So plain presence is no longer hardcoded to one xmlid; it is a per-company setting
+(**Attendances → Configuration → Settings → Attendance Time Type**).
 
----
+Rule outputs appear as child attendances on a "Rules Outputs" page of the source form
+([hr_attendance_overtime_views.xml:12](../addons/hr_holidays_attendance/views/hr_attendance_overtime_views.xml#L12)).
+Open attendances (no check-out) contribute nothing — the source domain requires a non-false
+span end ([hr_time_rule_source_mixin.py:117](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L117)).
 
-## Payslip ↔ Entry State Choreography
+### Time off (`hr_holidays`)
 
-There is **no relational link** between an entry and a payslip. The whole lifecycle is employee + date-window matching; the `validated` state's UI label "In Payslip" is wording, not a foreign key.
+`hr.leave` inherits the mixin with `date_from`/`date_to` as the span
+([hr_leave.py:74](../addons/hr_holidays/models/hr_leave.py#L74)). A leave feeds the payslip
+through two different paths that must not be confused:
 
-| Payslip event | Effect on entries |
-|---|---|
-| **Validate** (`action_payslip_done`) | Only for *regular* slips (`struct_id == structure type's default_struct_id`): searches all entries of the employee in the slip's date window — **no state/version filter, broader than what the slip counted** — and calls `action_validate()` ([hr_payslip.py:600-610](../enterprise/hr_payroll/models/hr_payslip.py#L600)). **The return value is ignored**: if a conflict check fails, entries stay draft/conflict while the payslip becomes validated anyway — silently |
-| **Cancel / set-to-draft / unlink** | `action_draft_linked_entries`: resets validated entries in the window back to draft — but skips them entirely if a duplicate validated/paid slip exists, or if any other live (validated/paid, non-refunded) slip covers the entry's date (`has_payslip`, [hr_work_entry.py:12-28](../enterprise/hr_payroll/models/hr_work_entry.py#L12); reset logic [hr_payslip.py:492-514](../enterprise/hr_payroll/models/hr_payslip.py#L492)) |
-| **Refund / credit note** | Entries untouched — they stay validated. Side effect: the origin slip's `is_refunded=True` removes it from `has_payslip`, so a later cancel elsewhere can release those entries ([hr_payslip.py:723-746](../enterprise/hr_payroll/models/hr_payslip.py#L723)) |
-| **Batch reset-to-draft** (`hr.payslip.run.action_draft`) | Writes `state='draft'` on slips **directly**, never releasing entries ([hr_payslip_run.py:250-266](../enterprise/hr_payroll/models/hr_payslip_run.py#L250)) — validated locks leak, and new entries on those days auto-conflict via check #4 |
-| **Batch generation** | The only path that hard-fails on conflicts: raises listing conflict intervals before creating slips ([hr_payslip_run.py:384-391](../enterprise/hr_payroll/models/hr_payslip_run.py#L384)) |
+- **As a `resource.calendar.leaves` row** — created by `_create_resource_leave()` on validation,
+  carrying `holiday_id`. This is what Layer 2 reads and subtracts from the schedule.
+- **As a time-rule source** — the leave record itself, which rules can split and reclassify.
 
-**When does a validated entry become editable again?** Three ways: the payslip releases it (above); someone writes `state='draft'` (the "Set to Draft" server action); or it's archived — `active=False` bypasses the guard and cancels the entry, even though *deleting* a validated entry is forbidden ([hr_work_entry.py:56-62](../enterprise/hr_payroll/models/hr_work_entry.py#L56)). Guard weakness: any truthy `state` key in a write smuggles other field changes past the validated lock. Note the "Set to Draft" server action ships in community views but its method exists only in enterprise `hr_payroll` — community-only installs would crash it.
+A rule splitting a day-unit leave sets `is_time_rule_trimmed`
+([hr_leave.py:286](../addons/hr_holidays/models/hr_leave.py#L286)) so that
+`_compute_date_from_to` does not snap the trimmed end back to the schedule boundary; the form
+then shows a `HH:MM → HH:MM` range instead of a whole day
+([_compute_time_rule_time_range:297](../addons/hr_holidays/models/hr_leave.py#L297)).
+The `_time_rule_write_ctx` on `hr.leave`
+([hr_leave.py:81](../addons/hr_holidays/models/hr_leave.py#L81)) is a long list of skip flags —
+that is the engine writing leaves without re-firing approvals, date checks or the overlap
+constraint. Whenever you write leaves programmatically near this engine, you need the same flags.
 
----
+After applying leave output, `_create_resource_leave()` is re-run on sources *and* new records so
+the calendar view of Layer 2 stays consistent
+([hr_time_rule.py:242](../addons/hr_holidays/models/hr_time_rule.py#L242)).
 
-## The Bridges in Depth
+### Public holidays / global time off
 
-### Time off (`hr_work_entry_holidays`)
+A `resource.calendar.leaves` with no `resource_id` gets its type computed to the country's
+`006.00` "Public holiday", falling back to the generic one
+([resource_calendar_leaves.py:18](../addons/hr_work_entry/models/resource_calendar_leaves.py#L18)).
+In type resolution, a global calendar leave beats an employee leave for the same interval unless
+a country bypass code applies
+([hr_version.py:288](../addons/hr_holidays/models/hr_version.py#L288)). Rules can be told to
+ignore public holidays with `apply_on_public_holidays=False`, which subtracts the holiday days
+from the rule's window ([_build_rule_day_intervals:534](../addons/hr_work_entry/models/hr_time_rule.py#L534)).
+Balance-side treatment (`include_public_holidays_in_duration`) and the company/timezone matrix
+are in [`public_holidays_flow.md`](public_holidays_flow.md) — **note that doc still describes the
+v19 architecture.**
 
-Leave type → `work_entry_type_id` on `hr.leave.type`; validation creates a `resource.calendar.leaves` carrying that type, then immediately materializes entries — but **only inside the version's already-generated window** ([hr_leave.py:45](../addons/hr_work_entry_holidays/models/hr_leave.py#L45)); outside it, nothing happens now and the entries appear later via normal generation. Existing entries fully covered by the leave are archived; partial overlaps just lose their `leave_id`. Validated entries are never touched at approve time — the new leave entries instead land in `conflict` via check #4.
+### Overtime → time off (`hr_holidays_attendance`)
 
-| Leave event | Entries |
-|---|---|
-| Validate | Leave-type entries created (window-gated), covered entries archived |
-| Refuse | **All** linked entries deactivated — *including validated (already-paid) ones* ([hr_leave.py:151-165](../addons/hr_work_entry_holidays/models/hr_leave.py#L151)); attendance entries re-created for those days |
-| Cancel (by user) | Same regen — but blocked upfront if any validated entry links to the leave ([hr_leave.py:167-175](../addons/hr_work_entry_holidays/models/hr_leave.py#L167)). Refuse has **no such guard**: the asymmetry is the payroll-integrity hole |
-| Reset to confirm | Same regen as refuse — archives all linked entries (validated included) and rebuilds attendance ([hr_leave.py:141-144](../addons/hr_work_entry_holidays/models/hr_leave.py#L141)) |
-| Delete | Entries untouched, `leave_id` nulled — an admin deleting a validated leave leaves orphan leave-type entries |
-
-The choreography also runs backwards: **cancelling a leave-linked work entry refuses the whole leave** — writing `state='cancelled'` on any entry with a `leave_id` calls `action_refuse()` on the leave ([hr_work_entry.py:15-18](../addons/hr_work_entry_holidays/models/hr_work_entry.py#L15)), which then archives *all* the leave's entries and rebuilds attendance. Conflict entries carrying a leave expose Approve/Refuse Time Off buttons directly on the work-entry form so the officer can resolve the leave from the calendar (buttons: `hr_work_entry_holidays_enterprise`, a views-only module, [hr_work_entry_views.xml:9-13](../enterprise/hr_work_entry_holidays_enterprise/views/hr_work_entry_views.xml#L9); methods live in community [hr_work_entry.py:25-34](../addons/hr_work_entry_holidays/models/hr_work_entry.py#L25)). Leave create/write themselves run inside the work-entry conflict engine over the leave span ±1 day ([hr_leave.py:89-121](../addons/hr_work_entry_holidays/models/hr_leave.py#L89)), and resetting an entry from conflict clears `leave_id` on attendance-type entries ([hr_work_entry.py:20-23](../addons/hr_work_entry_holidays/models/hr_work_entry.py#L20)).
-
-Type resolution priority per interval ([hr_version.py:29-61](../addons/hr_work_entry_holidays/models/hr_version.py#L29)): bypass-coded leave > **global public holiday > employee leave** > generic fallback. "Bypass codes" come from `_get_bypassing_work_entry_type_codes` overrides — country lists of leave codes that beat public holidays (BE: long-term sick; base: empty).
-
-Public-holiday balance treatment is separate: `include_public_holidays_in_duration=True` can make an employee leave consume the holiday even when work-entry priority still selects the public-holiday type. Public-holiday CRUD also reevaluates/auto-refuses employee leave without regenerating existing holiday entries; auto-refusal can deactivate validated leave entries. The complete source/company/timezone matrix is in [`public_holidays_flow.md`](public_holidays_flow.md). Work-entry generation has its own leave search using all enabled companies and lacks the resource interval engine's exact global-leave company pairing, so customization needs an exact-company filter.
-
-Half-day/hour leaves work by interval intersection with the schedule; leave-linked entries get their duration from theoretical calendar hours, not raw clock difference. Verified test behavior: a 2h leave 10-12 → 6h attendance + 2h leave lines on the same day.
-
-Enterprise `hr_payroll_holidays` adds the **defer flow**: a leave overlapping an already validated/paid slip gets `payslip_state='blocked'`, is excluded from work-entry generation entirely, and schedules an activity for the deferred-time-off manager; "Report to Next Month" converts next month's draft WORK100 entries into the leave's type (splitting entries for partial hours). Detail in [`hr_payroll.md`](hr_payroll.md) Time Off.
-
-Likely bug (unverified upstream): with 2+ overlapping versions, approve-time generation produces vals per version × whole recordset, and same-day/type vals merge-sum — durations can double ([hr_leave.py:43-49](../addons/hr_work_entry_holidays/models/hr_leave.py#L43)).
-
-### Attendance (`hr_work_entry_attendance`)
-
-- **All presence lands on WORK100** — hardcoded `env.ref` on every `hr.attendance` interval ([hr_version.py:205](../enterprise/hr_work_entry_attendance/models/hr_version.py#L205)). No config hook exists for plain presence.
-- **Open attendances (no check-out) are silently ignored** ([hr_version.py:127](../enterprise/hr_work_entry_attendance/models/hr_version.py#L127)).
-- Overtime: only `approved` overtime lines whose rules are `paid` become entries; the type comes from the rule (max-rate type in `max` mode; **one full-duration entry per paid rule in `sum` mode** — duplicated hours by design). Refused/pending overtime time is **carved out of WORK100 presence and not replaced** — that time is simply unpaid ([hr_version.py:173-185](../enterprise/hr_work_entry_attendance/models/hr_version.py#L173)). Overtime lines with no paid rules skip silently.
-- Calendar-source employees with a ruleset **also** get overtime entries ([hr_version.py:122](../enterprise/hr_work_entry_attendance/models/hr_version.py#L122)) — attendance source is not required for paid overtime.
-- Regeneration triggers: attendance create/write/unlink regenerate affected days; overtime approve/refuse regenerates via the wizard, but direct `status` write bypasses it. The linked-entry guard does **not** protect creation of a new attendance: check-out inside an already-generated day can archive overlapping predecessors, including validated entries, because `active=False` is allowed. Add a validated/paid-window create/close guard.
-- Direct entry creation from a check-out only happens inside the version's generated window ([hr_attendance.py:32](../enterprise/hr_work_entry_attendance/models/hr_attendance.py#L32)).
-
-### Planning (`hr_work_entry_planning`)
-
-- Only **published** slots generate entries; the slot's role is irrelevant — `planning.slot` has no `work_entry_type_id`, so **everything falls back to WORK100** ([hr_version.py:37-56](../enterprise/hr_work_entry_planning/models/hr_version.py#L37) + base fallback).
-- Multi-day slots split into equal per-day durations `allocated_hours / days` — **including non-working days** ([hr_version.py:58-77](../enterprise/hr_work_entry_planning/models/hr_version.py#L58)).
-- Public-holiday overlay uses the static calendar to price leave duration even though published shifts are the base source. A shift/calendar mismatch can remove a shift and produce fewer or zero holiday hours. `planning_holidays.write()` also watches `start_datetime/end_datetime` instead of the holiday's `date_from/date_to`, leaving shift allocated hours stale after a holiday move.
-- Publishing creates entries only if the slot lies inside the generated window. New publication can archive all work entries touched by the slot, including validated rows. Editing a published slot's times/hours never regenerates entries—only state changes do ([planning_slot.py:97-101](../enterprise/hr_work_entry_planning/models/planning_slot.py#L97)); falsy changes (`allocated_hours=0`, clear resource) can bypass the validated guard. Regenerate old+new spans and reject every affected validated/paid window.
+This is where "extra hours become leave" now lives. The attendance flavour of
+`_apply_attendance_output` pre-filters over-drawing deficits and then applies the allocation
+credits ([hr_time_rule.py:9](../addons/hr_holidays_attendance/models/hr_time_rule.py#L9)).
+Configure it on the rule: **Allocate <rate>% to <Time Off Type>**
+([hr_time_rule_views.xml:43](../addons/hr_holidays/views/hr_time_rule_views.xml#L43)). The
+allocation target must `requires_allocation` and be `time_off_selectable`; the *output* type must
+be the opposite — `requires_allocation = False`
+([hr_time_rule.py:22](../addons/hr_holidays/models/hr_time_rule.py#L22)).
 
 ---
 
-## Regeneration Wizard
+## Export
 
-The only tool that rebuilds already-generated dates (Work Entries calendar → Regenerate; also invoked internally by version edits, overtime approvals, attendance edits).
-
-- Clamped to the union of the employees' `[date_generated_from, date_generated_to]` — you cannot regenerate outside what was ever generated ([wizard:70-85](../addons/hr_work_entry/wizard/hr_work_entry_regeneration_wizard.py#L70)).
-- **An employee with any validated entry in the range is excluded entirely** — not just the validated days ([wizard:109](../addons/hr_work_entry/wizard/hr_work_entry_regeneration_wizard.py#L109)). This also applies to internally-triggered regenerations: a calendar change for a half-paid month silently regenerates nobody.
-- Force regeneration **archives** old non-validated entries (`active=False` → cancelled) and nulls bridge links (`attendance_id`, `planning_slot_id`) — history stays queryable; nothing is deleted.
-- A `slots` variant regenerates specific employee-days, grouped into contiguous ranges ([wizard:113-127](../addons/hr_work_entry/wizard/hr_work_entry_regeneration_wizard.py#L113)); it bypasses the normal wizard validation and calls force generation directly. Validated rows remain, replacements can become conflict. Its `record_ids` parameter is dead code.
+`hr.export.work.entries` ([hr_export_work_entries.py:11](../addons/hr_work_entry/wizard/hr_export_work_entries.py#L11))
+exports a month of the Layer-2 projection to a semicolon-separated file for external payroll
+providers: date, company, company external code, type name/code/external code, employee name and
+external code, duration in hours
+([_get_columns:84](../addons/hr_work_entry/wizard/hr_export_work_entries.py#L84)). It calls
+`generate_work_entries` directly ([:199](../addons/hr_work_entry/wizard/hr_export_work_entries.py#L199)) —
+no stored data involved. Reached from the Employees list cog menu
+([export_cog_menu.js](../addons/hr_work_entry/static/src/export_cog_menu/export_cog_menu.js)) or
+the list action ([hr_employee_views.xml:16](../addons/hr_work_entry/views/hr_employee_views.xml#L16)),
+downloaded through `/hr_work_entry/download/<company>/<export>`
+([main.py:7](../addons/hr_work_entry/controllers/main.py#L7)).
 
 ---
 
 ## Security & UI
 
-**ACLs:** HR Officer (`hr.group_hr_user`) can read/write/create entries but **not delete**; installing `hr_payroll` re-points the delete-capable ACL from system admins to `hr_payroll.group_hr_payroll_user` (an xmlid override, [hr_payroll ir.model.access.csv:27](../enterprise/hr_payroll/security/ir.model.access.csv)). Types: HR Officer read-only; HR/Payroll Manager full, but delete is blocked model-side (archive only). Record rules: **multi-company only — no own-employee restriction**; any HR officer sees all employees' entries in allowed companies. The type "multi-company" rule is actually country-based. `hr.user.work.entry.employee` (personal calendar filter) is vestigial in v19 — referenced nowhere outside its own definition.
+**Access** ([ir.access.csv](../addons/hr_work_entry/security/ir.access.csv)):
 
-**UI:** calendar view is month-scale only, quick-create disabled, with a multi-create popover, a split dialog (`action_split`: source ≥ 1h, split part strictly smaller), multi-select replace/reset/delete that filter out validated entries client-side, and the Regenerate button. List view has multi-edit. The form locks all fields when validated. Hazard: the form's clickable statusbar writes `state='validated'` **directly**, skipping `action_validate`'s conflict pass. Enterprise adds a Gantt view (`hr_work_entry_enterprise`).
+| Model | Who | Notes |
+|---|---|---|
+| `hr.work.entry.type` | HR Officer read; HR Manager CRUD; Payroll Manager CRUD ([hr_payroll ir.access.csv:19](../enterprise/hr_payroll/security/ir.access.csv#L19)); Time Off Manager CRUD, Time Off Employee read ([hr_holidays ir.access.csv:63](../addons/hr_holidays/security/ir.access.csv#L63)) | Restriction row limits visibility to types of the user's companies' countries plus country-less ones |
+| `hr.time.rule` | Attendance Officer CRUD ([hr_attendance ir.access.csv:7](../addons/hr_attendance/security/ir.access.csv#L7)); Time Off Manager CRUD, Time Off Officer read ([hr_holidays ir.access.csv:92](../addons/hr_holidays/security/ir.access.csv#L92)) | Restriction: own-company rules, or company-less rules of a matching country |
+| `hr.time.rule.allocation.log` | Time Off Manager CRUD, Officer read | Audit trail for allocation credits |
+| `hr.export.work.entries(.employee)` | HR Officer CRUD | Company restriction on the export |
 
-**Export mixin** (`hr.work.entry.export.mixin`, [hr_work_entry_export_mixin.py](../enterprise/hr_payroll/models/hr_work_entry_export_mixin.py)): abstract base for exporting a month of entries to external payroll providers (used by the Belgian secretariat sociaux modules + Italian SD Worx). Blocks export while conflict entries exist. Relevant to us only as a pattern if rs.ge-style monthly exports of worked time are ever needed.
+Note there is no `hr.time.rule` permission row for a pure payroll user — the rules are reachable
+only through the Attendance or Time Off groups.
 
----
+**Menus:**
+- Employees → Configuration → Working Schedules → **Time Types**
+  ([menuitems.xml:4](../addons/hr_work_entry/views/menuitems.xml#L4))
+- Payroll → Configuration → **Time Management** → Time Types / Working Schedules / Public Holidays
+  ([hr_payroll_menu.xml:79](../enterprise/hr_payroll/views/hr_payroll_menu.xml#L79))
+- Attendances → Configuration → **Automatic Rules** (Attendance Manager)
+- Time Off → Configuration → **Automatic Rules** (Time Off Manager)
 
-## Recipe: Custom Paid Work Entry Type (config only)
-
-Goal: monthly employee gets extra pay for specially-marked hours (e.g. "Evening Hours" at 125%).
-
-1. Payroll → Configuration → Work Entry Types → New: name "Evening Hours", code `EVENING`, `is_leave` off, **`is_extra_hours` on**, `amount_rate` 1.25, country empty.
-2. Enter hours manually in Work Entries (or from a custom source): date, duration, type Evening Hours — coexists with the normal Attendance entry of the same day up to 24h total.
-3. Payslip: the hours form their own line, paid `derived_rate × hours × 1.25` on top of the intact fixed wage — where `derived_rate = wage ÷ non-extra hours`.
-
-Limits of config-only: the rate is always *derived from the employee's own wage* (or `hourly_wage` for hourly employees) — an independent "X GEL/hour regardless of wage" or a per-day rate needs the custom module or a salary rule ([`payroll_wage_types.md`](payroll_wage_types.md) §5-6, §8).
+**There is no Work Entries screen.** You look at attendances and at time off. The rule form
+([hr_time_rule_views.xml:10](../addons/hr_work_entry/views/hr_time_rule_views.xml#L10)) is a
+sentence-shaped builder — "Exceed [8:00] the daily schedule ± [0:30] based on Employee Schedule,
+Mon–Fri, from 00:00 to 24:00 → Set Excess to Overtime, Allocate 100% to Compensatory".
+The Worked Days tab on the payslip remains a read-only projection
+([hr_payslip_views.xml:150](../enterprise/hr_payroll/views/hr_payslip_views.xml#L150)).
 
 ---
 
 ## Gotchas & Non-Obvious Behavior
 
-- **Day-based, not interval-based (v19).** date + duration; the old overlapping-interval conflict model is gone. Consequence: a manual/custom entry does **not** collide with an attendance or calendar entry on the same day — for attendance-source employees nothing blocks double pay on a day with both a check-in and a manual paid entry. Guard by process or constraint, not by trusting a conflict.
-- **Delta generation never revisits the middle.** Only the wizard (or `force=True`) rebuilds already-generated dates; version edits that matter trigger it, data fixes don't.
-- **Per-entry `amount_rate` is inert.** See Type Anatomy.
-- **Cron horizon** is current month + next month; payslips older than that generate on demand at payslip creation.
-- **Default type fallback:** a version's default entry type is its structure type's `default_work_entry_type_id`, falling back to global Attendance ([hr_version.py:275](../enterprise/hr_payroll/models/hr_version.py#L275)).
-- **Timesheet bridge is easier than previously documented.** Since a v19 work entry is (date, hours) — the same shape as a timesheet line — a timesheet→work-entry bridge no longer needs to invent clock times; it only needs type mapping, a validation gate, and dilution handling. This supersedes the "must invent datetimes" difficulty in [`payroll_wage_types.md`](payroll_wage_types.md) §7.7.
-- **Payslip validation of entries can fail silently.** `action_payslip_done` ignores `action_validate()`'s failure — the slip ends validated while its entries sit in conflict. Only batch generation hard-fails on conflicts.
-- **Leave refusal deactivates already-paid entries** while user-cancellation is guarded against exactly that. Refusing a leave inside a validated payslip period silently invalidates paid time.
-- **Nothing splits attendance presence** — WORK100 for everything (attendance *and* planning sources). The only automatic multi-type sources are the working schedule's per-line types and overtime rulesets.
-- **Normal regeneration excludes whole employees with validated entries in range** and is clamped to the generated window. Internal `slots=` regeneration bypasses that protection and can create replacements beside validated rows.
-- **Statusbar direct-validation skips conflict checks** — a user clicking "In Payslip" on the form bypasses `action_validate`.
-- **`hr_work_entry_no_check` context flag disables the whole conflict engine** ([hr_work_entry.py:305](../addons/hr_work_entry/models/hr_work_entry.py#L305)) — useful in migrations, dangerous anywhere else.
-- **Fully flexible + calendar source = silently zero payslip.** No calendar → generation emits duration-0 vals which are dropped at merge → zero entries; the payslip additionally skips generation entirely for calendar-less versions (`filtered('resource_calendar_id')`, [hr_payslip.py:1441](../enterprise/hr_payroll/models/hr_payslip.py#L1441)); the coverage check never fires on an empty set → BASIC = 0 with no error. The only signal is the `work_entry_source_calendar_invalid` banner ([hr_version.py:34-42](../addons/hr_work_entry/models/hr_version.py#L34)) — advisory, blocks nothing. `hr.version.resource_calendar_id` has **no default**, so this state is one blank field away.
-- **Custom-injected work entries are second-class citizens.** The generation engine's only sources are calendar/attendance/planning/leaves. Entries created by custom code (or manually) survive normal delta generation (the middle is never revisited) but are **archived and never recreated** by force regeneration, and leave approval archives any entry fully covered by the leave's day interval. Custom pay flows should pay via salary rules reading their own model, not by injecting entries — unless they also make themselves a real generation source.
-- **The Worked Days tab is a pure projection**: `create="0" delete="0"`, all pricing columns readonly ([hr_payslip_views.xml:171-184](../enterprise/hr_payroll/views/hr_payslip_views.xml#L171)). Nothing enters it without a work entry type; manual corrections go through work entries or the `edited` flag, never the tab.
+- **Rules mutate your source data, permanently.** An `exceed` rule rewrites the attendance's own
+  `work_entry_type_id` and end time, then creates children. There is no "cancel rule" button and
+  no archive of what the record looked like before. Test a rule on a copy of production data.
+- **Only validated sources are seen.** A draft attendance or an unapproved leave is invisible to
+  both the rule engine and the payslip. With `attendance_validation='no_validation'` (the
+  default) everything is validated on create, so this bites only on databases that turned
+  validation on.
+- **Attendances beat the schedule on any day they exist**, even for a calendar-based version,
+  because `hr_holidays_attendance` knocks the whole local day out of the theoretical schedule.
+  One 2-hour badge on an 8-hour scheduled day produces 2 paid hours, not 8.
+  `attendance_based` only governs days with no attendance at all.
+- **No generation cron, no pre-generated data.** Nothing exists until a payslip (or the export
+  wizard) asks. Correspondingly there is nothing to "regenerate" and nothing to fix after the
+  fact — you fix the attendance or the leave.
+- **Week rules are cron-only for undertime.** `_trigger_time_rules_for_affected` deliberately
+  runs only `exceed` week rules on save, because charging a weekly deficit while the user is
+  still entering the week's data would create spurious records
+  ([hr_time_rule_source_mixin.py:326](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L326)).
+- **Reversing an allocation credit can raise.** If a rule granted compensatory days and the
+  employee already took them, editing the originating attendance raises a `ValidationError`
+  naming the record, the employee and the manager
+  ([hr_time_rule.py:267](../addons/hr_holidays/models/hr_time_rule.py#L267)). Expect this to
+  surface as "I can't fix a typo in an old attendance".
+- **Rule order is global, not per-source.** Rules are evaluated in `sequence, id` order across
+  the whole applicable set, and each one sees the previous ones' output. Localisation data uses
+  this deliberately (Indonesia: the ">9 h at 200%" rule has the lower sequence so it wins the
+  overlap with ">8 h at 150%"). Inserting a rule in the middle of a shipped stack changes the
+  meaning of the rules after it.
+- **`condition_work_entry_type_ids` is required and defaults to the company's attendance type**
+  ([hr_time_rule.py:9](../addons/hr_attendance/models/hr_time_rule.py#L9)). A rule with the wrong
+  input type silently matches nothing — there is no warning.
+- **A rule with no output type is still a rule.** It does not reclassify, but it can still attach
+  premium-pay categories and allocate leave. That is the `_get_source_annotation_vals` path
+  ([hr_time_rule.py:667](../addons/hr_work_entry/models/hr_time_rule.py#L667)).
+- **`hr.time.rule.amount_rate` is display only** — a stored mirror of the output type's rate
+  ([hr_time_rule.py:305](../addons/hr_work_entry/models/hr_time_rule.py#L305)). Editing it on the
+  rule changes no money. Change the type's rate, or point the rule at a different type.
+- **`skip_time_rules` disables the entire engine.** Useful for migrations and bulk fixes,
+  dangerous everywhere else — records written under it are never evaluated, and nothing re-queues
+  them.
+- **Breaks are prorated, not subtracted whole.** `break_duration` is spread across whatever
+  fraction of the attendance falls inside the rule's timing window
+  ([hr_time_rule.py:790](../addons/hr_work_entry/models/hr_time_rule.py#L790)) — a narrow night
+  window on a long shift absorbs only its share.
+- **Custom time sources are a real option again.** Because the classification lives on records
+  implementing `hr.time.rule.source.mixin`, a custom model can plug in by declaring the four
+  `_time_rule_*` attributes and implementing `_get_time_rule_output_vals`,
+  `_get_time_rule_remainder_vals` and `_get_time_rule_deficit_occupied`
+  ([hr_time_rule_source_mixin.py:21](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L21)).
+  Getting hours onto the **payslip**, though, additionally means overriding
+  `_get_version_work_entries_values` — the projection only knows about the calendar, calendar
+  leaves and (via `hr_holidays_attendance`) attendances.
+- **Multi-company generation is loose.** `_get_leave_domain` searches calendar leaves with
+  `company_id in [False] + version.company_id.ids`
+  ([hr_version.py:60](../addons/hr_work_entry/models/hr_version.py#L60)) without the resource
+  engine's exact company/calendar pairing; a customisation that needs strict scoping must add its
+  own filter.
+- **`hr.user.work.entry.employee` is dead weight.** It survived the rewrite but nothing outside
+  its own definition and ACL references it.
 
 ---
 
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
-- [`payroll_wage_types.md`](payroll_wage_types.md) — how the aggregated lines become money; wage-type extension design
-- [`attendance_work_entry.md`](attendance_work_entry.md) — the attendance/overtime source in depth
-- [`hr_payroll.md`](hr_payroll.md) — payslip lifecycle, blockers, accounting
+- [`attendance_work_entry.md`](attendance_work_entry.md) — the attendance source and the rule
+  engine from the attendance side (also verified against v20)
+- [`hr_payroll.md`](hr_payroll.md) — payslip lifecycle, pay-run warnings, accounting.
+  **Its appendices (A/B/C, crons, key-methods map) still describe the v19 work-entry model.**
+- [`payroll_wage_types.md`](payroll_wage_types.md) — how the aggregated lines become money.
+  **Still written for v19: §3, §7.5–7.7, §8.2 and §10 describe removed modules and the
+  conflict engine.**
+- [`public_holidays_flow.md`](public_holidays_flow.md) — public holiday semantics.
+  **Still written for v19: "Flow B", the work-entry source matrix and the safety-gap table
+  describe removed machinery.**

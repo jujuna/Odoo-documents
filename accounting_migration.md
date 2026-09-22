@@ -1,10 +1,12 @@
-# Odoo 19 Accounting Migration Tutorial
+# Odoo 20 Accounting Migration Tutorial
 
-> Audience: Accounting and implementation teams migrating from another accounting system (QuickBooks, Xero, Sage, SAP, 1C, custom ERP) to Odoo 19.
+> Audience: Accounting and implementation teams migrating from another accounting system (QuickBooks, Xero, Sage, SAP, 1C, custom ERP) to Odoo 20.
 >
 > Goal: Start Odoo with correct Balance Sheet, P&L, Aged Receivable/Payable, inventory valuation, and fixed assets on day one.
 >
 > Scope: How to import opening balances and open accounting data, what can go wrong, and how to prevent it.
+>
+> Odoo version: **20.0**. Sections 3.9, 3.10, Step 5 and Step 6 cover mechanics that changed between 19 and 20 — see [What Changed Between Odoo 19 and Odoo 20](#16-what-changed-between-odoo-19-and-odoo-20) for the full delta.
 
 ---
 
@@ -13,7 +15,7 @@
 By the end of this tutorial you will know:
 
 - Which migration approach to choose (opening only, opening + open items, mid-year, full history).
-- How Odoo 19 opening balances actually work internally.
+- How Odoo 20 opening balances actually work internally.
 - The exact import sequence that avoids double counting.
 - How to handle AR/AP, inventory, banks, fixed assets, and multi-currency safely.
 - Which validation checks must pass before go-live.
@@ -36,44 +38,36 @@ This tutorial is built for **Case B**, with notes for A/C/D.
 
 ---
 
-## 3) How Odoo 19 Opening Balances Really Work (Critical)
+## 3) How Odoo 20 Opening Balances Really Work (Critical)
 
-These mechanics come directly from Odoo 19 source.
+These mechanics come directly from Odoo 20 source.
 
 ### 3.1 One company opening move is used by opening fields
 
 Odoo company has:
 
-- `account_opening_move_id`
-- `account_opening_date`
-
-Source:
-- `addons/account/models/company.py` (`account_opening_move_id`, `account_opening_date`)
+- `account_opening_move_id` — [company.py:175](../addons/account/models/company.py#L175)
+- `account_opening_date` — [company.py:177](../addons/account/models/company.py#L177)
 
 When opening balances are set through account fields (`opening_debit` / `opening_credit`), Odoo creates/updates **one move** linked to `account_opening_move_id`.
 
+In Odoo 20 `account_opening_date` defaults to **today** (`default=lambda self: fields.Date.today()`). In 19 it had no default. Practical effect: a fresh database already has an opening date, so the opening move lands on *yesterday* unless you set the real cut-off date first. Set `account_opening_date` before the first `opening_debit`/`opening_credit` import.
+
 ### 3.2 Opening move date is opening date minus 1 day
 
-Source:
-- `res.company._get_default_opening_move_values()` in `addons/account/models/company.py`
+Source: [`_get_default_opening_move_values() — company.py:949`](../addons/account/models/company.py#L949)
 
 If `account_opening_date = 2025-01-01`, opening move date becomes `2024-12-31`.
 
 ### 3.3 Opening field imports are batched, then one update is done
 
-Source:
-- `account.account._set_opening_debit_credit()`
-- `account.account._load_precommit_update_opening_move()`
-- `addons/account/models/account_account.py`
+Source: [`_set_opening_debit_credit() — account_account.py:736`](../addons/account/models/account_account.py#L736), [`_load_precommit_update_opening_move() — account_account.py:955`](../addons/account/models/account_account.py#L955)
 
 Odoo stores import values in precommit memory and updates the opening move once per transaction. This is why opening balance CSV import performs reasonably even on larger COA.
 
 ### 3.4 If opening move is unbalanced, Odoo inserts balancing line
 
-Source:
-- `res.company._update_opening_move()`
-- `res.company.get_unaffected_earnings_account()`
-- `addons/account/models/company.py`
+Source: [`_update_opening_move() — company.py:1009`](../addons/account/models/company.py#L1009), [`get_unaffected_earnings_account() — company.py:977`](../addons/account/models/company.py#L977)
 
 Difference is posted to `equity_unaffected` ("Undistributed Profits/Losses" / current year earnings bucket).
 
@@ -83,17 +77,30 @@ Practical meaning:
 
 ### 3.5 Once opening move is posted, opening field import is blocked
 
-Source:
-- `res.company._update_opening_move()` in `addons/account/models/company.py`
+Source: [`_update_opening_move() — company.py:1009`](../addons/account/models/company.py#L1009), guard message at [company.py:1022](../addons/account/models/company.py#L1022)
 
 You must reset opening move to draft before changing `opening_debit/opening_credit`.
 
-### 3.6 Receivable/payable accounts are always reconcilable
+Odoo 20 adds a **Validate and Post** button directly in the opening-balance list view (`account.init_accounts_tree`), calling `account.account.action_validate_opening_move()`. It is irreversible from that screen and affects the active company only.
+Source: [`action_validate_opening_move() — account_account.py:1184`](../addons/account/models/account_account.py#L1184), [`init_accounts_tree — setup_wizards_view.xml:89`](../addons/account/wizard/setup_wizards_view.xml#L89)
 
-Source:
-- `account.account._check_reconcile()` in `addons/account/models/account_account.py`
+### 3.6 Receivable/payable accounts are always reconcilable — but `reconcile` means something narrower in Odoo 20
 
-For `asset_receivable` and `liability_payable`, `reconcile` must be true.
+The constraint is unchanged: for `asset_receivable` and `liability_payable`, `reconcile` must be true.
+Source: [`_check_reconcile() — account_account.py:34`](../addons/account/models/account_account.py#L34)
+
+What changed is the **meaning** of the flag:
+
+| | Odoo 19 | Odoo 20 |
+|---|---|---|
+| Label | "Allow Reconciliation" | "Payment Reconciliation" |
+| Help | "allows invoices & payments matching of journal items" | "used in bank reconciliation. Currency rate difference entries will be automatically created if needed" |
+| Toggling it | rewrote `amount_residual` on every open line (`_toggle_reconcile_to_true/false`) | no side effect — both helpers were removed |
+| Blocks manual matching? | effectively yes | **no** — `_check_amls_exigibility_for_reconciliation()` only checks same account + same company root |
+
+Source: [`reconcile — account_account.py:112`](../addons/account/models/account_account.py#L112), [`_check_amls_exigibility_for_reconciliation() — account_move_line.py:2969`](../addons/account/models/account_move_line.py#L2969)
+
+**Migration consequence:** you no longer have to pre-flip `reconcile` on clearing accounts before matching lines on them, and you no longer get the old "You cannot switch an account to prevent the reconciliation if some partial reconciliations are still pending" error (that message no longer exists in Odoo 20). Still set `reconcile = True` on AR/AP clearing accounts — the flag drives bank reconciliation and automatic FX-difference entries.
 
 ### 3.7 Import-time reconciliation tagging (`matching_number` with `I*` prefix)
 
@@ -104,7 +111,7 @@ When you import journal lines and want Odoo to reconcile them automatically afte
 
 Any `matching_number` set during import that does not start with `I` is automatically prefixed with `I` by Odoo's `_sanitize_vals()`.
 
-Source: [`_sanitize_vals() — account_move_line.py:1568`](../addons/account/models/account_move_line.py#L1568)
+Source: [`_sanitize_vals() — account_move_line.py:2063`](../addons/account/models/account_move_line.py#L2063)
 
 ```python
 vals['matching_number'] = f"I{vals['matching_number']}"
@@ -112,7 +119,7 @@ vals['matching_number'] = f"I{vals['matching_number']}"
 
 After all move lines with the same `matching_number` are posted, `_reconcile_marked()` processes them and performs real reconciliation:
 
-Source: [`addons/account/models/account_move_line.py:3012`](../addons/account/models/account_move_line.py#L3012)
+Source: [`_reconcile_marked() — account_move_line.py:3485`](../addons/account/models/account_move_line.py#L3485)
 
 ```python
 def _reconcile_marked(self):
@@ -131,9 +138,14 @@ for _matching_number, account, lines in self._read_group(
     ...
 ```
 
-Source: [`_reconcile_marked() — account_move_line.py:3024`](../addons/account/models/account_move_line.py#L3024)
+Source: [`_reconcile_marked() — account_move_line.py:3499`](../addons/account/models/account_move_line.py#L3499)
 
 This means: the same `matching_number` value on lines using **different** accounts will NOT reconcile together. All lines sharing a marker must be on the same AR or AP account.
+
+Two Odoo 20 changes here:
+
+- `_sanitize_vals()` accepts a `skip_matching_number_check` context key that suppresses the automatic `I` prefix. Use it only if you are writing a *real* matching number yourself; for imports, leave it off and let Odoo add the prefix.
+- `_reconcile_marked()` no longer flips `account.reconcile` to `True` behind your back. In Odoo 19 it logged "has reconciled lines, changing the config" and silently enabled the flag. Now the account config is left exactly as you imported it.
 
 **Practical use in migration:** If you import AR open items as journal lines and want to pre-mark which invoice lines offset which payment lines (from partial payments in the old system), assign matching `matching_number` values in your CSV. Odoo will reconcile them after posting. Ensure all lines with the same number use the same receivable/payable account.
 
@@ -141,7 +153,7 @@ This means: the same `matching_number` value on lines using **different** accoun
 
 When you open the Chart of Accounts via the onboarding dashboard button (before the opening move is posted), Odoo uses a custom list view with a domain filter that hides all accounts with `account_type = 'equity_unaffected'`.
 
-Source: [`addons/account/models/onboarding_onboarding_step.py:92`](../addons/account/models/onboarding_onboarding_step.py#L92)
+Source: [`action_open_step_chart_of_accounts() — onboarding_onboarding_step.py:79`](../addons/account/models/onboarding_onboarding_step.py#L79), domain at [line 93](../addons/account/models/onboarding_onboarding_step.py#L93)
 
 ```python
 # Hide the current year earnings account as it is automatically computed
@@ -154,6 +166,54 @@ domain = [
 This is intentional — the `equity_unaffected` balance is automatically computed by the balancing line logic in `_update_opening_move()`. You cannot (and should not) manually set its opening balance through the UI. If you set opening balances correctly, this account stays at zero in the opening move.
 
 After the opening move is posted, the COA button shows the normal list view with all accounts visible.
+
+### 3.9 The chart of accounts is now a tree — `account.group` is gone (Odoo 20)
+
+This is the single biggest COA change between 19 and 20, and it affects both your import file and your reports.
+
+| | Odoo 19 | Odoo 20 |
+|---|---|---|
+| Grouping mechanism | separate `account.group` model, matched by `code_prefix_start` / `code_prefix_end` ranges | `account.account.parent_id` — accounts are their own parents |
+| Model on account | `group_id` (computed from code prefixes) | `parent_id`, `parent_path`, `parent_ids` |
+| Storage | `_parent_store` on `account.group` | `_parent_store` on `account.account` |
+| Default `_order` | `code, placeholder_code` | `code_path, account_type, name_path` |
+| Report hierarchy filter | rebuilt lines from `account.group` prefix ranges | walks `account.account.parent_id` |
+
+Source: [`parent_id — account_account.py:133`](../addons/account/models/account_account.py#L133), [`_order / _parent_store — account_account.py:29`](../addons/account/models/account_account.py#L29), report side at [`_create_hierarchy() — account_report.py:1434`](../enterprise/account_reports/models/account_report.py#L1434)
+
+Consequences for migration:
+
+- **`account.group` records no longer exist.** Any legacy import file or script that created `account.group` rows will fail. Convert those groups into parent accounts.
+- **Parent accounts may have no code.** Odoo 20 dropped the "The code must be set for every company to which this account belongs" check from `_ensure_code_is_unique()`. A pure grouping account can carry a name and no code.
+  Source: [`_ensure_code_is_unique() — account_account.py:1089`](../addons/account/models/account_account.py#L1089)
+- **Import `parent_id` explicitly** if you want a hierarchy — it is not derived from the code. In a CSV, use `parent_id/id` (external ID) or `parent_id` (name match), and import parents before children.
+- `code_path` and `name_path` are computed ` / `-joined paths used for ordering and searching. You do not import them.
+- Account codes may now contain **dashes**: `ACCOUNT_CODE_REGEX` went from `^[A-Za-z0-9.]+$` to `^[A-Za-z0-9.-]+$`. A legacy chart using codes like `1100-01` imports as-is in Odoo 20 and would have been rejected in 19.
+  Source: [`ACCOUNT_CODE_REGEX — account_account.py:17`](../addons/account/models/account_account.py#L17)
+
+### 3.10 Creating a bank/cash account auto-creates a journal (Odoo 20)
+
+`account.account.create()` now calls `_create_default_journals()`. Every created account with `account_type` in `asset_cash` or `liability_credit_card` that is not already some journal's `default_account_id` gets a new `account.journal` (`bank` or `credit` type) named after the account.
+
+Source: [`_create_default_journals() — account_account.py:1129`](../addons/account/models/account_account.py#L1129)
+
+**Migration consequence:** importing a legacy chart with 12 bank/cash accounts silently creates 12 bank journals. Two ways to control this:
+
+- Pass `skip_auto_account_journal_creation` in the import context to skip the call entirely ([account_account.py:1052](../addons/account/models/account_account.py#L1052)), or `chart_template_load` to make `_create_default_journals()` return immediately ([account_account.py:1131](../addons/account/models/account_account.py#L1131)). Chart-template loading uses the latter, which is why installing a localization does not produce duplicate bank journals.
+- Or let it happen and clean up afterwards — but check journal codes and sequences before you post anything, because each new journal starts its own numbering.
+
+This also means the old advice "create the bank journal first, then point it at the account" is reversed in Odoo 20 for imports: create the account and let Odoo build the journal, then rename/recode it.
+
+### 3.11 Account-level stock accounts (Odoo 20)
+
+`account.account` gained two fields used by the new periodic inventory closing:
+
+- `account_stock_variation_id` — "At closing, register the inventory variation of the period into a specific account"
+- `account_stock_expense_id` — "Counterpart used at closing for accounting adjustments to inventory valuation"
+
+Source: [`account_account.py:156`](../addons/account/models/account_account.py#L156)
+
+Set these on your stock valuation account before Step 5 if the company runs periodic valuation (the Odoo 20 default). See Step 5.
 
 ---
 
@@ -236,7 +296,7 @@ Recommended properties:
 - Reconcilable: true for AR/AP clearing if you will reconcile lines.
 - **`tax_ids` must be empty.** If an account has default taxes configured, Odoo's `_compute_tax_ids()` will auto-apply those taxes to any invoice line using that account. Migration clearing accounts with taxes create unintended tax lines and distort your tax report.
 
-Source: [`_compute_tax_ids() — account_move_line.py:912`](../addons/account/models/account_move_line.py#L912), [`_get_computed_taxes() — account_move_line.py:921`](../addons/account/models/account_move_line.py#L921)
+Source: [`_compute_tax_ids() — account_move_line.py:1293`](../addons/account/models/account_move_line.py#L1293), [`_get_computed_taxes() — account_move_line.py:1302`](../addons/account/models/account_move_line.py#L1302)
 
 Why separate accounts:
 
@@ -447,15 +507,28 @@ After import:
 When Odoo posts a move, it checks whether the move date violates any lock date. If it does, **it silently shifts the move date forward** to the day after the lock date:
 
 ```python
+# _post()
 lock_dates = move._get_violated_lock_dates(move.date, affects_tax_report)
 if lock_dates:
-    move.date = move._get_accounting_date(..., lock_dates=lock_dates)
-# _get_accounting_date: invoice_date = lock_dates[-1][0] + timedelta(days=1)
+    move.date = move._get_accounting_date(move._get_accounting_date_source(), affects_tax_report, lock_dates=lock_dates)
+
+# _get_accounting_date()
+if lock_dates:
+    invoice_date = lock_dates[-1][0] + timedelta(days=1)
 ```
 
-Source: [`account_move.py:5580`](../addons/account/models/account_move.py#L5580), [`account_move.py:6473`](../addons/account/models/account_move.py#L6473)
+Source: [`_post() — account_move.py:6252`](../addons/account/models/account_move.py#L6252), [`_get_accounting_date() — account_move.py:7427`](../addons/account/models/account_move.py#L7427)
 
-**Consequence:** If you import AR invoices dated Dec 31, 2024 but a `fiscalyear_lock_date` of Dec 31, 2024 is already set, every invoice will post on Jan 1, 2025 — the wrong period.
+The shifted date is **not** simply "lock date + 1 day". Odoo moves the date into the first open period, then adjusts it so sequence numbering stays increasing:
+
+| Document | Sequence resets | Resulting date |
+|---|---|---|
+| Sale document | monthly (or no sequence yet) | `min(today, end of month of lock_date + 1)` |
+| Sale document | yearly | `min(today, end of year of lock_date + 1)` |
+| Other (bills, misc) | monthly | end of month if that month is already past, else `max(date, today)` |
+| Other | yearly | Dec 31 if that year is already past, else `max(date, today)` |
+
+**Consequence:** If you import AR invoices dated Dec 31, 2024 but a `fiscalyear_lock_date` of Dec 31, 2024 is already set, every invoice posts in January 2025 (or later) — the wrong period, and silently.
 
 **Required: before any import step**, verify that no lock date covers your migration cut-off dates. Lock dates must be either unset or set to a date before your oldest migration entry.
 
@@ -550,47 +623,78 @@ Import payable line details with partner and due date, counterpart to `MIG_AP_CL
 
 ### Step 5 - Import inventory opening quantities and valuation
 
-### 5.1 Understand when accounting entries are created
+### 5.0 Odoo 20 default is PERIODIC valuation — read this first
 
-Inventory journal entries are only created when **all four** conditions are met simultaneously:
+In Odoo 20 the valuation configuration moved up to the company and **defaults to periodic**:
+
+| Field on `res.company` | Default | Meaning |
+|---|---|---|
+| `inventory_valuation` | `periodic` | `periodic` = "Periodic (at closing)", `real_time` = "Perpetual (at invoicing)" |
+| `cost_method` | `standard` | `standard` / `average`; `stock_account` adds `fifo` |
+| `account_stock_valuation_id` | — | default stock valuation account |
+| `account_stock_journal_id` | — | default journal for stock entries |
+| `inventory_period` | `manual` | `manual` / `daily` / `monthly` — how often the closing entry is generated |
+
+Source: [`company.py:343-365`](../addons/account/models/company.py#L343)
+
+`product.template.valuation` and `cost_method` are now **computed**, resolving in this order: product category property → company default.
+Source: [`valuation` / `cost_method` — account/models/product.py:108](../addons/account/models/product.py#L108), [`_compute_valuation() — product.py:197`](../addons/account/models/product.py#L197), [`_compute_cost_method() — product.py:209`](../addons/account/models/product.py#L209)
+
+Note the module move: in Odoo 19 these fields lived in `stock_account/models/product.py`. In Odoo 20 `property_valuation`, `property_cost_method`, `property_stock_valuation_account_id`, `property_stock_journal` and the computed `valuation` / `cost_method` are defined in **`account/models/product.py`**, because periodic closing works even without `stock` installed.
+
+**What this changes for migration:** on a fresh Odoo 20 database, importing inventory produces **no accounting entries at all** unless you explicitly switch the company (or the product category) to `real_time`. That is not a bug — it is the new default. Decide up front:
+
+| Decision | What you do in Step 5 |
+|---|---|
+| Keep periodic (default) | Load quantities only. Carry the opening inventory value through the opening TB on the real stock account. No `MIG_STOCK_CLEAR` needed. Run the first closing entry after go-live. |
+| Switch to perpetual | Set `inventory_valuation = 'real_time'` **before** any stock move, configure valuation accounts, then follow 5.1 below with `MIG_STOCK_CLEAR`. |
+
+Under periodic valuation, Odoo generates the stock entry at closing, not per move:
+
+- `res.company.action_close_stock_valuation()` builds the closing journal entry — [company.py:1278](../addons/account/models/company.py#L1278)
+- `_cron_post_stock_valuation()` runs it automatically for companies with `inventory_period` in `daily` / `monthly` — [company.py:1447](../addons/account/models/company.py#L1447), cron record [`service_cron.xml:23`](../addons/account/data/service_cron.xml#L23)
+- The variation and expense counterparts come from `account.account.account_stock_variation_id` / `account_stock_expense_id` (see 3.11)
+
+**Do not run a closing before the opening move is posted and validated.** `action_close_stock_valuation()` refuses to generate an entry dated before an existing closing ("It exists closing entries after the selected date"), so an accidental early closing is painful to unwind.
+
+### 5.1 When real-time accounting entries are created
+
+With `real_time` valuation, inventory journal entries are created only when **all five** conditions hold:
 
 ```python
 def _should_create_account_move(self):
-    return (
-        self.product_id.is_storable
-        and self.is_valued
-        and (self.location_dest_id.valuation_account_id or self.location_id.valuation_account_id)
-        and self.product_id.valuation == 'real_time'
-    )
+    self.ensure_one()
+    return self.product_id.is_storable and self.is_valued\
+    and (self.location_dest_id.valuation_account_id or self.location_id.valuation_account_id)\
+    and not self.uom_id.is_zero(self.quantity)\
+    and self.product_id.valuation == 'real_time'
 ```
 
-Source: [`_should_create_account_move() — stock_account/models/stock_move.py:616`](../addons/stock_account/models/stock_move.py#L616)
+Source: [`_should_create_account_move() — stock_account/models/stock_move.py:756`](../addons/stock_account/models/stock_move.py#L756)
 
 | Condition | What it means |
 |---|---|
-| `product_id.is_storable` | Product type must be "Storable Product" (not consumable or service) |
-| `is_valued` | The move must be a valued move (receipt/delivery, not internal unless configured) |
+| `product_id.is_storable` | Product must be a goods product tracked in inventory (not consumable or service) |
+| `is_valued` | Move must be `is_in`, `is_out` or `is_dropship` |
 | `location.valuation_account_id` | Source or destination location must have a valuation account set |
-| `product_id.valuation == 'real_time'` | Product costing method must be Automated (not Manual/Periodic) |
+| `not uom_id.is_zero(quantity)` | **New in Odoo 20** — zero-quantity moves are skipped outright |
+| `product_id.valuation == 'real_time'` | Resolved from category, then company (see 5.0) |
 
 If any condition is false, no accounting entry is created — the inventory count creates stock lines but has zero financial impact.
 
 **Critical: value is resolved in this fallback order:**
 
-1. Manual value override
-2. Invoice/Bill amount (if a related purchase order or sale order exists)
-3. Production cost
-4. SO/PO quotation lines
-5. Returns from related moves
-6. `standard_price` at the time of the move
+1. Manual value override (`_get_manual_value`)
+2. Invoice/Bill amount (if a related purchase or sale document exists)
+3. SO/PO lines
+4. `standard_price` at the time of the move
 
-Source: [`_get_value_data() — stock_account/models/stock_move.py:313`](../addons/stock_account/models/stock_move.py#L313)
+Source: [`_get_value_data() — stock_account/models/stock_move.py:442`](../addons/stock_account/models/stock_move.py#L442)
 
 **Migration risk:** If products have `standard_price = 0` at the time the inventory adjustment is validated, all stock moves will be valued at 0. The `MIG_STOCK_CLEAR` account will not go to zero, and your inventory will appear on the balance sheet at zero value.
 
-**Required precheck before Step 5:** Set all product `standard_price` values to the correct opening cost *before* importing inventory quantities. For FIFO/AVCO products, also verify the costing method is correct before the first move.
-
-If valuation is periodic/manual, inventory counts do not create accounting entries — you manage the opening inventory value entirely through your opening TB entries.
+**Required precheck before Step 5:** Set all product `standard_price` values to the correct opening cost *before* importing inventory quantities. For FIFO/AVCO products, also verify the costing method is correct before the first move — changing `res.company.cost_method` afterwards triggers `_correct_inventory_valuation()`, which replays valuation from the last closing date.
+Source: [`ResCompany.write() — stock_account/models/res_company.py:18`](../addons/stock_account/models/res_company.py#L18)
 
 ### 5.2 Import physical stock
 
@@ -602,13 +706,11 @@ Use inventory adjustment import (`stock.quant`) with fields such as:
 - Lot/serial where needed
 - Optional accounting date
 
-Sources:
-- `addons/stock/models/stock_quant.py` (`action_apply_inventory`, `action_apply_all`)
-- `addons/stock_account/models/stock_quant.py` (`accounting_date`)
+Sources: [`action_apply_inventory() — stock_quant.py:465`](../addons/stock/models/stock_quant.py#L465), [`action_apply_all() — stock_quant.py:550`](../addons/stock/models/stock_quant.py#L550), [`accounting_date — stock_account/models/stock_quant.py:12`](../addons/stock_account/models/stock_quant.py#L12)
 
 ### 5.3 Valuation alignment
 
-For real-time valuation, stock moves generate account entries using stock valuation/interim/location valuation accounts depending on move path.
+For real-time valuation, stock moves generate account entries using the source and destination **location** valuation accounts (`stock.location.valuation_account_id`) — not a single global account.
 
 Do not assume one universal counterpart account.
 
@@ -618,37 +720,71 @@ Practical migration method:
 - If needed, map temporary counterpart to `MIG_STOCK_CLEAR` for migration period.
 - After import, verify inventory valuation report and GL stock valuation account.
 
+For periodic valuation, there is nothing to align per move. Instead:
+
+- Confirm `res.company.get_inventory_value()` (what the valuation report shows) matches the legacy inventory value at cut-off.
+- Confirm the opening TB stock balance matches that same number. The first closing entry then posts only genuine post-go-live movement.
+
 ### 5.4 Inventory control checks
 
 - Quantities match legacy physical count.
 - Stock valuation total matches legacy inventory value at cut-off.
-- `MIG_STOCK_CLEAR` is zero after final reclass/reconciliation.
+- `MIG_STOCK_CLEAR` is zero after final reclass/reconciliation (perpetual only).
+- Periodic only: no closing entry exists with a date on or before the opening date.
 
 ---
 
 ### Step 6 - Import fixed assets (Enterprise `account_asset`)
 
-Source model:
-- `enterprise/account_asset/models/account_asset.py`
+**Odoo 20 restructured this module.** An asset is no longer one flat record. Read 6.0 before building your import file.
+
+### 6.0 The three-model structure (new in Odoo 20)
+
+| Model | File | What it holds |
+|---|---|---|
+| `account.asset` | [account_asset.py](../enterprise/account_asset/models/account_asset.py) | The asset itself: name, cost, acquisition date, fixed-asset account, asset group, properties |
+| `account.asset.variant` | [account_asset_variant.py:25](../enterprise/account_asset/models/account_asset_variant.py#L25) | One depreciation *book* for that asset: state, journal, depreciation/expense accounts, `already_depreciated_amount_import`, `value_residual`, `book_value`, the depreciation move lines |
+| `account.depreciation.model` | [account_depreciation_model.py:14](../enterprise/account_asset/models/account_depreciation_model.py#L14) | Reusable method configuration: `method`, `method_number`, `method_period`, `method_progress_factor`, `prorata_computation_type`, `salvage_value_percent`, journal, ledger accounts |
+
+Every asset gets a `main_variant_id` created implicitly on `create()`. With multi-ledger companies (a company that has `account.journal.group` records), an asset can carry additional *ledger variants* — a second depreciation book in a secondary ledger, e.g. tax vs statutory depreciation.
+Source: [`AccountAsset.create() — account_asset.py:410`](../enterprise/account_asset/models/account_asset.py#L410), [`account_asset_ledger_variant.py`](../enterprise/account_asset/models/account_asset_ledger_variant.py)
+
+Practical consequences for an import:
+
+- `method`, `method_number`, `method_period` are **no longer writable on the asset**. On `account.asset.variant` they are `related='model_id.*'`, so the duration and method come from the depreciation model. You import `model_id`, not the individual method fields.
+- `account.asset.create()` splits your vals: keys matching `account.asset` fields stay on the asset, keys matching non-readonly non-related fields of `account.asset.variant` are forwarded to the main variant.
+  Source: [`_split_assets_variants_vals() — account_asset.py:446`](../enterprise/account_asset/models/account_asset.py#L446)
+- `account_depreciation_id` / `account_depreciation_expense_id` live on the variant. To seed them from a flat import file, Odoo 20 added two **import-only** (`store=False`) fields on `account.asset`:
+  `import_account_depreciation_id` and `import_account_depreciation_expense_id` — [account_asset.py:149](../enterprise/account_asset/models/account_asset.py#L149). `create()` copies them onto the main variant.
+- `salvage_value` is now computed from the model's `salvage_value_percent` (`store=True, readonly=False`), so it is still importable, but a value you import can be overwritten if the model's percentage recomputes. Its label is now "Not Depreciable Value".
+- `method` gained a `no_depreciation` option, and `account.depreciation.model` gained `method_mode` (`duration` vs `rate`) with `method_rate`.
+
+**Import order:** depreciation models → assets (with `model_id` + `import_account_*`) → verify each asset's main variant.
 
 ### 6.1 Key fields for migration
 
+On `account.asset`:
+
 - `name`
 - `original_value`
-- `salvage_value`
 - `acquisition_date`
-- `method`
-- `method_number`
-- `method_period`
 - `account_asset_id`
-- `account_depreciation_id`
-- `account_depreciation_expense_id`
+- `asset_group_id` (optional)
+- `import_account_depreciation_id`
+- `import_account_depreciation_expense_id`
+
+Forwarded to the main `account.asset.variant`:
+
+- `model_id` (required on the variant — points at an `account.depreciation.model`)
+- `already_depreciated_amount_import`
+- `salvage_value`
+- `prorata_date`, `prorata_computation_type` (if you need to override the model)
 
 ### 6.2 Critical field for legacy imports
 
 Use `already_depreciated_amount_import`.
 
-Source: [`enterprise/account_asset/models/account_asset.py:158`](../enterprise/account_asset/models/account_asset.py#L158)
+Source: [`account_asset_variant.py:127`](../enterprise/account_asset/models/account_asset_variant.py#L127) (exposed on the asset as a writable related field at [account_asset.py:128](../enterprise/account_asset/models/account_asset.py#L128))
 
 Field help text (from source): "In case of an import from another software, you might need to use this field to have the right depreciation table report. This is the value that was already depreciated with entries not computed from this model."
 
@@ -663,13 +799,16 @@ value_residual = original_value
                - sum(posted_depreciation_moves.depreciation_value)
 ```
 
-Source: [`_compute_value_residual()`](../enterprise/account_asset/models/account_asset.py#L320)
+Source: [`_compute_value_residual() — account_asset_variant.py:258`](../enterprise/account_asset/models/account_asset_variant.py#L258)
 
 This means: you keep the full historical cost in `original_value`, put legacy accumulated depreciation in `already_depreciated_amount_import`, and Odoo calculates the remaining schedule from there. You do **not** need to post years of historical depreciation entries.
 
 **Book value formula:**
 
-`book_value = value_residual + salvage_value`
+`book_value = value_residual + salvage_value + sum(children_ids.book_value)`
+
+(the `children_ids` term covers gross-value-increase sub-assets; it is zero for a plain imported asset)
+Source: [`_compute_book_value() — account_asset_variant.py:281`](../enterprise/account_asset/models/account_asset_variant.py#L281)
 
 If your asset had cost $100,000, salvage $5,000, and $40,000 already depreciated:
 - `original_value` = 100,000
@@ -821,7 +960,10 @@ WHERE company_id = YOUR_COMPANY_ID
   AND parent_state = 'posted';
 ```
 
-`amount_residual` is a stored computed field on `account.move.line` ([account_move_line.py:241](../addons/account/models/account_move_line.py#L241)). It reflects the unreconciled balance after partial reconciliations.
+`amount_residual` is a stored computed field on `account.move.line` ([account_move_line.py:280](../addons/account/models/account_move_line.py#L280)). It reflects the unreconciled balance after partial reconciliations.
+
+Odoo 20 adds `residual_at_date` / `residual_currency_at_date` — the residual **as of a given date**, computed in SQL from the partial reconciliations whose `max_date` falls on or before that date. It is what the Aged Receivable/Payable reports now read, so use it when you want an as-of-cut-off comparison rather than a today comparison. It only differs from `amount_residual` when the `recon_limit` context key is set (the `open_on` field sets it).
+Source: [`residual_at_date — account_move_line.py:328`](../addons/account/models/account_move_line.py#L328), [`_compute_sql_residual_at_date() — account_move_line.py:1120`](../addons/account/models/account_move_line.py#L1120)
 
 ---
 
@@ -831,25 +973,26 @@ WHERE company_id = YOUR_COMPANY_ID
 
 Post only after all controls pass.
 
-### 10.2 Lock dates in Odoo 19
+### 10.2 Lock dates in Odoo 20
 
-Odoo lock fields are:
+Unchanged from 19. The four soft locks plus one hard lock:
 
-- `fiscalyear_lock_date`
+- `fiscalyear_lock_date` (labelled "Global Lock Date")
 - `tax_lock_date`
 - `sale_lock_date`
 - `purchase_lock_date`
 - `hard_lock_date`
 
-Source:
-- `LOCK_DATE_FIELDS` in `addons/account/models/company.py`
+Source: [`SOFT_LOCK_DATE_FIELDS` / `LOCK_DATE_FIELDS` — company.py:60](../addons/account/models/company.py#L60)
+
+For branches, the effective lock date is the **maximum across the company and all its ancestors**, minus any active `account.lock_exception` for the current user.
+Source: [`_get_user_lock_date() — company.py:749`](../addons/account/models/company.py#L749)
 
 ### 10.3 Hard lock warning
 
 `hard_lock_date` cannot be removed or moved backwards.
 
-Source:
-- `res.company._validate_locks()` in `addons/account/models/company.py`
+Source: [`_validate_locks() — company.py:694`](../addons/account/models/company.py#L694)
 
 When setting lock dates, Odoo can block you if there are draft entries or unreconciled bank statement lines up to that date. Clean those first.
 
@@ -912,41 +1055,48 @@ Odoo provides built-in Excel import templates. Download them via the **Import** 
 
 ### Template paths in source
 
-| Template | UI path | File path | Use for |
+| Template (Odoo 20 label) | UI path | File path | Use for |
 |---|---|---|---|
-| Chart of Accounts | Accounting → Configuration → Chart of Accounts → Import | `/account/static/xls/coa_import_template.xlsx` | `opening_debit/opening_credit` import |
-| Journal Items (AML) | Accounting → Accounting → Journal Items → Import | `/account/static/xls/aml_import_template.xlsx` | Misc journal entry lines |
-| Misc Operations (Journal Entries) | Accounting → Accounting → Journal Entries → Import | `/account/static/xls/misc_operations_import_template.xlsx` | Full journal entry import |
-| Customer Invoices / Credit Notes | Accounting → Customers → Invoices → Import | `/account/static/xls/customer_invoices_credit_notes_import_template.xlsx` | AR open items (invoice pattern) |
-| Vendor Bills / Refunds | Accounting → Vendors → Bills → Import | `/account/static/xls/vendor_bills_refunds_import_template.xlsx` | AP open items (bill pattern) |
+| Template for Chart of Accounts | Accounting → Configuration → Chart of Accounts → Import | `/account/static/xls/coa_import_template.xlsx` | `opening_debit/opening_credit` import |
+| Template for Journal Items | Accounting → Accounting → Journal Items → Import | `/account/static/xls/aml_import_template.xlsx` | Misc journal entry lines |
+| Template for Misc. Operations | Accounting → Accounting → Journal Entries → Import | `/account/static/xls/misc_operations_import_template.xlsx` | Full journal entry import |
+| Template for Invoices / Credit Notes | Accounting → Customers → Invoices → Import | `/account/static/xls/customer_invoices_credit_notes_import_template.xlsx` | AR open items (invoice pattern) |
+| Template for Bills / Refunds | Accounting → Vendors → Bills → Import | `/account/static/xls/vendor_bills_refunds_import_template.xlsx` | AP open items (bill pattern) |
 
-Source: [`account_account.get_import_templates()`](../addons/account/models/account_account.py#L1152), [`account_move.get_import_templates()`](../addons/account/models/account_move.py#L7186), [`account_move_line.get_import_templates()`](../addons/account/models/account_move_line.py#L3353)
+`account.move.get_import_templates()` picks the template from `default_move_type` in the context, so the label you see depends on which list view you opened the import dialog from.
+
+Source: [`account_account.get_import_templates() — account_account.py:1198`](../addons/account/models/account_account.py#L1198), [`account_move.get_import_templates() — account_move.py:8252`](../addons/account/models/account_move.py#L8252), [`account_move_line.get_import_templates() — account_move_line.py:3839`](../addons/account/models/account_move_line.py#L3839)
 
 **How the importer matches column headers** (in priority order):
-1. Exact match on technical field name (case-insensitive) — e.g. `partner_id`
-2. Match on user-translated field label — e.g. `Customer`
-3. Match on English field label — e.g. `Partner`
+1. A mapping the user saved previously for this model
+2. Exact match on technical field name / English label / translated label
+3. Fuzzy match — word distance between the header and the field name or label, restricted to fields whose type is compatible with the column's detected data type
 
-Source: [`base_import.py:833–841`](../addons/base_import/models/base_import.py#L833)
+Source: [`_get_mapping_suggestion() — base_import.py:833`](../addons/base_import/models/base_import.py#L833)
 
-**Practical guidance:** Use the official Odoo template headers as-is. Do not rename columns. If you must use custom headers, match the English field label exactly. Technical names (`field_name`) and English UI labels both work — translated labels depend on the importer's language context.
+**Practical guidance:** Use the official Odoo template headers as-is. Do not rename columns. If you must use custom headers, use the technical field name — it is unambiguous and language-independent. Because step 3 is a *fuzzy* match, a mistyped header does not fail loudly; it silently maps to the nearest field. Always review the mapping screen before running the import.
 
 ---
 
 ## 12) Error Messages You Will Encounter
 
-These are exact error messages from Odoo 19 source. Knowing them saves diagnosis time.
+These are exact error messages from Odoo 20 source. Knowing them saves diagnosis time.
 
 | Message | Source location | When you see it | How to fix |
 |---|---|---|---|
-| "Please install a chart of accounts or create a miscellaneous journal before proceeding." | `company.py:809` | Trying to set opening balances before a general journal exists | Install COA first or create a Miscellaneous journal manually |
-| "You cannot import the 'openning_balance' if the opening move (%s) is already posted. If you are absolutely sure you want to modify the opening balance of your accounts, reset the move to draft." | `company.py:866` | Trying to write `opening_debit/opening_credit` after the opening entry is posted | Reset the opening entry to draft (Accounting Manager access required) |
-| "Incorrect fiscal year date: day is out of range for month." | `setup_wizards.py:41` | Setting fiscal year end to an invalid date (e.g., Feb 30) | Use a valid calendar date |
-| "You cannot have a receivable/payable account that is not reconcilable. (account code: %s)" | `account_account.py:23` | Trying to set `reconcile = False` on an AR/AP account | Do not change `reconcile` on these accounts — it is enforced |
-| "An Off-Balance account can not be reconcilable" | `account_account.py:174` | Setting `reconcile = True` on an `off_balance` account | Off-balance accounts cannot be reconciled |
-| "You cannot switch an account to prevent the reconciliation if some partial reconciliations are still pending." | `account_account.py:1034` | Trying to disable reconcile on an account that has unfinished reconciliations | Clear all partial reconciliations first |
-| "A temporary number can not be used in a real matching" | `account_move_line.py:1463` | Setting an `I*` matching number on a line that already has real partial reconciles | Do not mix import markers with real reconciled lines |
-| "There are still draft entries in the period you want to hard lock." | `company.py:573` | Setting hard lock date when draft entries exist up to that date | Post or delete all draft entries up to the lock date |
+| "Please install a chart of accounts or create a miscellaneous journal before proceeding." | [company.py:964](../addons/account/models/company.py#L964) | Trying to set opening balances before a general journal exists | Install COA first or create a Miscellaneous journal manually |
+| "You cannot import the 'openning_balance' if the opening move (%s) is already posted. If you are absolutely sure you want to modify the opening balance of your accounts, reset the move to draft." | [company.py:1022](../addons/account/models/company.py#L1022) | Trying to write `opening_debit/opening_credit` after the opening entry is posted | Reset the opening entry to draft (Accounting Manager access required) |
+| "Incorrect fiscal year date: day is out of range for month. Month: %(month)s; Day: %(day)s" | [setup_wizards.py:39](../addons/account/wizard/setup_wizards.py#L39) | Setting fiscal year end to an invalid date (e.g., Feb 30) | Use a valid calendar date |
+| "You cannot have a receivable/payable account that is not reconcilable. (account code: %s)" | [account_account.py:38](../addons/account/models/account_account.py#L38) | Trying to set `reconcile = False` on an AR/AP account | Do not change `reconcile` on these accounts — it is enforced |
+| "An Off-Balance account can not be reconcilable" | [account_account.py:170](../addons/account/models/account_account.py#L170) | Setting `reconcile = True` on an `off_balance` account | Off-balance accounts cannot be reconciled |
+| "Bank & Cash accounts cannot be shared between companies." | [account_account.py:259](../addons/account/models/account_account.py#L259) | An `asset_cash` account imported with more than one company in `company_ids` | One bank/cash account per company — split the record |
+| "Account codes must be unique. You can't create accounts with these duplicate codes: %s" | [account_account.py:1126](../addons/account/models/account_account.py#L1126) | Two accounts with the same code in the same company branch | Deduplicate the import file; codes are checked across parent and child companies |
+| "The account code can only contain alphanumeric characters, dots, and dashes. (account code: %s)" | [account_account.py:293](../addons/account/models/account_account.py#L293) | Code contains spaces, slashes, etc. | Clean the legacy codes. Note dashes are now allowed (they were not in 19) |
+| "A temporary number can not be used in a real matching" | [account_move_line.py:1956](../addons/account/models/account_move_line.py#L1956) | Setting an `I*` matching number on a line that already has real partial reconciles | Do not mix import markers with real reconciled lines |
+| "There are still draft entries in the period you want to hard lock. You should either post or delete them." | [company.py:726](../addons/account/models/company.py#L726) | Setting hard lock date when draft entries exist up to that date | Post or delete all draft entries up to the lock date |
+| "It exists closing entries after the selected date. Cancel them before generate an entry prior to them" | [company.py:1283](../addons/account/models/company.py#L1283) | Running a periodic inventory closing dated before an existing one | Cancel the later closing entry first |
+
+**Removed in Odoo 20:** "You cannot switch an account to prevent the reconciliation if some partial reconciliations are still pending." The `_toggle_reconcile_to_false()` helper that raised it no longer exists — see 3.6.
 
 ---
 
@@ -971,7 +1121,9 @@ Recommended columns by file (minimum):
 - `opening_debit` and `opening_credit` — two separate columns, one per side
 - **or** `opening_balance` — single signed column: positive = debit, negative = credit
 
-`opening_balance` is a first-class field on `account.account` ([account_account.py:118](../addons/account/models/account_account.py#L118)). Using it reduces sign mistakes when your source data is already a signed net balance rather than split debit/credit columns.
+`opening_balance` is a first-class field on `account.account` ([account_account.py:145](../addons/account/models/account_account.py#L145)). Using it reduces sign mistakes when your source data is already a signed net balance rather than split debit/credit columns.
+
+Add `parent_id` if you are importing a hierarchical chart (see 3.9), and import parent rows before child rows.
 
 ### 13.2 AR open items (invoice pattern)
 
@@ -996,19 +1148,19 @@ Recommended columns by file (minimum):
 - `lot_id` (if tracked)
 - `accounting_date` (optional, with stock_account)
 
-### 13.5 Asset opening
+### 13.5 Asset opening (Odoo 20 column set)
 
 - `name`
 - `original_value`
+- `acquisition_date`
+- `account_asset_id`
+- `model_id` — the `account.depreciation.model` that carries `method` / `method_number` / `method_period`
 - `already_depreciated_amount_import`
 - `salvage_value`
-- `acquisition_date`
-- `method`
-- `method_number`
-- `method_period`
-- `account_asset_id`
-- `account_depreciation_id`
-- `account_depreciation_expense_id`
+- `import_account_depreciation_id`
+- `import_account_depreciation_expense_id`
+
+Do **not** put `method`, `method_number` or `method_period` in the file — they are read-only related fields in Odoo 20. Create the depreciation models first (file `06a_depreciation_models.csv`) and reference them by external ID.
 
 ---
 
@@ -1044,59 +1196,49 @@ Target before production run:
 
 ---
 
-## 16) What Was Fixed/Improved Compared to the Previous Document
+## 16) What Changed Between Odoo 19 and Odoo 20
 
-Main corrections:
+If you have run this migration before on Odoo 19, these are the deltas that change your files or your sequence.
 
-- Clarified that manual JEs are not automatically the same as Odoo opening move engine.
-- Corrected AR/AP clearing logic with explicit migration clearing account design.
-- Added two valid AR/AP migration patterns (invoice documents vs open item journal lines).
-- Added aged report reality from code (based on receivable/payable move lines, partner, due date).
-- Added fixed asset migration best practice using `already_depreciated_amount_import`.
-- Clarified inventory accounting behavior based on valuation mode and stock_account logic.
-- Clarified opening move identification (company linked move), not by assuming a special journal name.
-- Strengthened control framework with a mandatory zero-balance clearing matrix.
+| Area | Odoo 19 | Odoo 20 | Impact on migration |
+|---|---|---|---|
+| Chart of accounts structure | `account.group` model, matched by code prefix ranges | `account.account.parent_id` tree (`_parent_store`); `account.group` removed | Rewrite group imports as parent accounts; import `parent_id`; parents before children (3.9) |
+| Account code | `^[A-Za-z0-9.]+$`, required on every company | dashes allowed; no longer required on every company | Legacy codes with `-` import as-is; grouping accounts may be code-less |
+| Bank/cash account creation | no side effect | `_create_default_journals()` auto-creates a bank/credit journal | Importing a chart creates journals; suppress with `skip_auto_account_journal_creation` (3.10) |
+| `account.reconcile` | gated matching, rewrote residuals when toggled | bank-reconciliation flag only; toggling has no side effect | No need to pre-flip it on clearing accounts (3.6) |
+| `account_opening_date` | no default | defaults to today | Set the real cut-off date before the first opening import (3.1) |
+| Opening-balance UI | post from the move form | "Validate and Post" button in the opening-balance list | Faster, but irreversible from that screen (3.5) |
+| Inventory valuation config | product category property, per product | `res.company.inventory_valuation` / `cost_method` / `account_stock_valuation_id`, category and product override it | New DBs default to **periodic** — no stock entries at all unless you opt into `real_time` (5.0) |
+| Periodic closing | manual journal entries | `action_close_stock_valuation()` + `_cron_post_stock_valuation()` driven by `inventory_period` | Post the opening move before any closing runs (5.0) |
+| Valuation field location | `stock_account/models/product.py` | `account/models/product.py` | Path changes in scripts and studio references |
+| Fixed assets | one flat `account.asset` | `account.asset` + `account.asset.variant` + `account.depreciation.model` | `method`/`method_number`/`method_period` are no longer importable on the asset; import `model_id` and the two `import_account_*` fields (6.0) |
+| Aged report residual | inline partial-reconciliation SQL | `account.move.line.residual_at_date` computed-SQL field | Cut-off comparisons are easier and match the report exactly (9.4) |
+| Security files | `ir.model.access.csv` + `ir.rule` | unified `ir.access.csv` / `ir.access` model | Any custom migration module's security files must be converted |
 
-Usability improvements:
-
-- Reorganized as a tutorial/runbook with strict execution order.
-- Added decision matrix and case-specific guidance.
-- Added practical templates and rehearsal plan.
-- Added common failure table with direct fixes.
+Everything else in this runbook — the opening-move engine, the clearing-account design, the import order, the validation matrix — is unchanged between 19 and 20.
 
 ---
 
-## 17) Source References (Odoo 19 Code)
+## 17) Source References (Odoo 20 Code)
 
-- Opening move fields and update logic:
-  - `addons/account/models/company.py`
-  - Methods: `_get_default_opening_move_values`, `_update_opening_move`, `get_unaffected_earnings_account`
-- Opening field import batching:
-  - `addons/account/models/account_account.py`
-  - Methods: `_set_opening_debit_credit`, `_load_precommit_update_opening_move`
-- Lock date fields and hard lock constraints:
-  - `addons/account/models/company.py`
-  - `LOCK_DATE_FIELDS`, `_validate_locks`
-- Receivable/payable reconcile constraint:
-  - `addons/account/models/account_account.py` (`_check_reconcile`)
-- Aged receivable/payable engine:
-  - `enterprise/account_reports/models/account_aged_partner_balance.py`
-- Inventory adjustment and valuation flow:
-  - `addons/stock/models/stock_quant.py`
-  - `addons/stock_account/models/stock_quant.py`
-  - `addons/stock_account/models/stock_move.py`
-- Asset migration fields and depreciation logic:
-  - `enterprise/account_asset/models/account_asset.py`
-  - Fields: `already_depreciated_amount_import` (line 158), `_compute_value_residual` (line 320)
-- Import-time reconciliation tagging:
-  - `addons/account/models/account_move_line.py`
-  - Method: `_reconcile_marked` (line 3012), `_prepare_create_values` (line 1573 — auto I-prefix)
-  - Field: `matching_number` (line 284)
-- Official import templates:
-  - `addons/account/models/account_account.py` (`get_import_templates`, line 1152)
-  - `addons/account/models/account_move.py` (`get_import_templates`, line 7186)
-- COA onboarding editor behavior:
-  - `addons/account/models/onboarding_onboarding_step.py` (`action_open_step_chart_of_accounts`, line 80)
+| Topic | File | Symbols / lines |
+|---|---|---|
+| Opening move fields and update logic | [account/models/company.py](../addons/account/models/company.py) | `account_opening_move_id` (175), `account_opening_date` (177), `_get_default_opening_move_values` (949), `get_unaffected_earnings_account` (977), `_update_opening_move` (1009) |
+| Opening field import batching | [account/models/account_account.py](../addons/account/models/account_account.py) | `opening_debit`/`opening_credit`/`opening_balance` (143–145), `_set_opening_debit_credit` (736), `_load_precommit_update_opening_move` (955), `action_validate_opening_move` (1184) |
+| Hierarchical chart of accounts | [account/models/account_account.py](../addons/account/models/account_account.py) | `_order`/`_parent_store` (29–30), `parent_id` (133), `ACCOUNT_CODE_REGEX` (17), `_ensure_code_is_unique` (1089), `_create_default_journals` (1129) |
+| Lock dates and hard lock | [account/models/company.py](../addons/account/models/company.py) | `SOFT_LOCK_DATE_FIELDS`/`LOCK_DATE_FIELDS` (60, 67), `_validate_locks` (694), `_get_user_lock_date` (749), `_get_violated_lock_dates` (865) |
+| Lock-date move shifting | [account/models/account_move.py](../addons/account/models/account_move.py) | `_post` lock check (6252), `_get_accounting_date` (7427) |
+| Reconcile constraints and semantics | [account/models/account_account.py](../addons/account/models/account_account.py) | `_check_reconcile` (34), `_constrains_reconcile` (165), `reconcile` (112), `_compute_reconcile` (711) |
+| Import-time reconciliation tagging | [account/models/account_move_line.py](../addons/account/models/account_move_line.py) | `matching_number` (358), `_sanitize_vals` (2063), `_reconcile_marked` (3485), `_check_amls_exigibility_for_reconciliation` (2969) |
+| Residual fields | [account/models/account_move_line.py](../addons/account/models/account_move_line.py) | `amount_residual` (280), `residual_at_date` (328), `_compute_sql_residual_at_date` (1120) |
+| Aged receivable/payable engine | [account_reports/models/account_aged_partner_balance.py](../enterprise/account_reports/models/account_aged_partner_balance.py) | `_aged_partner_report_custom_engine_common` (85) |
+| Inventory adjustment | [stock/models/stock_quant.py](../addons/stock/models/stock_quant.py), [stock_account/models/stock_quant.py](../addons/stock_account/models/stock_quant.py) | `action_apply_inventory` (465), `action_apply_all` (550), `accounting_date` (12) |
+| Perpetual valuation entries | [stock_account/models/stock_move.py](../addons/stock_account/models/stock_move.py) | `_should_create_account_move` (756), `_get_value_data` (442) |
+| Periodic valuation config and closing | [account/models/company.py](../addons/account/models/company.py), [account/models/product.py](../addons/account/models/product.py) | `inventory_valuation` (343), `inventory_period` (358), `action_close_stock_valuation` (1278), `_cron_post_stock_valuation` (1447), `valuation` (108) |
+| Asset migration | [account_asset/models/account_asset.py](../enterprise/account_asset/models/account_asset.py), [account_asset_variant.py](../enterprise/account_asset/models/account_asset_variant.py), [account_depreciation_model.py](../enterprise/account_asset/models/account_depreciation_model.py) | `import_account_depreciation_id` (149), `_split_assets_variants_vals` (446); variant `already_depreciated_amount_import` (127), `_compute_value_residual` (258), `_compute_book_value` (281) |
+| Official import templates | [account_account.py](../addons/account/models/account_account.py), [account_move.py](../addons/account/models/account_move.py), [account_move_line.py](../addons/account/models/account_move_line.py) | `get_import_templates` (1198 / 8252 / 3839) |
+| Importer header matching | [base_import/models/base_import.py](../addons/base_import/models/base_import.py) | `_get_mapping_suggestion` (833), `_get_mapping_suggestions` (993) |
+| COA onboarding editor | [account/models/onboarding_onboarding_step.py](../addons/account/models/onboarding_onboarding_step.py) | `action_open_step_chart_of_accounts` (79) |
 
 ---
 
@@ -1108,4 +1250,4 @@ Usability improvements:
 - Never set hard lock date before final sign-off.
 - Keep every migration file versioned and reproducible.
 
-If you follow this runbook, your Odoo 19 accounting start will be controlled, auditable, and operationally usable from day one.
+If you follow this runbook, your Odoo 20 accounting start will be controlled, auditable, and operationally usable from day one.
