@@ -1,180 +1,318 @@
-# Attendance and Work Entries — Odoo 20
+# Attendance and Payroll Time — `hr_attendance` + Time Rules + Payslips
 
-> Reviewed against the local Odoo 20 source on 2026-09-22. This is a source review, not a fresh database/payroll test.
-> Main modules: [`hr_attendance`](../addons/hr_attendance/), [`hr_work_entry`](../addons/hr_work_entry/), [`hr_holidays_attendance`](../addons/hr_holidays_attendance/), [`hr_payroll_attendance`](../enterprise/hr_payroll_attendance/).
+> **Modules:** `hr_attendance`, `hr_work_entry`, `hr_holidays_attendance`, `hr_payroll_attendance` | **Path:** [`addons/hr_attendance/`](../addons/hr_attendance/)
+> Verified against Odoo 20 source on 2026-09-24.
 
-## The Architecture Has Changed
+## What It Does & Why It Exists
 
-This checkout no longer uses the documented Odoo 19 chain of overtime rulesets → overtime lines → stored `hr.work.entry` records. `hr_work_entry_attendance` is a leftover cache-only directory here, without an installable manifest or Python source. The former ruleset, `manual_duration`, approval-to-regeneration wizard and same-day stored-entry archiving explanations do not describe the current implementation.
+Employees check in and out (kiosk, systray, manual entry). Each clock record is an
+`hr.attendance` with a **time type**. Payroll uses those records in two ways:
 
-The current chain is:
+- **As the baseline** for employees whose version is *attendance based*: only clocked time is
+  worked time.
+- **As overrides of the schedule** for everybody else: a validated attendance replaces the
+  scheduled hours of the day it falls on.
 
-```text
-Clock record: hr.attendance (time type, state, check-in/out, break)
-    → hr.time.rule evaluates eligible validated source intervals
-    → reclassifies/splits attendance records or creates deficit outputs
-    → hr.version.generate_work_entries(date_from, date_to)
-    → returns day/duration dictionaries built from schedules, attendance and leave
-    → payroll aggregates these values into payslip worked-day lines
+Overtime and missing time are handled by **time rules** (`hr.time.rule`), which split and
+re-type the attendance records themselves. Nothing is generated or stored for payroll: when a
+payslip is computed, `hr.version.generate_work_entries()` builds the day/duration values from
+schedules, attendances and leaves. `hr.work.entry` records do not exist in 20.0; see
+[`work_entries.md`](work_entries.md) for that projection.
+
+---
+
+## The Big Picture — How It Works
+
+```
+hr.attendance (check-in/out, break, time type, state)
+    | validated + closed only
+    v
+hr.time.rule engine            splits / re-types the attendance, creates child records
+    |                           (overtime, deficit), optional time-off allocation credit
+    v
+payslip compute: hr.version.generate_work_entries(date_from, date_to)
+    schedule hours (not attendance-based versions)
+  - days that have a validated attendance (whole local day)
+  + attendance segments, each with its own time type, break cut off the end
+  +/- leaves and public holidays (worked time wins over absence)
+    v
+worked-day lines per time type  ->  amount = rate x hours x type rate
 ```
 
-`hr_work_entry` still provides **Time Types** (`hr.work.entry.type`) and generation methods, but its model imports do not define the old persisted `hr.work.entry` model. The generation API returns a Python list, not a recordset to validate or archive. See [`hr_work_entry/models/__init__.py`](../addons/hr_work_entry/models/__init__.py), [`hr_version.py`](../addons/hr_work_entry/models/hr_version.py), and [`payroll hr_version.py`](../enterprise/hr_payroll/models/hr_version.py).
+### Key Decision Points
+
+- **Attendance based or not** (`hr.version.attendance_based`,
+  [hr_version.py:10](../addons/hr_attendance/models/hr_version.py#L10); company default
+  "Default Tracking"). It only changes the days *without* a validated attendance: schedule hours
+  (off) or nothing (on).
+- **Validation policy** of the company: decides whether new attendances count at once.
+- **Time rules**: which hours become overtime or missing time, and with which time type and rate.
+
+---
 
 ## Module Responsibilities
 
 | Module | Responsibility |
 |---|---|
-| `hr_work_entry` | Time types, `hr.time.rule`, source-processing mixin, schedule/leave interval generation and daily aggregation; depends on `hr` |
-| `hr_attendance` | Clock records, validation, breaks, attendance rule outputs, kiosk/systray and scheduled processing; directly depends on `hr_work_entry` |
-| `hr_holidays_attendance` | Attendance/leave integration, attendance-based generation and time-rule allocation credits; depends on Attendances and Time Off, auto-install |
-| `hr_payroll_attendance` | Payslip attendance links and payroll options; auto-install with dependencies `hr_attendance_gantt`, `hr_holidays_attendance`, `hr_payroll` |
+| `hr_work_entry` | Time types, the `hr.time.rule` engine, the source mixin, the schedule/leave projection ([manifest](../addons/hr_work_entry/__manifest__.py)) |
+| `hr_attendance` | Clock records, validation, breaks, kiosk/systray, crons; depends on `hr_work_entry` ([__manifest__.py:18](../addons/hr_attendance/__manifest__.py#L18)) |
+| `hr_holidays_attendance` | Puts attendances into the payslip projection, resolves attendance/leave overlaps, allocation credits from rules; auto-installs with Attendances + Time Off ([__manifest__.py:9](../addons/hr_holidays_attendance/__manifest__.py#L9)) |
+| `hr_payroll_attendance` | Payslip attendance count and button, payroll options on attendances, pay-run warnings; auto-installs with payroll ([__manifest__.py:8](../enterprise/hr_payroll_attendance/__manifest__.py#L8)) |
+| `hr_attendance_gantt` | Gantt view of attendances (worked vs expected hours) |
+| `hr_timesheet_attendance` | Timesheet vs attendance report only; no timesheet-to-payroll link |
 
-Sources: the modules' [`attendance manifest`](../addons/hr_attendance/__manifest__.py), [`work-entry manifest`](../addons/hr_work_entry/__manifest__.py), [`holiday bridge manifest`](../addons/hr_holidays_attendance/__manifest__.py), and [`payroll bridge manifest`](../enterprise/hr_payroll_attendance/__manifest__.py).
+---
 
 ## Attendance Records
 
 Source: [`hr_attendance.py`](../addons/hr_attendance/models/hr_attendance.py).
 
-| Field | Current behavior |
+| Field | Behavior |
 |---|---|
-| `employee_id`, `check_in`, `check_out` | Employee and UTC clock timestamps; an unchecked-out record is open |
-| `date` | Check-in date in the employee timezone |
-| `worked_hours` | Elapsed check-in/out hours **minus explicit `break_duration`**; no automatic schedule-lunch subtraction in this compute |
-| `break_duration` | Extra unpaid break hours; cannot be negative, exceed elapsed duration, or be nonzero on an open record |
-| `work_entry_type_id` | Required **Time Type**, defaulting to the company's attendance type |
-| `state` | `draft`, `validated`, `refused` |
-| `time_rule_id` | Rule that produced/reclassified this record |
-| `source_attendance_id` | Actual relation to the source attendance |
-| `overtime_attendance_ids` | Reverse relation to output attendances |
-| `source_stale` | Warns that a surviving rule output's source was edited/deleted |
-| `in_mode`, `out_mode` | Capture origin, including kiosk, systray, manual and technical modes |
+| `check_in`, `check_out` | UTC timestamps; a record without check-out is open ([:47](../addons/hr_attendance/models/hr_attendance.py#L47)) |
+| `date` | Check-in date in the employee's timezone |
+| `worked_hours` | Check-out minus check-in minus `break_duration` ([:163](../addons/hr_attendance/models/hr_attendance.py#L163)); no automatic lunch deduction |
+| `break_duration` | Extra unpaid break in hours: not negative, not longer than the attendance, only once checked out ([:176](../addons/hr_attendance/models/hr_attendance.py#L176)) |
+| `work_entry_type_id` | Required time type, default = company's Attendance Time Type ([:87](../addons/hr_attendance/models/hr_attendance.py#L87)) |
+| `state` | `draft` / `validated` / `refused` ([:95](../addons/hr_attendance/models/hr_attendance.py#L95)) |
+| `time_rule_id`, `source_attendance_id`, `overtime_attendance_ids` | Which rule produced this record, from which source, and the outputs of a source ([:102](../addons/hr_attendance/models/hr_attendance.py#L102)) |
+| `source_stale` | Warning on a rule output whose source was edited or deleted |
+| `in_mode`, `out_mode` | Capture channel: kiosk, systray, manual, auto check-out, technical |
 
-Standard validity checks prohibit overlapping employee attendance intervals and multiple open records. Internal rule processing uses `skip_time_rules`, which also bypasses the overlap check; generated data must not be interpreted as if every row were an independent raw punch. `copy()` is blocked.
+- **Validity** ([_check_validity](../addons/hr_attendance/models/hr_attendance.py#L198)): no
+  overlapping attendances per employee and only one open record. The engine's own writes use
+  `skip_time_rules`, which also skips this check, because splitting creates adjacent records.
+- **Duplicating is blocked** ([copy](../addons/hr_attendance/models/hr_attendance.py#L272)).
+  Moving an attendance to another employee is refused unless it is your own, you are that
+  employee's attendance manager, or you are Attendance Administrator ([write](../addons/hr_attendance/models/hr_attendance.py#L245)).
+- **Stale outputs.** Changing check-in/out, break, employee or time type of a source, or deleting
+  it, marks its surviving outputs `source_stale` ([:243](../addons/hr_attendance/models/hr_attendance.py#L243),
+  [:264](../addons/hr_attendance/models/hr_attendance.py#L264)). **Mark Reviewed** only clears the
+  flag ([action_mark_reviewed](../addons/hr_attendance/models/hr_attendance.py#L269)); it does
+  not rebuild anything.
 
-Changing source times, break, employee or time type marks surviving output records stale. `action_mark_reviewed()` clears the marker; it is an acknowledgment, not a regeneration of the source. Deletion also marks surviving outputs stale.
+---
 
 ## Validation
 
-Company [`attendance_validation`](../addons/hr_attendance/models/res_company.py) controls ordinary creation:
+Company setting **Attendance Validation** ([res_company.py:37](../addons/hr_attendance/models/res_company.py#L37)):
 
-- `no_validation`: ordinary attendance records are created validated.
-- Manager-validation mode: records start draft and require validation.
-- `tolerance_validation`: closed draft source records may be validated automatically when elapsed time is within `attendance_validation_tolerance` of expected daily attendance, or no expected time exists.
+| Value | New attendances |
+|---|---|
+| `no_validation` (default) | Created validated |
+| `manual_validation` | Created draft; a manager validates |
+| `tolerance_validation` | Created draft, then validated automatically when closed if the elapsed time is within **Validation Tolerance (Hours)** of the day's expected hours, or when no hours are expected ([_update_tolerance_state](../addons/hr_attendance/models/hr_attendance.py#L669)) |
 
-Rule-generated records carrying `time_rule_id` or `source_attendance_id` default to validated. Explicitly supplied states take precedence over those defaults. `_update_tolerance_state()` uses elapsed clock time for its comparison, not the break-adjusted `worked_hours` value.
+- Records produced by a rule (`time_rule_id` or `source_attendance_id` set) are always created
+  validated; an explicit `state` in the values wins ([create](../addons/hr_attendance/models/hr_attendance.py#L689)).
+- The tolerance check compares **elapsed** time, not `worked_hours`, so a long break does not
+  push a record out of tolerance.
+- `action_validate`, `action_reset_to_draft` and `action_refuse` (rules skipped) set the state
+  ([:704](../addons/hr_attendance/models/hr_attendance.py#L704)).
+- **Only closed, validated attendances count** for time rules and for payroll. Draft, refused and
+  open records supply nothing.
 
-`action_validate()` writes validated; `action_reset_to_draft()` writes draft; `action_refuse()` writes refused with rule processing skipped. Generation selects **closed, validated** attendances. Draft/refused/open records do not supply clock intervals to payroll generation.
+---
 
-## Time Rules Replace Overtime Rulesets
+## Time Rules
 
-Source: [`hr.time.rule`](../addons/hr_work_entry/models/hr_time_rule.py), extended by [`hr_attendance`](../addons/hr_attendance/models/hr_time_rule.py).
+Source: [`hr_time_rule.py`](../addons/hr_work_entry/models/hr_time_rule.py#L110), extended by
+[`hr_attendance`](../addons/hr_attendance/models/hr_time_rule.py). Menu: Attendances →
+Configuration → Automatic Rules. Rule anatomy and pipeline: [`work_entries.md`](work_entries.md).
 
 | Setting | Purpose |
 |---|---|
-| `sequence`, `active`, company/country | Rule ordering and scope |
-| `employee_domain` | Select eligible employees; no per-version `ruleset_id` assignment |
-| `condition_work_entry_type_ids` | Source time types the rule considers |
-| `threshold_operator` | `exceed` or `less_than` |
-| `working_hours_mode` | Daily/weekly schedule or fixed daily/weekly threshold |
-| `calendar_source`, `resource_calendar_id` | Employee or reference schedule baseline |
-| `expected_hours` | Threshold used for fixed-hour modes |
-| `quantity_period`, `week_start` | Day/week evaluation and configurable week boundary |
-| Weekday flags, `apply_on_public_holidays` | Applicable days |
-| `timing_start`, `timing_stop` | Time window inside a day |
-| `employer_tolerance`, `employee_tolerance` | Threshold tolerances |
-| `work_entry_type_id` | Type assigned to excess/missing time; may be empty for integrations that only add options/allocation effects |
-| `amount_rate` | Stored editable compute from the output time type's rate |
+| `sequence`, `active`, `company_id` / `country_id`, `employee_domain` | Order and scope. A rule with no company, no country and an empty domain applies to every employee ([_get_applicable_employees](../addons/hr_work_entry/models/hr_time_rule.py#L336)) |
+| `condition_work_entry_type_ids` | Which time types the rule looks at; defaults to the company's attendance type ([hr_time_rule.py:9](../addons/hr_attendance/models/hr_time_rule.py#L9)) |
+| `threshold_operator` | `exceed` (overtime) or `less_than` (missing time) |
+| `working_hours_mode`, `calendar_source`, `resource_calendar_id`, `expected_hours` | Compare with the daily or weekly schedule (employee's or a reference calendar), or with flat daily/weekly hours |
+| `week_start` | Week boundary for weekly rules |
+| Weekday flags, `apply_on_public_holidays` | Days the rule applies to |
+| `timing_start`, `timing_stop` | Hour window inside a day; the database requires start < stop ([:226](../addons/hr_work_entry/models/hr_time_rule.py#L226)), so a 22:00–06:00 night band needs two rules |
+| `employer_tolerance`, `employee_tolerance` | Excess or deficit below the tolerance produces nothing |
+| `work_entry_type_id` ("Set Excess to") | Time type of the matched hours; may be empty when the rule only adds payroll options or time-off credit |
+| `amount_rate` | Display mirror of the output type's rate; the money follows the type |
 
-The SQL timing constraint requires **start < stop**, with start below 24 and stop at most 24. A 22:00–06:00 overnight window cannot be entered as one rule in this implementation; use separate windows where appropriate. The former `base_off`, `timing_type`, `paid` and ruleset `max`/`sum` descriptions are obsolete here.
+What applying a rule does: the source attendance is shortened and re-typed or kept as the first
+output, further outputs and remainders become new attendance records, and deficit outputs are
+placed in the free schedule time. Outputs carry payroll options (`category_options_ids`) from
+`hr_payroll_attendance` ([hr_time_rule.py:10](../enterprise/hr_payroll_attendance/models/hr_time_rule.py#L10)),
+and payroll groups hours by time type and those options.
 
-The rule engine evaluates interval slices and applies outputs through `_apply_output()`. Depending on coverage, it can repurpose a source record as the first output, shorten its remaining interval, and create further output/remainder records. This changes attendance records; it does not merely attach a separate numerical overtime balance. Overlapping rules can carry accumulated premium-pay/allocation effects through the pipeline. Do not reuse the old “one duplicate work entry per paid rule in sum mode” explanation.
+**Shipped rules.** "Employee Schedule Rule" (anything beyond the daily schedule on the generic
+Work type → Overtime `040.00`) has no company, country or domain, so it applies to every
+company, Georgian ones included ([hr_time_rule_data.xml:4](../addons/hr_work_entry/data/hr_time_rule_data.xml#L4)).
+The other shipped rules are limited to their countries.
 
-Enterprise [`hr_payroll_attendance.hr_time_rule`](../enterprise/hr_payroll_attendance/models/hr_time_rule.py) propagates accumulated premium-pay category IDs to output `category_options_ids`. Payroll groups hours by time type **and** sorted category options.
+---
 
 ## When Rules Run
 
-[`hr.time.rule.source.mixin`](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py) triggers processing on creation and relevant writes unless `skip_time_rules` is set. Attendance's source domain requires `state = validated` and completed start/end timestamps.
+Saving a source triggers them unless `skip_time_rules` is set
+([_trigger_time_rules_for_affected](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L297)):
 
-The trigger distinguishes unfinished periods:
-
-| Period | Immediate processing |
+| Period of the saved record | Rules applied at save |
 |---|---|
-| Past day | Daily excess and deficit rules |
-| Current/future day | Daily excess only |
-| Completed week | Weekly excess rules |
-| Weekly deficit | Scheduled processing only |
+| A past day | Daily excess and daily deficit rules |
+| Today or later | Daily excess only |
+| A completed week | Weekly excess only |
+| Weekly deficit | Never at save; cron only |
 
-The mixin collects day/week ranges, searches active company-eligible rules and combines their interval outputs. There is no current `_update_overtime()` weekly delete-and-recreate pipeline. Editing a rule is not equivalent to running the removed Odoo 19 ruleset regeneration button; inspect source records, output records and the current processing methods when backfilling.
+Crons ([hr_attendance_data.xml](../addons/hr_attendance/data/hr_attendance_data.xml)):
 
-Employee `total_overtime` now sums `worked_hours` of attendance records with a nonempty `time_rule_id`. The base compute does not filter to approved overtime lines or even add a state condition. It should not be read as the old approved, spendable time-off balance. See [`hr_employee.py`](../addons/hr_attendance/models/hr_employee.py).
+| Job | Interval | What it does |
+|---|---|---|
+| Automatic check-out | 4 hours | Closes open attendances in companies with Automatic Check Out: *tolerance* mode when open time plus the day's earlier worked hours exceeds expected hours plus the tolerance; *specific time* mode at a local cut-off ([_cron_auto_check_out](../addons/hr_attendance/models/hr_attendance.py#L451)) |
+| Absence detection | 4 hours | With Absence Management: for each employee with no attendance yesterday, a one-second validated technical attendance, so deficit rules can create missing-time outputs; technical records without outputs are deleted ([_cron_absence_detection](../addons/hr_attendance/models/hr_attendance.py#L515)) |
+| Daily time rules | 1 day | Yesterday's records, deficit day rules ([_cron_process_day_undertime_rules](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L182)) |
+| Weekly time rules | 1 week | The week that ended yesterday, only rules whose `week_start` is today's weekday ([_cron_process_week_time_rules](../addons/hr_work_entry/models/hr_time_rule_source_mixin.py#L195)) |
+
+The weekly job's docstring calls it a daily cron, but it ships weekly. Weekly deficit rules
+whose `week_start` differs from the cron's weekday are never processed; set the cron to daily if
+you use them.
+
+**Overtime balance.** Employee `total_overtime` sums `worked_hours` of all attendances that carry
+a `time_rule_id`, without any state filter ([hr_employee.py:179](../addons/hr_attendance/models/hr_employee.py#L179)).
+It is a display figure, not what the payslip pays.
+
+---
 
 ## Attendance-Based Versus Schedule-Based Payroll
 
-[`hr.version.attendance_based`](../addons/hr_attendance/models/hr_version.py) defaults from the company and is exposed on the employee. The actual attendance generation integration is in [`hr_holidays_attendance/models/hr_version.py`](../addons/hr_holidays_attendance/models/hr_version.py).
+The projection lives in [`hr_holidays_attendance/models/hr_version.py`](../addons/hr_holidays_attendance/models/hr_version.py#L35):
 
-- **Attendance based:** base schedule attendance intervals start empty; closed validated clock records supply working time. Time off is still accounted for through the leave pipeline.
-- **Schedule based:** the schedule supplies ordinary days, but a validated attendance touching a local day removes the schedule's regular attendance for that **whole day** and supplies its clock intervals instead. This is not “schedule plus overtime only.”
+- **Attendance based:** the schedule supplies nothing
+  ([_get_attendance_intervals](../addons/hr_holidays_attendance/models/hr_version.py#L18)); closed
+  validated attendances are the worked time. Leaves and public holidays still produce their
+  scheduled hours.
+- **Schedule based:** the schedule supplies ordinary days, but a validated attendance on a local
+  day removes that **whole day** from the schedule and supplies its own intervals instead
+  ([:88](../addons/hr_holidays_attendance/models/hr_version.py#L88)). One 2-hour badge on an 8-hour
+  day gives 2 hours, not 8.
 
-For both modes, clock intervals subtract `break_duration` by trimming the end. Overlaps between attendance and working-time leave are split and resolved by time-type sequence, with the lower sequence winning. Worked time removes overlapping absence intervals through the leave integration. Exact holiday outcomes depend on time-type classification, sequence, calendar and actual clock intervals; the previous Odoo 19 holiday/source matrix is not a current guarantee.
+In both modes:
 
-Generation clips to version dates, converts intervals into local dates/durations, and merges values sharing the date, time type, employee, version and company (with extension hooks for additional keys). Source relations such as `attendance_ids` are aggregated. Two non-overlapping attendances on the same day can therefore contribute to the same aggregate; the old bug narrative about archiving the earlier stored work entry does not apply to this implementation.
+- The break is cut off the end of the attendance ([:94](../addons/hr_holidays_attendance/models/hr_version.py#L94)).
+- Where an attendance and a working-time leave overlap, the time type with the lower sequence wins
+  ([:103](../addons/hr_holidays_attendance/models/hr_version.py#L103)); worked time removes
+  overlapping absence ([_get_valid_leave_intervals](../addons/hr_holidays_attendance/models/hr_version.py#L165)).
+- Values are split at local midnight and merged per date, time type, employee, version and
+  company. An 08:00–12:00 and a 13:00–17:00 attendance of the same type give one 8-hour value;
+  an overnight attendance is split between the two dates in the version's timezone.
 
-Example: an 08:00–12:00 attendance and a 13:00–17:00 attendance with the same type and no breaks can contribute 8 hours on the same date. An overnight attendance is divided using version timezone boundaries during postprocessing, not assumed to belong entirely to its UTC start date.
+---
 
 ## Payroll Integration
 
-[`hr.payslip`](../enterprise/hr_payroll/models/hr_payslip.py) calls version generation for the relevant date range and builds worked-day values. [`hr.version._get_work_hours()`](../enterprise/hr_payroll/models/hr_version.py) sums returned durations by type/options; it does not search draft/validated persisted `hr.work.entry` rows.
+[`hr.payslip`](../enterprise/hr_payroll/models/hr_payslip.py) calls the projection for its period
+and prices one worked-day line per time type (and payroll options). `hr_payroll_attendance` adds:
 
-The payroll attendance extension adds:
+- **Attendance count and button** on attendance-based payslips: validated attendances overlapping
+  the period ([_get_attendance_by_payslip](../enterprise/hr_payroll_attendance/models/hr_payslip.py#L15));
+  the button opens all of the employee's attendances, starting at the payslip date
+  ([action_open_attendances](../enterprise/hr_payroll_attendance/models/hr_payslip.py#L56)).
+- **`payslip_id` on attendance**: the latest non-draft, non-cancelled payslip whose period holds
+  the local check-in date, computed on the fly ([_get_payslip_domain](../enterprise/hr_payroll_attendance/models/hr_attendance.py#L36)).
+- **Payroll options** on attendances ([hr_attendance.py:9](../enterprise/hr_payroll_attendance/models/hr_attendance.py#L9))
+  and `attendance_based` visible to payroll users ([hr_version.py:7](../enterprise/hr_payroll_attendance/models/hr_version.py#L7)).
+- **Warnings**: "Attendance Discrepancies" for employees with attendances who are not attendance
+  based ([warning data:4](../enterprise/hr_payroll_attendance/data/hr_payroll_attendance_warning_data.xml#L4)),
+  and pay-run start warnings "Attendances to Review" and "No Attendance" for attendance-based
+  versions ([hr_payslip_run.py:10](../enterprise/hr_payroll_attendance/models/hr_payslip_run.py#L10)).
 
-- `attendance_count` for attendance-based slips, computed from validated overlapping records with additional date grouping/filtering.
-- An Attendances action that opens the employee's records in gantt/list; the action domain itself is employee-wide, with the payslip start used as the initial display date.
-- `payslip_id` on attendance, selecting the latest non-draft/non-canceled payslip covering the localized check-in date. This is a computed lookup, not a permanent unique payroll allocation.
-- Payroll category options on attendance and wider payroll-user access to `attendance_based`.
+---
 
-Sources: [`payslip extension`](../enterprise/hr_payroll_attendance/models/hr_payslip.py), [`attendance extension`](../enterprise/hr_payroll_attendance/models/hr_attendance.py).
+## Configuration & Settings
 
-## Scheduled Jobs and Capture Settings
+Attendances → Configuration → Settings, all stored on the company
+([res_config_settings.py](../addons/hr_attendance/models/res_config_settings.py)):
 
-Source: [`hr_attendance_data.xml`](../addons/hr_attendance/data/hr_attendance_data.xml).
-
-| Job | Shipped interval | What it calls |
-|---|---|---|
-| Automatic check-out | 4 hours | `_cron_auto_check_out()` |
-| Absence detection | 4 hours | `_cron_absence_detection()` |
-| Daily time rules | 1 day | `_cron_process_day_undertime_rules()` |
-| Weekly time rules | 1 week | `_cron_process_week_time_rules()` |
-
-Automatic checkout supports tolerance and specific-time modes. Tolerance compares open time plus earlier worked hours with expected hours plus the configured tolerance. Specific-time mode uses the configured local cutoff. These are scheduled evaluations, not a guarantee that a record closes at the exact wall-clock cutoff.
-
-Absence detection creates a one-second validated technical attendance for eligible employees without attendance yesterday, allowing deficit rules to produce typed missing-time outputs. Technical sources without child outputs are removed. Payroll impact depends on the resulting time types and payroll rules; it is no longer correctly described as only a negative `manual_duration` balance.
-
-**Source discrepancy:** the weekly helper describes daily evaluation of rules whose configured week ended yesterday, and filters `week_start` to today's weekday; its shipped cron runs weekly. A weekly schedule on one weekday cannot be assumed to process every possible `week_start` setting. Verify the installed cron schedule when using different week boundaries.
-
-Other current company settings include single check-in, break entry at checkout, device/location tracking, check-in pictures, kiosk PIN/barcode and systray access. These write the same attendance model; they do not bypass its payroll eligibility requirements.
-
-## Access and Troubleshooting
-
-Source: [`attendance security`](../addons/hr_attendance/security/hr_attendance_security.xml) and [`access rules`](../addons/hr_attendance/security/ir.access.csv).
-
-Own-record, officer, all-attendance and administrator privileges control different scopes. `is_manager` accepts all-attendance users or officers assigned as the employee's attendance manager; `can_edit` also considers own-attendance rights. Field visibility and computed booleans supplement model/record access; they are not a substitute for it.
-
-| Symptom | Check in Odoo 20 |
+| Setting | Behavior |
 |---|---|
-| Clocked hours absent from payroll | Closed and validated attendance; version dates/timezone; `attendance_based`; installed holiday/payroll bridge |
-| Overtime not classified | Active time rule, employee/company scope, condition time types, threshold, window and whether the period has finished |
-| A schedule day shrinks after a punch | Schedule-based mode replaces regular schedule attendance for days touched by validated clock records |
-| Hours differ from clock elapsed time | Explicit breaks, local-day splitting, overlapping time-type priorities and leave handling |
-| Warning marker on rule output | Source changed/deleted; review the output before clearing `source_stale` |
-| Missing weekly deficit output | Configured week boundary and actual cron weekday; weekly deficits are cron-only |
-| Overtime total differs from payslip | Total sums typed rule outputs; payroll uses validated interval generation and salary rules |
+| **Attendance Validation** + **Validation Tolerance** | See Validation. Draft attendances do not pay |
+| **Attendance Time Type** | Type given to new attendances and read by rules; any working-time type ([res_company.py:46](../addons/hr_attendance/models/res_company.py#L46)) |
+| **Default Tracking** | Default of `attendance_based` for new versions ([res_company.py:63](../addons/hr_attendance/models/res_company.py#L63)) |
+| **Automatic Check Out** (tolerance, default 2 h, or specific time, default 20:00) | Arms the auto check-out cron |
+| **Absence Management** | Arms absence detection |
+| **Break Management on Checkout** | Lets employees enter their break when checking out |
+| **Single Check-In** | One attendance per day |
+| **Device & Location Tracking**, **Take Pictures on Check-In** | Store GPS/IP/browser and a picture |
+| Kiosk mode, barcode source, PIN, systray | Capture channels only; they write the same record |
+
+Setting an employee's **attendance manager** adds that user to the Officer group
+([hr_employee.py:117](../addons/hr_attendance/models/hr_employee.py#L117)).
+
+---
+
+## Recipe — Georgian Client, Fixed Schedule + Paid Overtime
+
+1. **Overtime type.** Create a working-time type per overtime rate, e.g. "Overtime 150%" with
+   rate 1.5, and give it the salary category your structure adds to GROSS. Leave its country empty
+   (see the one-country-type trap in [`public_holidays_flow.md`](public_holidays_flow.md)). The
+   shipped `040.00` pays 100%.
+2. **Versions.** Leave `attendance_based` off to keep schedule pay on days without a badge. If
+   employees badge, they must badge every workday: a badge replaces the whole scheduled day.
+3. **Rule.** Edit "Employee Schedule Rule" or add your own: exceed the daily schedule, condition =
+   the attendance type, output = your overtime type, employer tolerance e.g. 0:15. Add a
+   weekend-only and a holiday-only rule if those pay differently.
+4. **Validation.** Use manual or tolerance validation so unapproved overruns do not pay.
+5. **Monthly flow.** Punches → approve drafts (rules run at validation) → refresh draft payslips →
+   confirm.
+
+With `geo_payroll`, overtime can also come from approved overtime work logs; do not pay the same
+hours through both channels ([`geo_payroll.md`](geo_payroll.md)).
+
+---
+
+## Access
+
+Source: [`hr_attendance_security.xml`](../addons/hr_attendance/security/hr_attendance_security.xml)
+and [`ir.access.csv`](../addons/hr_attendance/security/ir.access.csv).
+
+| Group | Access to `hr.attendance` |
+|---|---|
+| Every internal user | Read own attendances ([ir.access.csv:4](../addons/hr_attendance/security/ir.access.csv#L4)) |
+| Self Attendance Edit (default for new users) | Create/edit own attendances while not validated, or always when the company uses `no_validation` ([:5](../addons/hr_attendance/security/ir.access.csv#L5)) |
+| Officer: Manage attendances | Full access to employees they manage ([:3](../addons/hr_attendance/security/ir.access.csv#L3)) |
+| Officer: Manage all attendances / Administrator | Full access ([:2](../addons/hr_attendance/security/ir.access.csv#L2)) |
+
+---
+
+## Gotchas & Non-Obvious Behavior
+
+- **Employees can edit validated attendances under `no_validation`** (the default), and those
+  hours are payroll hours. Use manual or tolerance validation where pay follows the clock.
+- **The generic overtime rule is live everywhere.** On a database with Attendances and payroll,
+  every validated hour beyond the daily schedule becomes `040.00` Overtime and reaches the
+  payslip at 100%. `gec20_prod1` has this rule active (checked 2026-09-24).
+- **Absence detection can cut pay.** A surviving technical attendance knocks its scheduled day out
+  of the payslip, and the deficit outputs land there with the rule's output type; a type with
+  rate 0 removes that day's pay.
+- **Rules rewrite attendance records.** There is no undo; the source record itself is shortened
+  and re-typed. Test rules on a copy of production data.
+- **"Attendances to Review" pay-run warning searches a field that does not exist.** It filters
+  `hr.attendance` on `overtime_status` ([hr_payslip_run.py:19](../enterprise/hr_payroll_attendance/models/hr_payslip_run.py#L19)),
+  a field `hr.attendance` does not define. Starting a pay run whose versions include an
+  attendance-based employee should fail on that domain [Unverified].
+- **Weekly deficit rules can silently never run** (weekly cron vs `week_start`, above).
+- **Mark Reviewed is not a recalculation.** Fix the source or re-save it to re-run the rules.
+
+| Symptom | Check |
+|---|---|
+| Clocked hours missing from the payslip | Attendance closed and validated; version dates and timezone; draft payslip refreshed |
+| A scheduled day shrank after a punch | Schedule-based versions: a badge replaces the whole day |
+| Overtime not classified | Rule active and in scope; condition type = the attendance's type; threshold, window, tolerance; day or week finished |
+| Hours differ from clock time | Break, midnight split, overlap with a leave of lower sequence |
+| Warning icon on a rule output | Source edited or deleted; review, then Mark Reviewed |
+| Overtime balance differs from pay | `total_overtime` counts every rule output; payroll counts validated records per type |
+
+---
 
 ## Related Docs
 
-- [Work entries](work_entries.md)
-- [Payroll](hr_payroll.md)
-- [Employee versions](hr_employee_versions.md)
-- [Resource calendars](resource_calendars.md)
-- [Public holidays](public_holidays_flow.md)
-
-These neighboring documents may still describe the former architecture; use the source links above for the behavior reviewed here.
+- [`work_entries.md`](work_entries.md) — the projection, time types and the rule engine
+- [`hr_payroll.md`](hr_payroll.md) — payslips and pay runs
+- [`hr_employee_versions.md`](hr_employee_versions.md) — versions, `attendance_based`, timezone
+- [`resource_calendars.md`](resource_calendars.md) — schedules and expected hours
+- [`public_holidays_flow.md`](public_holidays_flow.md) — attendance on public holidays
+- [`payroll_wage_types.md`](payroll_wage_types.md) — how hours become money

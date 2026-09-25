@@ -1,436 +1,239 @@
 # Inventory Forecast Report
 
-> **Module:** `stock` | **Path:** [`addons/stock/`](../addons/stock/)
-> **Odoo Apps category:** Inventory
+> **Module:** `stock` (+ `sale_stock`, `purchase_stock`, `mrp`, `stock_account`, `product_expiry`) | **Path:** [`addons/stock/report/stock_forecasted.py`](../addons/stock/report/stock_forecasted.py)
+> Verified against Odoo 20 source on 2026-09-24.
 
-## What It Does
+## What It Does & Why It Exists
 
-The Forecast Report shows — per product per warehouse — exactly how much stock will be available over time, why, and when. It matches every outgoing demand to a supply source (reserved stock, free stock, transit stock, or a pending receipt) and shows any unmet demand explicitly. It also shows a stepped line chart of the cumulative forecasted quantity over a rolling window. The report is the primary tool for planners to understand if and when they can fulfill demand.
+The Forecasted Report answers, per product and per warehouse, "how much will I have, and which demand will be served by which supply?". It combines three views of the same stock: header totals (on hand, incoming, outgoing, forecasted, lead time), a stepped graph of the forecasted stock level day by day, and a table that matches every open outgoing move to a supply source: stock already reserved, free stock, stock in transit inside the warehouse, or a specific receipt. Demand that nothing covers is shown in red as **Not Available**. Planners use it to decide whether to replenish, which delivery gets priority, and which receipt should be assigned to which order. The same matching engine feeds the colored availability badge on transfer and MO lines.
 
 ---
 
-## Dependencies
+## How to Open It
 
-### Requires
-| Module | Why |
+| Entry point | Opens |
 |---|---|
-| `stock` | `stock.move`, `stock.quant`, `stock.warehouse`, `stock.location` — all core data sources |
-| `product` | `product.product` / `product.template` — the product records the report is built around |
+| Product form → **Forecasted** smart button | Report for the template ([`action_product_tmpl_forecast_report()`](../addons/stock/models/product.py#L1271)) or the variant ([`action_product_forecast_report()`](../addons/stock/models/product.py#L690)) |
+| Availability badge on a transfer or MO component line | Report for that product, warehouse of the move, with the move's lines highlighted ([`stock.move.action_product_forecast_report()`](../addons/stock/models/stock_move.py#L1062), context `move_to_match_ids`) |
+| Reordering rule / replenishment line | Report for the rule's warehouse, with its lead horizon date and quantity to order in the context ([`action_product_forecast_report()`](../addons/stock/models/stock_orderpoint.py#L345)) |
+| MO, purchase line | Same client action, tag `stock_forecasted` ([`stock_forecasted_product_product_action`](../addons/stock/views/stock_forecasted.xml#L4)) |
 
-### Optional Integrations
-| Module | What it enables |
-|---|---|
-| `sale_stock` | Sale order lines appear as `document_out` source links in report lines |
-| `purchase_stock` | Purchase order lines appear as `document_in` source links in report lines |
-| `mrp` | Manufacturing orders appear as demand; components appear as outgoing |
-| `stock_account` | No direct effect on forecast; valuation is separate |
+The page is the OWL client action [`StockForecasted`](../addons/stock/static/src/stock_forecasted/stock_forecasted.js#L14). It loads the warehouses, picks the first one when the context has none, and calls `get_report_values` on `stock.forecasted_product_template` or `stock.forecasted_product_product` ([`_getReportValues()`](../addons/stock/static/src/stock_forecasted/stock_forecasted.js#L42)). Switching warehouse writes `warehouse_id` into the context and replaces the current action ([`updateWarehouse()`](../addons/stock/static/src/stock_forecasted/stock_forecasted.js#L87), [`reloadReport()`](../addons/stock/static/src/stock_forecasted/stock_forecasted.js#L95)). The component follows OWL 3: `props = useProps(standardActionServiceProps)` and the context and warehouse list held with `proxy()`.
 
 ---
 
-## Architecture — Two Separate Data Sources
-
-The Forecast Report is built from **two independent systems** that work in parallel:
-
-| System | Model / File | What it powers |
-|---|---|---|
-| Reconciliation engine | [`stock_forecasted.py`](../addons/stock/report/stock_forecasted.py) | Header summary numbers + detail lines table |
-| SQL view | [`report_stock_quantity.py`](../addons/stock/report/report_stock_quantity.py) | The line graph (stepped chart) |
-
-Both are triggered when you open the report. They share the same warehouse context but are computed independently.
-
----
-
-## Part 1 — Header Summary Numbers
-
-### Where they come from
-
-Header numbers are computed by [`_get_report_header()`](../addons/stock/report/stock_forecasted.py#L112) which reads fields computed on `product.product`.
-
-All four quantity fields are computed together by [`_compute_quantities()`](../addons/stock/models/product.py#L151) → [`_compute_quantities_dict()`](../addons/stock/models/product.py#L163).
-
-### The four numbers
-
-| UI Label | Python Field | Formula | Source |
-|---|---|---|---|
-| On Hand | `qty_available` | `SUM(stock_quant.quantity)` for internal locations | [`product.py:246`](../addons/stock/models/product.py#L246) |
-| Free To Use | `free_qty` | `qty_available − reserved_quantity − expired_unreserved_qty` | [`product.py:250`](../addons/stock/models/product.py#L250) |
-| Incoming | `incoming_qty` | `SUM(stock_move.product_qty)` for moves inbound to warehouse, state IN `waiting/confirmed/assigned/partially_available` | [`product.py:251`](../addons/stock/models/product.py#L251) |
-| Outgoing | `outgoing_qty` | `SUM(stock_move.product_qty)` for moves outbound from warehouse, same states | [`product.py:252`](../addons/stock/models/product.py#L252) |
-| Forecasted Quantity | `virtual_available` | `qty_available + incoming_qty − outgoing_qty − expired_unreserved_qty` | [`product.py:253`](../addons/stock/models/product.py#L253) |
-
-### Exact query logic
-
-`_compute_quantities_dict()` fires **three `_read_group` queries** per call:
-
-1. **Quants query** — groups `stock.quant` by `product_id`, sums `quantity` and `reserved_quantity`. Only reads quants in the location domain (internal locations under the warehouse).
-2. **Moves-in query** — groups `stock.move` by `product_id`, sums `product_qty`. Filter: state IN `(waiting, confirmed, assigned, partially_available)` AND destination inside warehouse.
-3. **Moves-out query** — same as moves-in but source inside warehouse, destination outside.
-
-Draft moves (`state='draft'`) are **excluded** from all four fields. They are shown separately in the header as **Draft Quantities** via [`_move_draft_domain()`](../addons/stock/report/stock_forecasted.py#L49) → [`_get_report_header()`](../addons/stock/report/stock_forecasted.py#L136-141).
-
-### Historical / date-range mode
-
-When `to_date` context is set to a past date, `_compute_quantities_dict()` switches to a **reverse calculation**:
-- Starts from current quant quantities
-- Subtracts moves done after `to_date` (incoming)
-- Adds moves done after `to_date` (outgoing)
-- This reconstructs what the stock looked like at that past date
-
-Source: [`product.py:213-223`](../addons/stock/models/product.py#L213)
-
----
-
-## Part 2 — The Stepped Line Graph
-
-### Model
-
-[`report.stock.quantity`](../addons/stock/report/report_stock_quantity.py#L7) — a **PostgreSQL VIEW** (not a stored table). Recreated on `init()` every time the module updates.
-
-### What it stores
-
-Each row represents one product × one warehouse × one day × one state:
-
-| `state` | Meaning | `product_qty` sign |
-|---|---|---|
-| `forecast` | Running cumulative stock level for that day | positive = stock present |
-| `in` | Expected receipts scheduled on that day | positive |
-| `out` | Expected deliveries scheduled on that day | negative |
-
-### How the view is built (SQL logic)
-
-The `init()` SQL creates the view in three `UNION ALL` parts: [source: `report_stock_quantity.py:50-182`](../addons/stock/report/report_stock_quantity.py#L50)
-
-**Part A — `state='out'` / `state='in'` rows (pending moves):**
-- Reads all `stock.move` where `state NOT IN ('draft', 'cancel')` and `product_qty != 0`
-- Determines source warehouse (`whs_id`) and destination warehouse (`whd_id`) via `parent_path` lookup on `stock_location`
-- A move with `whs_id` set and `whd_id=NULL` → `state='out'`, `product_qty = -product_qty`
-- A move with `whd_id` set and `whs_id=NULL` → `state='in'`, `product_qty = +product_qty`
-- Inter-warehouse moves (both whs and whd set) are **duplicated** via `GENERATE_SERIES(0,1)`: one out-row for source warehouse, one in-row for destination warehouse
-- Only non-done moves appear here
-
-**Part B — `state='forecast'` rows from quants (current stock base):**
-- For every quant in an internal or transit location, generates **one row per day** over the report window (`today - period` to `today + period`)
-- Each row carries `q.quantity` (the current physical quantity) as the base level for every day
-- Source: [`report_stock_quantity.py:130-150`](../addons/stock/report/report_stock_quantity.py#L130)
-
-**Part C — `state='forecast'` rows from moves (adjustments over time):**
-- For every move (done or pending), generates rows that **adjust the forecast** for a date range:
-  - Done moves: generate rows from `today - period` up to `move.date - 1 day`. Sign is reversed (a done outgoing move means the goods have left, so the base is *higher* before that date).
-  - Pending moves: generate rows from `GREATEST(move.date, today - period)` to `today + period`. Sign mirrors the movement direction.
-- Source: [`report_stock_quantity.py:151-180`](../addons/stock/report/report_stock_quantity.py#L151)
-
-The final `GROUP BY` sums all `product_qty` per `(product_id, state, date, company_id, warehouse_id)` to produce the net daily values.
-
-### Report period setting
-
-Controlled by system parameter `stock.report_stock_quantity_period` (default: `3` months).
-Read at view creation time: [`report_stock_quantity.py:184`](../addons/stock/report/report_stock_quantity.py#L184).
-Change requires re-running `init()` (module upgrade or manual recreate).
-
-### Graph rendering
-
-[`StockForecastedGraphRenderer`](../addons/stock/static/src/stock_forecasted/forecasted_graph.js#L5) extends the standard `GraphRenderer`:
-- Forces `stepped: true` on all datasets → flat horizontal lines between events
-- Removes intermediate data points where the value did not change (`null` = span gaps) to keep the chart clean
-- Domain used: `[["state", "=", "forecast"], ["warehouse_id", "=", warehouseId], [product filter]]`
-
----
-
-## Part 3 — Detail Lines Table
-
-### Purpose
-
-Every outgoing demand is reconciled against available supply and rendered as one or more table rows. The table shows **where the stock for each delivery will come from** — or flags it as unavailable.
-
-### Move selection and ordering
-
-Source: [`_get_report_lines()`](../addons/stock/report/stock_forecasted.py#L239)
+## The Big Picture — Three Sources
 
 ```
-Outgoing moves (outs):
-  1. Past outs  (reservation_date <= today) → order: priority desc, date, id
-  2. Future outs (reservation_date > today OR reservation_date IS NULL) → order: reservation_date, priority desc, date, id
-  Combined: past_outs | future_outs  (past outs have priority over future outs)
-
-Incoming moves (ins):
-  order: priority desc, date, id
+                      warehouse_id in context
+                               │
+     ┌─────────────────────────┼──────────────────────────────┐
+     ▼                         ▼                              ▼
+ Header totals            Stepped graph                 Detail table
+ product.product fields   report.stock.quantity          stock.forecasted_product_product
+ (_compute_quantities)    (PostgreSQL view)              ._get_report_lines()
+                                                              │
+                                                              └─► also used by the availability
+                                                                  badge on move lines
 ```
 
-Only moves in states `waiting`, `confirmed`, `partially_available`, `assigned` are included. `draft` and `cancel` are excluded.
+[`_get_report_data()`](../addons/stock/report/stock_forecasted.py#L156) builds the header and the lines for one warehouse: all locations under the warehouse view location count as "in the warehouse", and the warehouse **stock location** (`lot_stock_id`) and its children count as free stock. Without `warehouse_id` in the context, the first active warehouse is used ([`_get_warehouse()`](../addons/stock/report/stock_forecasted.py#L153)).
 
-### What `reservation_date` is
+`location_final_id` does not exist in 20.0; use `forecasted_location_id` ("Forecasted Location", [`stock_move.py:86`](../addons/stock/models/stock_move.py#L86), `forecasted_location_id`).
 
-`reservation_date` is a stored computed field on `stock.move`: [`stock_move.py:193`](../addons/stock/models/stock_move.py#L193)
+---
 
-| `reservation_method` on picking type | `reservation_date` value |
+## Part 1 — Header
+
+### Quantities
+[`_get_product_quantities()`](../addons/stock/report/stock_forecasted.py#L69) reads the product fields computed by [`_compute_quantities_dict()`](../addons/stock/models/product.py#L156) with the warehouse in the context:
+
+| Header label | Field | Formula ([`product.py:266`](../addons/stock/models/product.py#L266), `qty_available`) |
+|---|---|---|
+| On Hand | `qty_available` | Sum of quant quantities in the warehouse locations |
+| Incoming | `incoming_qty` | Sum of `product_qty` of moves in state waiting / confirmed / partially available / assigned that enter the warehouse |
+| Outgoing | `outgoing_qty` | Same states, moves that leave the warehouse |
+| Forecasted | `virtual_available` | On hand + incoming − outgoing − expired unreserved quantity; shown in red below zero |
+| (used by buttons) | `free_qty` | On hand − reserved − expired unreserved quantity |
+
+- For moves not done, "enters/leaves the warehouse" is judged on `forecasted_location_id` when set, else on the destination ([`_get_domain_locations_new()`](../addons/stock/models/product.py#L404)). A pick move from Stock to Output whose chain ends at the customer already counts as outgoing.
+- Draft moves are never in these numbers. [`_get_report_header()`](../addons/stock/report/stock_forecasted.py#L112) sums them separately (`draft_picking_qty`) for the table footer.
+- The expired unreserved quantity is only subtracted when the context has `with_expiration` ([`product.py:225`](../addons/stock/models/product.py#L225), `with_expiration`).
+- A kit's quantities are derived from its components (`mrp` override of `_compute_quantities_dict`, [`product.py:239`](../addons/mrp/models/product.py#L239)).
+- With `to_date` in the past, on hand is rebuilt backwards: current quants minus done move lines received after that date plus done move lines sent after it ([`product.py:231`](../addons/stock/models/product.py#L231), `dates_in_the_past`).
+
+### Lead time
+[`_get_product_leadtime()`](../addons/stock/report/stock_forecasted.py#L98) finds the rules that replenish the warehouse stock location and sums their delays with `_get_lead_days()` (purchase lead times, manufacturing lead time and days to prepare, transfer delays). The header shows the smallest total among the displayed variants and the earliest possible arrival = today + that delay; a popover lists each delay ([`leadTime`](../addons/stock/static/src/stock_forecasted/forecasted_header.js#L32)).
+
+### Additions by other modules
+| Module | Adds |
 |---|---|
-| `by_date` | `move.date - reservation_days_before` (or `reservation_days_before_priority` for urgent moves) |
-| `manual` | `False` (null) |
-| `at_confirm` | Set to today when the move is confirmed |
-
-Moves without a `reservation_date` are treated as future and sorted last. This means **urgent/priority moves are satisfied first** in the forecast reconciliation.
-
-### Reconciliation algorithm — 5 passes per out move
-
-For each outgoing move, demand is satisfied in this exact order:
-
-#### Pass 1 — Reserved stock
-- Checks linked pick/pack moves (via `_rollup_move_origs()`) for state `partially_available` or `assigned`
-- Reads `move.quantity` (reserved qty) on those linked moves
-- Subtracts already-counted reservations (`used_reserved_moves` dict prevents double-counting when multiple outs share the same pick/pack)
-- Deducts from `currents` (current stock dict keyed by `(product_id, location_id)`)
-- Source: [`stock_forecasted.py:241-268`](../addons/stock/report/stock_forecasted.py#L241)
-
-**Produces line type:** On-Hand (reserved) — `document_out` set, no `document_in`, `replenishment_filled=True`, `in_transit=True` if the reserved move has upstream `move_orig_ids`
-
-#### Pass 2 — Free current stock
-- From unreserved demand remaining after Pass 1
-- Checks `currents[(product_id, location_id)]` for available non-reserved stock at the source location
-- Handles chained moves: if the source move has `move_orig_ids`, uses qty delivered by those origs minus qty already consumed by sibling moves
-- Deducts taken quantity from `currents`
-- Source: [`stock_forecasted.py:270-303`](../addons/stock/report/stock_forecasted.py#L270)
-
-**Produces line type:** On-Hand (free) — `document_out` set, no `document_in`, `replenishment_filled=True`, `in_transit=False`
-
-#### Pass 3 — Transit stock
-- Stock that is inside the warehouse total but not at the correct sub-location to be reserved from
-- `transit_stock = product_sum[product_id] - free_stock` where `product_sum` sums all warehouse locations except sub-locations of the main stock location
-- `unreservable_qty = min(demand_out, transit_stock)`
-- Source: [`stock_forecasted.py:449-452`](../addons/stock/report/stock_forecasted.py#L449)
-
-**Produces line type:** In-Transit — `document_out` set, no `document_in`, `replenishment_filled=True`, `in_transit=True`
-
-#### Pass 4 — Incoming moves (procurement-linked first, then any)
-- First: tries `dest_ids_to_in_ids[out.id]` — incoming moves that are directly linked to this out via procurement chain (`_rollup_move_dests`)
-- Second: if still demand remaining, tries any available `ins_per_product[product_id]`
-- Splits incoming move qty across multiple outs if needed (`taken_from_in = min(demand, in_data['qty'])`)
-- Source: [`stock_forecasted.py:306-328`](../addons/stock/report/stock_forecasted.py#L306) (`_reconcile_out_with_ins`)
-
-**Produces line type:** Reconciled — both `document_in` and `document_out` set, `replenishment_filled=True`
-
-#### Pass 5 — Unreconciled (not available)
-- Any remaining demand after Passes 1-4 that could not be satisfied
-- Source: [`stock_forecasted.py:467-469`](../addons/stock/report/stock_forecasted.py#L467)
-
-**Produces line type:** Not Available — `document_out` set, no `document_in`, `replenishment_filled=False`
-
-### After all outs are processed — remaining items
-
-**Free Stock line:** remaining `currents[product_id, wh_stock_location_id]` not allocated to any out.
-- Shows if line `quantity == 0` only when there are no other lines for the product
-- Source: [`stock_forecasted.py:474-476`](../addons/stock/report/stock_forecasted.py#L474)
-
-**Unused Incoming lines:** incoming moves with remaining `qty > 0` not matched to any out.
-- Source: [`stock_forecasted.py:479-483`](../addons/stock/report/stock_forecasted.py#L479)
-
-### Line type summary
-
-| Condition | `document_in` | `document_out` | `in_transit` | `replenishment_filled` | Display meaning |
-|---|---|---|---|---|---|
-| On-Hand (reserved from pick/pack) | No | Yes | No | Yes | Stock already reserved for this delivery |
-| On-Hand (reserved, in transit to slot) | No | Yes | Yes | Yes | Reserved but physically at wrong sub-location |
-| On-Hand (from free stock) | No | Yes | No | Yes | Will be taken from available stock |
-| In-Transit (unreservable) | No | Yes | Yes | Yes | Stock in warehouse but wrong location, cannot reserve yet |
-| Reconciled (matched to receipt) | Yes | Yes | No | Yes | Delivery matched to an incoming shipment |
-| Free Stock (no demand) | No | No | No | Yes | Available stock with no demand assigned |
-| Unused Incoming | Yes | No | — | — | Receipt not matched to any demand |
-| Not Available | No | Yes | No | No | Demand exists but no supply found |
-
-Source: [`forecasted_details.js:47-61`](../addons/stock/static/src/stock_forecasted/forecasted_details.js#L47)
-
-### `_rollup_move_origs` and `_rollup_move_dests`
-
-These are recursive traversals of the move chain: [`stock_move.py:2484-2514`](../addons/stock/models/stock_move.py#L2484)
-
-- `_rollup_move_origs()` — walks backward through `move_orig_ids` chain. Returns all upstream move IDs.
-- `_rollup_move_dests()` — walks forward through `move_dest_ids` chain. Returns all downstream move IDs.
-- Both use `seen` set to prevent infinite loops in cyclic chains.
-- Cache is prewarmed before the reconciliation loop via `_rollup_move_origs_fetch()` and `_rollup_move_dests_fetch()`.
-
-These are critical for 3-step routes where a delivery (OUT) is linked to a PACK move linked to a PICK move. The reconciliation looks up all the way to the PICK to find reservations.
-
-### `location_final_id` and multi-step routes
-
-`location_final_id` on `stock.move` is the **actual final destination** in a multi-step route, as opposed to `location_dest_id` which may be an intermediate stop.
-
-In `_move_domain()`, the out-domain uses:
-```python
-'|',
-('location_dest_id', 'not in', wh_location_ids),
-'&',
-('location_final_id', '!=', False),
-('location_final_id', 'not in', wh_location_ids),
-```
-This correctly identifies a move as "leaving the warehouse" even if its current intermediate destination is still inside the warehouse. Source: [`stock_forecasted.py:36-41`](../addons/stock/report/stock_forecasted.py#L36)
+| `stock_account` | Stock value of the warehouse quants, for Inventory Administrators only ([`stock_forecasted.py:11`](../addons/stock_account/report/stock_forecasted.py#L11), `_get_report_header`) |
+| `product_expiry` | "To remove" quantity (expired stock), expired quants excluded from free stock ([`stock_forecasted.py:11`](../addons/product_expiry/report/stock_forecasted.py#L11), `to_remove_qty`) |
+| `mrp` | Draft MO quantities and draft component demand (`draft_production_qty`, [`stock_forecasted.py:25`](../addons/mrp/report/stock_forecasted.py#L25), `_get_report_header`) |
+| `sale_stock`, `purchase_stock` | Draft quotation and draft purchase quantities with links (`draft_sale_qty`, `draft_purchase_qty`) |
 
 ---
 
-## Part 4 — `forecast_availability` Widget (in Picking Form)
+## Part 2 — The Stepped Graph
 
-This is a separate, inline forecast shown per operation line on a picking, not part of the Forecast Report page itself.
+The graph is a standard graph view embedded in the page, on model [`report.stock.quantity`](../addons/stock/report/report_stock_quantity.py#L7), a PostgreSQL **view** (`_auto = False`) recreated by [`init()`](../addons/stock/report/report_stock_quantity.py#L36) at module install or update. The page filters it on `state = 'forecast'`, the warehouse and the product ([`graphDomain`](../addons/stock/static/src/stock_forecasted/stock_forecasted.js#L107)).
 
-### Field definition
+### What the view contains
+One row per product × warehouse × day × state:
 
-`stock.move.forecast_availability` — computed, not stored, `compute_sudo=True`. Source: [`stock_move.py:190`](../addons/stock/models/stock_move.py#L190)
-
-Computed by [`_compute_forecast_information()`](../addons/stock/models/stock_move.py#L502).
-
-### Computation logic per state
-
-| Move state | `forecast_availability` value | Logic |
+| `state` | Label | Rows |
 |---|---|---|
-| `assigned` | `move.quantity` (reserved qty in product UoM) | Already fully reserved — use what's reserved |
-| `draft`, `free_qty >= demand` | `free_qty` | Enough free stock right now |
-| `draft`, consuming, insufficient | `virtual_available - product_qty` | Net forecast after subtracting this move's demand |
-| `waiting/confirmed/partially_available`, outgoing | Result of `_get_forecast_availability_outgoing()` | Queries `report.stock.quantity` view |
-| `incoming` (receipt) | `virtual_available + product_qty` (if draft) | Adding this receipt improves the forecast |
-| Internal move, enough `free_qty` | `free_qty` | Sufficient stock at source location |
+| `forecast` | Forecasted Stock | Stock level of the day |
+| `in` | Forecasted Receipts | Open moves entering the warehouse that day |
+| `out` | Forecasted Deliveries | Open moves leaving that day (negative) |
 
-For unreserved outgoing moves, [`_get_forecast_availability_outgoing()`](../addons/stock/models/stock_move.py#L2516) queries the `report.stock.quantity` view to find the **first date** when the running cumulative forecast reaches the required quantity. That date becomes `forecast_expected_date`.
+How it is built:
+1. **Moves kept:** storable products, not draft or cancelled, whose source warehouse differs from the destination warehouse; done moves only if dated within the past period. The destination of an open move is `forecasted_location_id`, else `location_dest_id`. Moves between two warehouses are duplicated (`GENERATE_SERIES(0, 1)`) so each warehouse gets its own out or in row.
+2. **Base level:** each quant in an internal location of a warehouse, or in a transit location, is repeated on every day from today − period to today + period.
+3. **Corrections:** a done move adds back its quantity on the days before it happened (so the past shows the stock of that day); an open move adds its signed quantity from its date (or the start of the window) to the end.
+4. Rows are summed per product, template, state, date, company and warehouse.
 
-### Widget colors
+**Period:** system parameter `stock.report_stock_quantity_period` in months, default 3, read with `get_int` when the view is created ([`report_stock_quantity.py:49`](../addons/stock/report/report_stock_quantity.py#L49), `report_period`). Changing it takes effect only after the view is rebuilt (module update).
 
-[`forecast_widget.js`](../addons/stock/static/src/widgets/forecast_widget.js)
-
-| Color | Class | Condition | Meaning |
-|---|---|---|---|
-| Green | `text-bg-success` | `forecast_availability >= product_qty` AND no `forecast_expected_date` | Stock available now from current inventory |
-| Yellow | `text-bg-warning` | `forecast_availability >= product_qty` AND `forecast_expected_date <= date_deadline` | Will be covered by a future receipt, on time |
-| Red | `text-bg-danger` | `forecast_availability < product_qty` OR `forecast_expected_date > date_deadline` | Cannot fulfill, or will be late |
-
-The widget appears in the picking form on `stock.move` lines: [`stock_picking_views.xml:288`](../addons/stock/views/stock_picking_views.xml#L288).
-Clicking the widget opens the full Forecast Report for that product.
+### Rendering
+[`StockForecastedGraphRenderer`](../addons/stock/static/src/stock_forecasted/forecasted_graph.js#L5) makes every dataset `stepped` and blanks the points where no dataset changes, keeping the first and last point.
 
 ---
 
-## Part 5 — Lead Time Display
+## Part 3 — The Detail Table (Reconciliation)
 
-Shown in the report header. Computed by [`_get_product_leadtime()`](../addons/stock/report/stock_forecasted.py#L98):
+[`_get_report_lines()`](../addons/stock/report/stock_forecasted.py#L239) builds the table.
 
-1. Gets the warehouse stock location from context
-2. Calls `product._get_rules_from_location(location)` to find applicable procurement rules
-3. Calls `rule._get_lead_days(product)` which sums all delays across the rule chain
-4. Returns `total_delay` (days) and `details` (breakdown per rule)
+### Which moves, in which order
+- **Outgoing** and **incoming** moves come from [`_move_domain()`](../addons/stock/report/stock_forecasted.py#L30) restricted to waiting, confirmed, partially available and assigned moves with a non-zero demand ([`_move_confirmed_domain()`](../addons/stock/report/stock_forecasted.py#L55)). An in comes from outside the warehouse into it; an out starts inside and its destination, or its forecasted location, is outside.
+- Outs are processed in two groups ([`stock_forecasted.py:332`](../addons/stock/report/stock_forecasted.py#L332), `past_domain`): first those whose **reservation date** is today or earlier (by priority, date, id), then the others (by reservation date, priority, date, id; no reservation date last).
+- Ins are ordered by priority, date, id.
 
-Frontend (`ForecastedHeader.leadTime`) picks the product with the **lowest** total delay if multiple variants are shown, and computes "Earliest Possible Arrival" as `today + total_delay`. Source: [`forecasted_header.js:30-48`](../addons/stock/static/src/stock_forecasted/forecasted_header.js#L30)
+`reservation_date` ([`_compute_reservation_date()`](../addons/stock/models/stock_move.py#L756)) depends on the operation type's **Reservation Method**: *Before scheduled date* gives move date − **Days** (or **Days when starred** for starred moves); *Manually* gives none; *At Confirmation* sets today when the move is confirmed. So moves that reserve now are served first, and starred moves that reserve earlier move up.
 
----
+### Chains
+For each out, the report collects its upstream moves with [`_rollup_move_origs()`](../addons/stock/models/stock_move.py#L2796), stopping at incoming moves ([`stock_forecasted.py:349`](../addons/stock/report/stock_forecasted.py#L349), `_rollup_move_origs`). In a 3-step delivery the OUT therefore sees the reservations of its PACK and PICK. Each in knows its downstream moves ([`_rollup_move_dests()`](../addons/stock/models/stock_move.py#L2793)), which links a receipt to the delivery it was procured for. Caches are prefetched first (`_rollup_move_origs_fetch`, `_rollup_move_dests_fetch`).
 
-## Part 6 — Warehouse Filter and Context
+### Stock counters
+Quants of the warehouse are summed per product and location; quantities in children of the stock location are also added to the stock location ([`stock_forecasted.py:393`](../addons/stock/report/stock_forecasted.py#L393), `currents`). Then, for all outs of a product:
+1. **Reserved stock** ([`_get_out_move_reserved_data()`](../addons/stock/report/stock_forecasted.py#L240)): the reserved quantity of the out and its upstream moves. A pick or pack shared by several outs is counted once (`used_reserved_moves`).
+2. **Taken from stock** ([`_get_out_move_taken_from_stock_data()`](../addons/stock/report/stock_forecasted.py#L269)): for unreserved upstream moves, what free stock at their source location can cover. For chained moves, only what the previous step delivered and siblings did not take.
 
-The OWL component [`StockForecasted`](../addons/stock/static/src/stock_forecasted/stock_forecasted.js#L14) loads all active warehouses on startup and adds a warehouse switcher to the control panel.
+**Free stock** = what remains at the stock location. **Transit stock** = what remains elsewhere in the warehouse (outside the stock location tree), e.g. in Input or Output ([`stock_forecasted.py:423`](../addons/stock/report/stock_forecasted.py#L423), `transit_stock`).
 
-- On switch: calls `updateWarehouse(id)` → `reloadReport()` which dispatches a new `ir.actions.client` action with the new `warehouse_id` in context (replaces the current action on the breadcrumb stack)
-- Backend uses `warehouse_id` from context in [`_get_warehouse()`](../addons/stock/report/stock_forecasted.py#L153) — falls back to first active warehouse if not set
-- All location domains are derived from `warehouse.view_location_id` (includes all child locations)
-- The "free stock" location is `warehouse.lot_stock_id` specifically
+### Lines per out
+For each out, in order, until its demand is covered:
 
-Source: [`stock_forecasted.js:87-105`](../addons/stock/static/src/stock_forecasted/stock_forecasted.js#L87)
+| Step | Line | `document_in` | `in_transit` | `replenishment_filled` |
+|---|---|---|---|---|
+| Reserved | Reserved quantity, with the reserving document | — | yes if the reserving move has upstream moves | yes |
+| Free stock | Quantity taken from stock | — | no | yes |
+| In transit | Quantity covered by transit stock | — | yes | yes |
+| Linked receipts | Quantity from receipts procured for this out ([`_reconcile_out_with_ins()`](../addons/stock/report/stock_forecasted.py#L305)) | receipt | no | yes |
+| Any receipt | Second pass over every receipt of the product, after all outs had their linked receipts | receipt | no | yes |
+| Not available | What is still uncovered | — | no | **no** |
 
----
+A receipt can be split across several outs. After the outs, the product gets: a **Free Stock in Transit** line for unused transit stock, the **Free Stock** line ([`_free_stock_lines()`](../addons/stock/report/stock_forecasted.py#L485); shown even at zero when the product has no other line), and one line per receipt quantity nobody uses.
 
-## Key Models
+Each line ([`_prepare_report_line()`](../addons/stock/report/stock_forecasted.py#L174)) carries the source documents (`_get_source_document()`: the picking, the MO for component and finished moves in `mrp`, the order in sales and purchase modules), receipt and delivery dates, late flags (`is_late` when the receipt comes after the delivery date), the reservation document and `is_matched` for highlighted moves.
 
-### `stock.forecasted_product_product` — reconciliation engine
-> [`addons/stock/report/stock_forecasted.py`](../addons/stock/report/stock_forecasted.py)
+### What the user sees
+Columns: **Available**, **Outgoing**, **Used by**, action, **Delivery Date**. The **Available** cell reads ([`forecasted_details.xml`](../addons/stock/static/src/stock_forecasted/forecasted_details.xml#L40), `document_in`):
 
-Abstract model. No stored fields. All computation is on-demand per `get_report_values()` call.
+| Line | Available cell |
+|---|---|
+| Reconciled | Receipt link: "quantity expected on date" |
+| In transit, with an out | Stock In Transit |
+| In transit, no out | Free Stock in Transit |
+| Reserved or free stock for an out | Stock To Reserve: total |
+| Free stock | Free Stock |
+| Uncovered | Not Available (row in red) |
 
-### `stock.forecasted_product_template` — template variant
-> [`addons/stock/report/stock_forecasted.py:506`](../addons/stock/report/stock_forecasted.py#L506)
+Consecutive lines from the same receipt, or of the same on-hand or not-available group, are merged ([`_mergeLines()`](../addons/stock/static/src/stock_forecasted/forecasted_details.js#L154)). Below the lines: **Forecasted Inventory**, draft rows (Incoming / Outgoing Draft Transfer, plus draft MOs, quotations and draft purchases from the other modules) and **Forecasted with Pending** = forecasted + draft in − draft out ([`futureVirtualAvailable()`](../addons/stock/static/src/stock_forecasted/forecasted_details.js#L231)).
 
-Inherits from `stock.forecasted_product_product`. Overrides `get_report_values()` to pass `product_template_ids` instead of `product_ids`.
-
-### `report.stock.quantity` — graph data view
-> [`addons/stock/report/report_stock_quantity.py`](../addons/stock/report/report_stock_quantity.py)
-
-`_auto = False` (PostgreSQL VIEW). Never written directly. Rebuilt on module init.
-Fields: `date`, `product_id`, `product_tmpl_id`, `state` (`forecast`/`in`/`out`), `product_qty`, `company_id`, `warehouse_id`.
-
----
-
-## Key Methods
-
-| Method | File:Line | Purpose |
+### Actions in the table
+| Action | Shown when | Effect |
 |---|---|---|
-| `get_report_values()` | [`stock_forecasted.py:16`](../addons/stock/report/stock_forecasted.py#L16) | Entry point — called by OWL component, returns all data for the report |
-| `_get_report_data()` | [`stock_forecasted.py:156`](../addons/stock/report/stock_forecasted.py#L156) | Orchestrates header + lines |
-| `_get_report_header()` | [`stock_forecasted.py:112`](../addons/stock/report/stock_forecasted.py#L112) | Builds header: product quantities, draft qty, lead time |
-| `_get_report_lines()` | [`stock_forecasted.py:239`](../addons/stock/report/stock_forecasted.py#L239) | Core reconciliation — matches outs to supply |
-| `_reconcile_out_with_ins()` | [`stock_forecasted.py:306`](../addons/stock/report/stock_forecasted.py#L306) | Inner loop: matches one out to available ins |
-| `_prepare_report_line()` | [`stock_forecasted.py:174`](../addons/stock/report/stock_forecasted.py#L174) | Builds a single display line dict with all flags |
-| `_move_domain()` | [`stock_forecasted.py:30`](../addons/stock/report/stock_forecasted.py#L30) | Builds in/out domain accounting for `location_final_id` |
-| `_move_confirmed_domain()` | [`stock_forecasted.py:55`](../addons/stock/report/stock_forecasted.py#L55) | Adds state filter for confirmed/waiting/assigned/partially_available |
-| `_move_draft_domain()` | [`stock_forecasted.py:49`](../addons/stock/report/stock_forecasted.py#L49) | Adds state filter for draft moves only (header only) |
-| `_get_warehouse()` | [`stock_forecasted.py:153`](../addons/stock/report/stock_forecasted.py#L153) | Reads warehouse from context, falls back to first active |
-| `_get_product_leadtime()` | [`stock_forecasted.py:98`](../addons/stock/report/stock_forecasted.py#L98) | Resolves procurement rule chain and sums delays |
-| `action_reserve_linked_picks()` | [`stock_forecasted.py:490`](../addons/stock/report/stock_forecasted.py#L490) | Reserves stock for a move's upstream picks — called from Reserve button |
-| `action_unreserve_linked_picks()` | [`stock_forecasted.py:497`](../addons/stock/report/stock_forecasted.py#L497) | Unreserves upstream picks — called from Unreserve button |
-| `_compute_quantities_dict()` | [`product.py:163`](../addons/stock/models/product.py#L163) | Computes all 5 quantity fields with 3 DB queries |
-| `_compute_forecast_information()` | [`stock_move.py:502`](../addons/stock/models/stock_move.py#L502) | Computes `forecast_availability` and `forecast_expected_date` per move |
-| `_get_forecast_availability_outgoing()` | [`stock_move.py:2516`](../addons/stock/models/stock_move.py#L2516) | Queries `report.stock.quantity` view to find when outgoing demand will be met |
-| `_compute_reservation_date()` | [`stock_move.py:645`](../addons/stock/models/stock_move.py#L645) | Computes when a move should start reserving based on picking type method |
-| `_rollup_move_origs()` | [`stock_move.py:2497`](../addons/stock/models/stock_move.py#L2497) | Recursively walks upstream move chain |
-| `_rollup_move_dests()` | [`stock_move.py:2494`](../addons/stock/models/stock_move.py#L2494) | Recursively walks downstream move chain |
-| `report.stock.quantity.init()` | [`report_stock_quantity.py:36`](../addons/stock/report/report_stock_quantity.py#L36) | Recreates the PostgreSQL VIEW on module install/upgrade |
+| Star (priority) | The out belongs to a transfer | Toggles the transfer's priority, then reloads |
+| **Reserve** / **Unreserve** | Inventory users (`user_can_edit_pickings`), transfer lines not in transit; Unreserve on reserved lines | Reserve or unreserve the out and its upstream moves ([`action_reserve_linked_picks()`](../addons/stock/report/stock_forecasted.py#L489), [`action_unreserve_linked_picks()`](../addons/stock/report/stock_forecasted.py#L497)) |
+| **Assign** / **Unassign** | Line has both a receipt and a delivery | `stock.allocation.report.action_assign` / `action_unassign`: links the receipt to the delivery as its origin (make-to-order link, shared references, optional **Location for allocation** on the receipt's operation type), splitting moves when quantities differ ([`action_assign()`](../addons/stock/report/stock_allocation_report.py#L207)) |
+
+Header buttons: **Replenish** opens the `product.replenish` wizard with the warehouse; **Update Quantity** opens the quants in inventory mode ([`_onClickReplenish()`](../addons/stock/static/src/stock_forecasted/forecasted_buttons.js#L31)).
 
 ---
 
-## UI Entry Points
+## Part 4 — Availability Badge on Move Lines
 
-| Entry Point | Path in UI | What It Does |
-|---|---|---|
-| Forecasted Qty stat button | Product Template form → smart button | Opens full Forecast Report via `action_product_tmpl_forecast_report` |
-| Forecasted Qty stat button | Product Variant form → smart button | Opens full Forecast Report via `action_product_forecast_report` |
-| Forecast widget column | Inventory → Transfers → Operation lines | Shows `forecast_availability` colored badge per move line; click opens report |
-| Replenish button | Forecast Report header | Opens `product.replenish` wizard pre-filled with warehouse context |
-| Update Quantity button | Forecast Report header | Opens `stock.quant` in inventory mode for manual adjustments |
-| Reserve / Unreserve | Forecast Report detail lines | Calls `action_reserve_linked_picks` / `action_unreserve_linked_picks` on linked picks |
-| Warehouse switcher | Forecast Report control panel | Reloads report for the selected warehouse |
+`stock.move` fields [`forecast_availability` and `forecast_expected_date`](../addons/stock/models/stock_move.py#L194) (computed, not stored, `compute_sudo`) are filled by [`_compute_forecast_information()`](../addons/stock/models/stock_move.py#L528):
 
-Actions defined in [`addons/stock/views/stock_forecasted.xml`](../addons/stock/views/stock_forecasted.xml):
-- `stock_forecasted_product_product_action` — tag: `stock_forecasted`, res_model: `product.product`
-- `stock_forecasted_product_template_action` — tag: `stock_forecasted`, res_model: `product.template`
+| Move | `forecast_availability` |
+|---|---|
+| Not storable | Its quantity |
+| Assigned | Reserved quantity |
+| Draft, free quantity covers the demand | Free quantity |
+| Draft outgoing, free quantity short | Forecasted quantity if it covers the demand, else forecasted quantity − demand |
+| Waiting / confirmed / partially available outgoing | From the reconciliation engine (below) |
+| Internal, free quantity covers the demand | Free quantity |
+| Receipt | Forecasted quantity at its date (+ its own quantity while draft) |
+
+Free and forecasted quantities are read for the move's warehouse at the move date (or now if earlier). For unreserved outgoing moves, [`_get_forecast_availability_outgoing()`](../addons/stock/models/stock_move.py#L2815) runs `_get_report_lines(..., read=False)` for the move's warehouse and source location: covered lines add up to the available quantity, an uncovered line gives a negative value, and the expected date is the latest receipt date among the lines serving the move.
+
+The badge ([`ForecastWidgetField`](../addons/stock/static/src/widgets/forecast_widget.js#L7)):
+
+| Badge | Condition |
+|---|---|
+| **Available** (green) | Availability ≥ demand and no expected date |
+| **Exp** *date* (yellow) | Covered by a future receipt on or before the deadline |
+| **Exp** *date* (red) | Covered, but the expected date is after the move deadline |
+| **Not Available** (red) | Availability < demand |
+
+It shows on operation lines of internal and outgoing transfers that are not done or cancelled ([`stock_picking_views.xml:375`](../addons/stock/views/stock_picking_views.xml#L375), `forecast_widget`) and on MO component lines ([`mrp_production_views.xml:532`](../addons/mrp/views/mrp_production_views.xml#L532), `forecast_widget`). Clicking it opens the report for storable products.
 
 ---
 
 ## Configuration
 
-| Setting | Location | Effect |
+| Setting | Where | Effect |
 |---|---|---|
-| `stock.report_stock_quantity_period` | Technical → System Parameters | Number of months the graph covers before and after today (default: `3`). Change requires module upgrade to rebuild the view. |
-| `reservation_method` on picking type | Inventory → Configuration → Operations Types → Reservation field | Controls how `reservation_date` is computed per move (`at_confirm`, `by_date`, `manual`) |
-| `reservation_days_before` | Picking type form | Days before scheduled date to start reserving (used when `reservation_method='by_date'`) |
-| `reservation_days_before_priority` | Picking type form | Same but for urgent moves (priority = `1`) |
-| `stock.group_stock_user` security group | — | Controls visibility of Reserve/Unreserve buttons. `user_can_edit_pickings` flag in report data. Source: [`stock_forecasted.py:171`](../addons/stock/report/stock_forecasted.py#L171) |
+| `stock.report_stock_quantity_period` | System Parameters | Months shown before and after today in the graph (default 3); rebuild the view after a change |
+| **Reservation Method**, **Days**, **Days when starred** | Operation type | Drive `reservation_date`, hence the order in which outs are served |
+| **Location for allocation** (`allocated_location_id`) | Operation type of receipts | Where assigned receipts are sent ([`stock_picking_type.py:68`](../addons/stock/models/stock_picking_type.py#L68), `allocated_location_id`) |
+| Inventory User group | Users | Reserve / Unreserve links ([`stock_forecasted.py:171`](../addons/stock/report/stock_forecasted.py#L171), `user_can_edit_pickings`) |
+| Inventory Administrator group | Users | Stock value in the header (`stock_account`) |
 
 ---
 
-## Edge Cases & Gotchas
+## Extension Points
 
-- **Draft moves are NOT in the 4 header numbers.** They appear separately in the header as "Draft Quantities". Draft moves are NOT reconciled in the detail lines at all. Only states `waiting`, `confirmed`, `assigned`, `partially_available` count.
+| Hook | Used by |
+|---|---|
+| [`_get_report_header()`](../addons/stock/report/stock_forecasted.py#L112) | `mrp`, `sale_stock`, `purchase_stock`, `stock_account`, `product_expiry` add header data |
+| [`_prepare_report_line()`](../addons/stock/report/stock_forecasted.py#L174) | `mrp` adds the MO of component moves; `sale_stock` and `product_expiry` add line data |
+| [`_move_draft_domain()`](../addons/stock/report/stock_forecasted.py#L49) | `mrp` removes MO moves from the draft transfer rows |
+| `_get_quant_domain()`, `_free_stock_lines()` | `product_expiry` excludes expired quants and splits free stock by removal date |
+| `stock.move._get_source_document()` | Modules return their document for the table links |
+| `report.stock.quantity._get_product_qty_col()` | `product_expiry` counts only reserved quantity of quants past their removal date ([`report_stock_quantity.py:14`](../addons/product_expiry/report/report_stock_quantity.py#L14), `_get_product_qty_col`) |
 
-- **`virtual_available` ≠ graph forecast.** The header's Forecasted Quantity (`virtual_available`) is a simple formula computed from current quants and pending moves. The graph's `forecast` state in `report.stock.quantity` is a daily cumulative sum built by the SQL view and includes done moves in the historical window. They can differ momentarily due to caching or timing.
+JS side: `ForecastedDetails` groups lines through `_groupLines()` so modules can add groups, and `mrp`, `sale_stock`, `purchase_stock` extend its template with their draft rows.
 
-- **`reservation_date` controls priority, not scheduling.** Past-reservation-date outs are sorted and processed FIRST in reconciliation, meaning their demand is satisfied before future-dated outs. This is how urgent moves "jump the queue."
+---
 
-- **Multi-step routes and `location_final_id`.** In a 3-step delivery (PICK → PACK → OUT), the OUT move's `location_dest_id` is the customer location and `location_final_id` is also the customer. But the PACK move's `location_dest_id` is Output and `location_final_id` is customer. The forecast uses `location_final_id` to determine if the PACK move is an outgoing warehouse move.
+## Gotchas & Non-Obvious Behavior
 
-- **Sub-location quantities bubble up.** If stock is in `WH/Stock/Shelf-A` (a sub-location of `WH/Stock`), `currents[product_id, WH/Stock]` is incremented too. This ensures sub-location stock is visible at the main stock level. Source: [`stock_forecasted.py:390-399`](../addons/stock/report/stock_forecasted.py#L390)
-
-- **Same pick/pack for multiple outs.** `used_reserved_moves` dict prevents double-counting reservations when two OUT moves share the same PICK or PACK move. Each reservation is counted at most once across all outs. Source: [`stock_forecasted.py:403`](../addons/stock/report/stock_forecasted.py#L403)
-
-- **Interwarehouse transfers in the graph.** The SQL view duplicates interwarehouse moves (`GENERATE_SERIES(0,1)`) to produce both an OUT row for the source warehouse and an IN row for the destination. This ensures each warehouse's forecast is self-contained.
-
-- **`forecast_availability` is not stored.** Computed on every read, not cached in DB. Loading a picking with many lines triggers `_compute_forecast_information()` for all lines, which queries `report.stock.quantity`. This is `compute_sudo=True` — access control is bypassed.
-
-- **Expiry-aware mode.** If `with_expiration` context key is set, `_compute_quantities_dict()` additionally subtracts expired-but-unreserved quants from `free_qty` and `virtual_available`. Source: [`product.py:207-210`](../addons/stock/models/product.py#L207)
-
-- **Forecast graph is a VIEW, not live data.** The `report.stock.quantity` view is a static SQL VIEW — it always reflects the current state of `stock_move` and `stock_quant` tables at query time. It is NOT precomputed or cached. However it is also NOT refreshed by triggers — the view definition is fixed until next module upgrade.
+- **Header forecast ≠ graph.** The header is a formula over open moves at any date; the graph spreads moves over the window by date and only includes moves between warehouses (transfers inside one warehouse do not appear).
+- **Draft moves are not reconciled.** They only appear in the draft rows and in "Forecasted with Pending".
+- **Order is reservation date, not delivery date.** Outs that may reserve today are served before later ones, whatever their delivery date.
+- **One warehouse at a time.** Stock in another warehouse never covers demand; inter-warehouse transfers show as a receipt in one and a delivery in the other.
+- **Sub-locations count as stock.** Quants in children of WH/Stock are free stock; quants elsewhere in the warehouse are transit stock that covers demand but cannot be reserved yet.
+- **Shared pick/pack.** A pick feeding two deliveries is counted once across them.
+- **Availability badges are computed on read.** Every open outgoing move line runs the reconciliation for its product and warehouse, with sudo.
+- **The graph view definition is static.** It always reads live moves and quants, but the period and SQL only change when the view is recreated.
 
 ---
 
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
-- [`inventory.md`](inventory.md) — core inventory: moves, quants, routes, reservations, multi-step
+- [`inventory.md`](inventory.md) — moves, reservations, routes and multi-step transfers
+- [`mrp.md`](mrp.md) — MOs, component demand and manufacturing lead times shown in the report

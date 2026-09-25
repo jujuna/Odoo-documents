@@ -231,7 +231,7 @@ The 2010 text does not describe the interfaces our modules use, but it describes
 | Waybill as movement proof, **never** a credit document (Art. 25(22)) | `rs_waybill` ↔ `rs_einvoice` separation; the bridge links them but VAT comes only from the invoice side |
 | Special invoice **replaces** the waybill when transport accompanies supply (Art. 52(2)) | Why a supply can legitimately have an invoice and no waybill |
 | Correction invoice = **two rows, before and after, totals as the difference** (Art. 55) | The shape of every correction flow in [`rs_waybill_einvoice_fix_plan.md`](rs_waybill_einvoice_fix_plan.md) and [`rs_einvoice_down_payments.md`](rs_einvoice_down_payments.md) |
-| Reverse-charge credit arises **when the bank debits**, evidenced by the payment document (Art. 66) | The payment-time withholding/RC design in [`gec_l10n_ge_tax.md`](gec_l10n_ge_tax.md) |
+| Reverse-charge credit arises **when the bank debits**, evidenced by the payment document (Art. 66) | Odoo 20 books reverse charge when the bill is posted (the `l10n_ge` reverse-charge taxes); only withholding runs at payment. The Art. 66 timing is not modelled. See [`l10n_ge.md`](l10n_ge.md#withholding-at-payment) |
 | Credit unwinding: 5% trigger, 1/5 over 5 years, 1/10 over 10 years, year-end true-up in boxes 20/21 (Arts. 73, 75) | Nothing in our stack computes this — it is a known gap, not an implemented feature |
 | Exemption by **register lookup before invoicing** (Art. 71(6)) | The pattern behind fiscal-position-driven 0% supply |
 | In-kind salary dated to the **last day of the month** (Art. 38(7)(ა)) | `geo_payroll` benefit and in-kind handling |

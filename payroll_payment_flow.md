@@ -1,130 +1,185 @@
-# Payroll Payment Flow — Stock Mechanics, Localization Standards, GEC Design Analysis
+# Payroll Payment Flow — Paying Payslips and Settling the Salary Entry
 
-> Researched 2026-08-05 from Odoo 19 source (7-agent sweep, adversarially verified) + live DB `gec_modules_hr3`.
-> Companion docs: [geo_payroll.md](geo_payroll.md) §10 (booking pattern decision), [../BASIS_SALARY_NET_PAYMENT_HANDOFF.md](../BASIS_SALARY_NET_PAYMENT_HANDOFF.md) (agreed fix plan, 2026-08-02).
-> Status: **DECIDED + code shipped 2026-08-05** — Option B (standard net-payable layout) chosen after the accountant rejected 3160; `geo_payroll` 19.0.1.8.0 configurator + test updated, **19.0.1.9.0 adds a fingerprint-guarded migration** that realigns already-configured ge companies on upgrade (only rewrites rules still matching the old shipped mapping; custom accountant values untouched).
-> **19.0.1.10.0 + basis_bank 19.0.1.12.0 (same day): NET-only payment filter in code** — user rejected both the account-type change on 3181/3182 (Payable→Current is required before un-reconciling, core constraint) and leaving multiple payments. AU-precedent solution instead: `hr.payslip.action_register_payment` override replaces the wizard's `active_ids` with the structure's NET-account lines; `account.payment.register._reconcile_payments` override flips the slip to `paid` when its NET lines are settled (stock demands every line at zero — open pension interims would block forever); `_basisbank_send_salaries` passes only NET lines (handoff Edit A; Edits B/C obsolete under the net-payable layout). 3181/3182 stay Payable+reconcilable — the accountant checkbox question is **dropped**. **Verified live on slip 36** (one payment 23.52 → NET reconciled → slip paid; withholding legs open by design). **basis_bank 19.0.1.13.0**: stale-salary-batch watchdog cron — a batch never transmitted within 48h of creation gets a one-time to-do activity + chatter note (slips read Paid while no money moved; the payment-level 48h guard can't see never-sent batches). Suite run + cleanup still pending (§6).
+> **Modules:** `hr_payroll_account` + `account.payment.register`; custom `geo_payroll`, `gec_localization`, `gec_payroll_bank`, `basis_bank` | **Path:** [`enterprise/hr_payroll_account/`](../enterprise/hr_payroll_account/), [`custom_addons/gec_odoo_modules/gec_payroll_bank/`](../custom_addons/gec_odoo_modules/gec_payroll_bank/)
+> Verified against Odoo 20 source on 2026-09-24.
 
-## 1. The stock payment chain (what the Pay button actually does)
+## What It Does & Why It Exists
+
+"Paying a payslip" means two different things:
+
+1. **Payroll state:** the payslip moves from *Validated* to *Paid*.
+2. **Accounting:** the salary entry's liabilities (net salary, pension, income tax) are settled by
+   real `account.payment` records, reconciled against the entry, and sent to a bank.
+
+Stock Odoo 20 does only the first. The GEC design does both with standard payments: every
+liability on the payslip entry is a reconcilable Payable line with a partner, and the **Pay
+Salaries** wizard pays them through the standard payment register, marks the payslips Paid and
+hands sealed batches to the bank module. This doc explains the stock mechanics first, then the
+design built on them.
+
+---
+
+## Stock Odoo 20: How Paying Works
 
 | Step | What happens | Source |
 |---|---|---|
-| 1. Guard | `NET` rule's **Credit Account** must have `reconcile=True`, else `UserError: The credit account on the NET salary rule is not reconciliable`. Stock enterprise code. Also blocks: already-paid slips, untrusted employee bank (`allow_out_payment=False`), unposted move. | [hr_payslip.py:281-289](../enterprise/hr_payroll_account/models/hr_payslip.py#L281) |
-| 2. Sweep | The button passes **ALL move lines** of the slip's entry to `account.payment.register` (`default_partner_id`=employee work contact, `payment_consider_partner=True`). It does NOT pre-filter to the NET line. | [hr_payslip.py:290-296](../enterprise/hr_payroll_account/models/hr_payslip.py#L290) |
-| 3. Wizard filter | Keeps a line only if account type ∈ (`asset_receivable`, `liability_payable`) — extended with `liability_current` under the Pay-button context — AND residual ≠ 0. Non-reconcilable accounts always report residual 0, so they drop out silently. | [account_payment_register.py:952-965](../addons/account/wizard/account_payment_register.py#L952), [account_payment.py:11-15](../enterprise/hr_payroll_account/models/account_payment.py#L11), [account_move_line.py:773-778](../addons/account/models/account_move_line.py#L773) |
-| 4. Batching | One payment per batch, key = `(partner, account, currency, partner_bank, partner_type)`. Same account+partner lines **net into one batch** (never opposite-direction pairs); different accounts or partners = separate payments. Direction = sign of the batch's summed balance. | [account_payment_register.py:265-283, 349-358, 388-389](../addons/account/wizard/account_payment_register.py#L265) |
-| 5. Paid flip | Only under the Pay-button context (`hr_payroll_payment_register`), slip → `paid` **only when EVERY line of the slip's move has zero residual at that moment**. Any reconcilable line left open (transit legs, pension interims) blocks it permanently — the check never re-fires later. | [account_payment_register.py:24-42](../enterprise/hr_payroll_account/wizard/account_payment_register.py#L24) |
+| 1. Salary entry | At validation each rule line becomes a journal item. A rule with **Set employee on account line** (`employee_move_line`) gets the employee's work contact as partner; any other line gets the rule's third-party partner. An employee with several bank accounts gets one NET item per account | [_prepare_line_values](../enterprise/hr_payroll_account/models/hr_payslip.py#L123), [hr_salary_rule.py:37](../enterprise/hr_payroll_account/models/hr_salary_rule.py#L37) |
+| 2. **Pay** button | On a validated payslip; opens the payment report wizard | [hr_payslip_views.xml:53](../enterprise/hr_payroll/views/hr_payslip_views.xml#L53) |
+| 3. Report + Mark as Paid | Exports manually or as CSV, stamps `paid_date`, then `action_payslip_paid()` sets state *Paid*. **No accounting entry is made** | [mark_as_paid](../enterprise/hr_payroll/wizard/hr_payroll_payment_report_wizard.py#L162), [action_payslip_paid](../enterprise/hr_payroll/models/hr_payslip.py#L1062) |
+| 4. Settle the entry | Left to the accountant (payments, statement matching) | — |
 
-Two structural consequences:
+Payment-register plumbing is still in `hr_payroll_account`, but nothing in a generic install
+calls it. Only `l10n_au_hr_payroll_account` re-adds a Register Payment action
+([hr_payslip.py:491](../enterprise/l10n_au_hr_payroll_account/models/hr_payslip.py#L491)).
+Details of the entry itself: [`hr_payroll_account.md`](hr_payroll_account.md).
 
-- **Every open payable-type line gets its own payment.** Stock salary rules can carry a third-party `partner_id` (tax authority, insurer) — in stock designs extra payable lines are either real third-party debts or sit on non-reconcilable interim accounts and vanish at step 3.
-- **The guard exists because a payment can only *close an open item*.** The payslip books "we owe employee X" as a credit on a reconcilable account; the payment books the opposite and reconciliation marries the two. Without a reconcilable NET credit account there is nothing a payment could ever settle — the debt would stay open forever and the slip could never become `paid`. With a bank account there (our 1210 case) it also protects against booking the cash outflow twice.
+### Payment register rules that shape any payroll design
 
-## 2. What stock localizations do (survey of all 25 l10n_*_hr_payroll_account modules)
+- **Only Receivable and Payable lines are payable**
+  ([_get_valid_payment_account_types](../addons/account/models/account_payment.py#L247)). Context
+  `hr_payroll_payment_register` adds Current Liabilities
+  ([account_payment.py:11](../enterprise/hr_payroll_account/models/account_payment.py#L11)).
+- **One account type per wizard.** Lines of two types raise "You can't register payments for both
+  inbound and outbound moves at the same time" — misleading, but that is the check
+  ([account_payment_register.py:1049](../addons/account/wizard/account_payment_register.py#L1049)).
+- **Batches** are per partner, account, currency and bank account; `hr_payroll_account` takes the
+  bank account from the journal item, else the partner's first account
+  ([_get_line_batch_key](../enterprise/hr_payroll_account/wizard/account_payment_register.py#L11)).
+- **Every journal item keeps a residual until it is reconciled**, expense lines included
+  ([account_move_line.py:1212](../addons/account/models/account_move_line.py#L1212)). A line on a
+  non-reconcilable account is never closed, so "all lines at zero" never happens on a salary
+  entry. The stock paid transition in `_reconcile_payments` waits for exactly that
+  ([account_payment_register.py:36](../enterprise/hr_payroll_account/wizard/account_payment_register.py#L36)),
+  so it does not fire.
 
-No module ever sets `reconcile=True` in Python — the flag always comes from the country CoA CSV. The generic `_configure_payroll_account` only writes rule accounts/tags and the Salaries journal ([account_chart_template.py:26-67](../enterprise/hr_payroll_account/models/account_chart_template.py#L26)).
+---
 
-| Country | NET credit account | Type / reconcile | Deduction style | Pattern |
-|---|---|---|---|---|
-| AE | 201002 Payables | payable / **True** | liability in debit field (sign-flip) | standard |
-| SA | 201002 Payables | payable / **True** | debit field | standard |
-| JO | 200101 Payables | payable / **True** | debit field (tax/social also reconcilable) | standard |
-| EG | 201002 Payables | payable / **True** | debit field; **interims 201026/201027 reconcile=False** | standard |
-| US | 2300 Salary Payable | current / **True** | debit field → 2301 (reconcilable) | standard |
-| IN | 300010 Salary Exp Payable | current / **True** | debit field (all reconcile=False) | standard |
-| MX | 210.01.01 Provision | current / **True** | debit field | standard |
-| HK | 2217 Salaries Payable | current / True | debit field (MPF reconcile=False) | standard |
-| KE | 2220 Net Wages (intended) | payable / True | credit field | standard — **stock bug: mapping silently no-ops** |
-| AU | 21300 Wages & Salaries | current / **True** | debit field; gross composed on expense 62430 | standard + ABA bank-file batch; duplicates the same NET guard in its run flow |
-| **BE** | 455000 Remuneration | current / **False** | both fields mixed | **never uses the Pay button** — `batch_payroll_move_lines` forced on (button hidden), pays via SEPA files |
-| **CH** | none — no NET mapping | transit 1090 asset / True | everything transits 1090 | **the only stock gross-clearing design** — net = residual on pass-through 1090; also batch/SEPA only, button hidden |
-| LT, PL, RO, SK, TR, ID, MY, BD, LU, MA, NL, PK, FR | — | — | — | empty stubs, no mapping |
+## The GEC Design
 
-**The two stock families:**
+### 1. Booking layout (net-payable)
 
-1. **Wizard-flow countries** (AE/SA/JO/EG/US/IN/MX/HK/AU): earnings debit expense only; deductions park the liability in one field (engine sign-flips negative amounts — [hr_payslip.py:185-209](../enterprise/hr_payroll_account/models/hr_payslip.py#L185)); NET credits a reconcilable payable carrying the employee partner (`employee_move_line=True`). The slip move's open payable lines are few and each is a *real* debt.
-2. **Batch-file countries** (BE/CH): booking style incompatible with the per-slip wizard → Odoo **hides the Pay button entirely** (`batch_payroll_move_lines`) and pays through SEPA batch files instead.
+Configured by `geo_payroll` on companies using the `l10n_ge` chart
+([account_chart_template.py:14](../custom_addons/gec_odoo_modules/geo_payroll/models/account_chart_template.py#L14)):
 
-Even stock is imperfect here: KE and US ship silent mapping bugs; JO/US/AE leave withholding liabilities reconcilable, so their Pay button would also emit extra (legitimate, but partner-less) payments.
+| Rule | Debit | Credit | Partner on the item |
+|---|---|---|---|
+| Earnings (BASIC, work logs, timesheets, units, bonus) | 720100 Salary expense | — | — |
+| PENSION_EE (negative total) | 332010 Pension payable (posts as a credit) | — | Pension Agency |
+| PIT (negative total) | 331320 PIT transit (posts as a credit) | — | State Treasury |
+| PENSION_ER | 740900 Pension expense | 332010 Pension payable | Pension Agency |
+| NET | — | 310310 Salaries payable | The employee (`employee_move_line`) |
+| Benefit deductions | 720900, or the benefit vendor's payable when the program has a vendor | — | Vendor |
 
-## 3. The GEC design measured against this
+`gec_localization` sets the account types this needs
+([template_ge.py:9](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L9)):
+310310 and 332010 become **Payable + reconcilable**, 331320 is a new Payable, reconcilable,
+non-trade PIT account ([account.account-ge.csv:10](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.account-ge.csv#L10)),
+and 331310 stays for withholding taxes, not reconcilable. All payable legs share one account
+type, so salary, pension and income tax can go through the payment register.
 
-Georgian gross-payable booking (accountant's decision, [geo_payroll.md](geo_payroll.md) §10): earnings Dr 7410 / Cr 3130 at gross; PENSION_EE/PIT pull back out of 3130; NET moves the net from 3130 onward. This is **the Swiss family** — 3130 is our 1090 pass-through. Switzerland pairs that booking with batch payments and a hidden Pay button; we paired it with the wizard flow, which is the mismatch.
+The authority partners are data: Pension Agency and State Treasury, the latter with treasury code
+101001000 ([res_partner_data.xml:13](../custom_addons/gec_odoo_modules/geo_payroll/data/res_partner_data.xml#L13)).
 
-What each experiment hit:
+The configurator skips any company whose base rules already carry an account
+([:120](../custom_addons/gec_odoo_modules/geo_payroll/models/account_chart_template.py#L120)): an
+accountant's mapping survives upgrades, and a mapping change in code does not reach configured
+companies — remap their rules by hand.
 
-| NET config | Result | Why |
-|---|---|---|
-| Cr **1210** (bank) | guard error (current state) | 1210 is `asset_cash`, never reconcilable; also the slip move itself would book the cash outflow — paying on top would double-book the bank |
-| Cr **3160**, Dr 3130 | 5 payments (pension member) / 3 payments (non-member) | wizard sweeps every open payable line: 3130 no-partner batch (−net), 3130 partner batch (+net, *inbound*), 3160 partner (−net, the only real one), plus 3182/3181 pension interims (−0.60 each). The ± pair is on **different accounts** (3130 vs 3160), not a same-account artifact |
+### 2. Pay Salaries (`gec_payroll_bank`) — the production path
 
-Beyond the visible junk payments, three quieter gaps:
+Buttons on the payslip form and list and on the pay-run card, for **Payroll Administrators**
+([hr_payslip_views.xml:12](../custom_addons/gec_odoo_modules/gec_payroll_bank/views/hr_payslip_views.xml#L12));
+the payments are created as the user, so the user also needs accounting rights (Invoicing or
+higher), assigned separately.
 
-1. **Paid-state deadlock.** Slip flips to `paid` only if *all* lines reach zero residual during the wizard run. Open transit legs (3130 trio) and open pension interims (3181/3182, reconcilable) block it forever. The handoff's Edit C reconciles the 3130 trio but does **not** cover pension members — their 3181/3182 lines stay open until the pension-agency payment, so their slips can never flip via the wizard. EG's precedent: interim accounts are `reconcile=False` (our 3325 PIT interim already is — the pension interims are not).
-2. **Entry-less payments.** All 8 existing payments have `move_id=NULL` — journal 16 has no outstanding-payment account, so payments post no GL entry and reconcile nothing until bank-statement confirmation. Consequence: even a perfect single NET payment cannot flip the slip at wizard time in this journal configuration; the Basis flow's post-send settlement check would also trip on this.
-3. **Account mismatch.** The reverted NET rule credits bank **1210** — an account attached to **no bank journal at all**. Journal map (verified 2026-08-05): 16 "ბანკი" → 1211, 19 "Basis Bank GEL" → 1212 (`is_basisbank`), 20 USD → 1213, 21 EUR → 1214. No payment flow could ever have matched a 1210 booking; manual Pay-button payments went through 1211, the Basis flow auto-picks journal 19 → 1212 (`_basisbank_salary_journal`: is_basisbank + type bank + company currency).
+1. **Select** validated payslips with a positive net ([action_gec_pay_salaries](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip.py#L18)).
+   The wizard proposes a bank channel per employee and per authority.
+2. **Pre-flight** ([_gec_payroll_check_payable](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip.py#L144))
+   refuses the run, listing every reason at once: batch payroll entries enabled, employees without
+   work contact, NET rule without credit account, NET items that are not the employee's or not on
+   a reconcilable payment account, and open reconcilable amounts owed to somebody the flow cannot
+   route.
+3. **Pay.** Draft entries are posted, then one payment-register run per channel, purpose, account
+   type and currency ([_gec_payroll_pay](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip.py#L303)):
+   - **Authority legs** first, grouped per partner across payslips, without the payroll context
+     ([_gec_payroll_register_context](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip.py#L279)).
+   - **Salaries**: the employee's NET items (NET account and employee partner,
+     [_gec_payroll_employee_lines](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip.py#L75)),
+     one payment per payslip entry, with the payroll context.
+4. **Check and mark Paid.** Every NET item and every selected authority item must be closed, or
+   nothing is created; then `action_payslip_paid()` runs
+   ([_gec_payroll_assert_settled](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip.py#L385)).
+5. **Seal batches** per bank, purpose and currency and hand them to the bank module. A watchdog
+   cron, every 4 hours, flags batches nobody sent or the bank rejected
+   ([ir_cron_data.xml:4](../custom_addons/gec_odoo_modules/gec_payroll_bank/data/ir_cron_data.xml#L4)) — "Paid" in Odoo is not
+   "money moved".
 
-## 4. Options — **Option B chosen 2026-08-05** (accountant rejected 3160, which removed Option A's account; NET payable = 3130 itself). Code side shipped in `geo_payroll` 19.0.1.8.0: configurator remapped (earnings/PENSION_EE/PIT debit-only, NET credit 3130), `test_journal_entry_per_account_balances` re-asserted to the 1020-debit move + NET partner check, README rewritten. Remaining: hr3 UI rule edits (configurator skips configured companies), 3181/3182 reconcile checkbox (accountant), cleanup §6, Basis journal outstanding-account check.
+**Basis Bank channel.** A salary batch in GEL from one sender account goes out as a salary package
+(op 5); other batches as GEL, treasury or single transfers
+([_compute_basisbank_endpoint](../custom_addons/gec_odoo_modules/basis_bank/models/account_batch_payment.py#L73)).
+A payment to a partner with a treasury code becomes a treasury transfer carrying that code, with
+no receiver account ([_gec_payroll_payment_vals](../custom_addons/gec_odoo_modules/basis_bank/models/account_payment_method_line.py#L68)).
+Transmission, statements and matching: [`basis_bank.md`](basis_bank.md).
 
-| # | Option | Changes | Outcome | Risk |
-|---|---|---|---|---|
-| A **(recommended)** | Keep gross-payable booking; NET Dr 3130 / Cr 3160; implement handoff Edits A+B+C ([BASIS_SALARY_NET_PAYMENT_HANDOFF.md](../BASIS_SALARY_NET_PAYMENT_HANDOFF.md) §2): Basis flow passes **only NET-account lines** to the wizard, settlement check matches, transit trio internally reconciled | ~25-30 lines, one file (`basis_bank/models/hr_payslip.py`) | one outbound payment per employee = net; accountant's booking untouched | pension members still can't auto-flip to `paid` unless 3181/3182 become non-reconcilable (ask accountant); stock Pay button stays wrong unless given the same filter or left unused |
-| B | Adopt the standard l10n pattern: earnings debit-only (drop Cr 3130 legs), PIT/PENSION liabilities via sign-flip only, NET credit-only → 3160 | config only (rule accounts in UI) + `reconcile=False` on 3181/3182 | stock Pay button works out of the box, one payment | overturns the accountant's locked gross-payable decision; loses gross visibility on 3130 |
-| C | BE/CH style: enable `batch_payroll_move_lines`, never use the wizard | one company flag | button hidden, no junk possible | merged monthly moves — Basis flow explicitly warns shared moves can leak slips across the intended subset ([basis_bank.md](../basis_bank.md) 2026-07-12 audit); payment must be fully rethought |
-| — | Never: `reconcile=True` on 1210, or NET credit = bank | — | silences the guard | books every salary out of the bank twice; breaks bank reconciliation |
+### 3. Register Payment (`geo_payroll`) — one payslip, standard wizard
 
-## 4b. Authority payments — pension in the sweep, PIT pending (2026-08-06, `geo_payroll` 19.0.1.11.0)
+A **Register Payment** button on validated payslips with their own entry
+([hr_payslip_views.xml:94](../custom_addons/gec_odoo_modules/geo_payroll/views/hr_payslip_views.xml#L94),
+[action_register_payment](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_payslip.py#L1306)):
 
-The NET-only filter (19.0.1.10.0) deliberately dropped the withholding legs; the missing half
-is now built on the stock third-party mechanism instead of a separate accounting routine:
+- Refuses paid payslips, unposted entries, untrusted employee bank accounts, payslips without an
+  open NET item, and a NET credit account that is not reconcilable.
+- Opens the standard wizard on every open line of a valid account type on a reconcilable account;
+  a payable line without partner stops it, naming the rule.
+- Marks the payslip Paid as soon as its **NET items** are settled, even while authority legs stay
+  open ([account_payment_register.py:7](../custom_addons/gec_odoo_modules/geo_payroll/models/account_payment_register.py#L7)).
 
-- **Stock mechanism**: [hr_salary_rule.py:66](../enterprise/hr_payroll/models/hr_salary_rule.py#L66)
-  `partner_id` ("eventual third party") is stamped on the rule's move lines by
-  [hr_payslip.py:130](../enterprise/hr_payroll_account/models/hr_payslip.py#L130). The payment
-  wizard batches per (partner, account, currency)
-  ([account_payment_register.py:266](../addons/account/wizard/account_payment_register.py#L266))
-  and only sees `asset_receivable`/`liability_payable` lines with open residual
-  ([account_payment.py:209](../addons/account/models/account_payment.py#L209)).
-- **geo_payroll 19.0.1.11.0**: pension rules (8, all 4 structures) ship the shared Pension
-  Agency partner (`geo_payroll.partner_pension_agency`, upgradable `noupdate="0"` rule
-  records — reaches existing DBs on `-u geo_payroll`). `action_register_payment` now passes
-  **all open payable lines with a partner** and pre-sets `default_group_payment`; result per
-  run = one NET payment per employee + one aggregated agency payment per pension account.
-  A payable line without a partner raises, naming the rule. Paid-flip unchanged (NET settled).
-- **PIT stays out — with a nuance found 2026-08-06**: the Pay button's view context
-  (`hr_payroll_payment_register`,
-  [hr_payslip_views.xml:30](../enterprise/hr_payroll_account/views/hr_payslip_views.xml#L30))
-  makes enterprise add `liability_current` to the wizard's valid account types
-  ([account_payment.py:13](../enterprise/hr_payroll_account/models/account_payment.py#L13)) —
-  so 3320 is *type-eligible* from the button. It is still dropped because a non-reconcilable
-  account has zero `amount_residual` and the wizard keeps only open-residual lines
-  ([account_payment_register.py:958](../addons/account/wizard/account_payment_register.py#L958));
-  the geo override applies the same residual rule. **Path (a) implemented 2026-08-06 in
-  19.0.1.12.0**: `reconcile=True` on 3320 (type stays `liability_current`; flipped by the
-  configurator for fresh companies and a guarded migration for existing ones — only the
-  account the PIT rules book to, only when still off) + State Treasury partner
-  (`geo_payroll.partner_state_treasury`) on the 4 PIT rules. Pay now yields NET per employee
-  + pension agency payments + one aggregated treasury payment. Accepted caveat, accountant
-  informed: gec_l10n_ge_tax resident-WHT postings on 3320 become open items to match against
-  their treasury payments. Alternative (b) — retype unused 3325 — kept only if the
-  accountant later rejects open items on 3320.
-- **Bank layer untouched**: payments stay standard `account.payment`; basis_bank (or any
-  future bank module) transmits its journal's payments — agency/treasury payments send as
-  op 7 singles or a treasury batch (op 6), never inside the op 5 salary package
-  (`_basisbank_net_payable_lines` keeps the salary batch NET-only).
+It does not create bank batches; use it for a one-off payment or an off-cycle slip.
 
-## 5. Questions for the accountant
+---
 
-1. **3181/3182 pension interims: are they open-item accounts?** Do you match individual employee contributions against agency payments per employee, or settle monthly in aggregate? If aggregate → they should be `reconcile=False` like 3325 (EG precedent), which removes them from payment sweeps and unblocks the `paid` state.
-2. **Who owns 3130's cleanliness?** In the gross-payable design 3130 nets to zero per slip but the three legs stay unreconciled open items. Is internal reconciliation per slip (Edit C) acceptable, or do you want 3130 statements clean by another process?
-3. **Net-payable account** — accountant rejected 3160 (2026-08-05). Two coherent choices remain: (a) standard remap → **3130 Wages Payable itself becomes the net payable** (its literal purpose; used once per slip, no new account needed); (b) keep gross-through-3130 → accountant must name another reconcilable payable for the employee net debt; it cannot be neither.
-4. **Which bank account is salary cash paid from** — 1210 or 1211? The current data contradicts itself.
-5. Confirm the still-pending hr3 rule edits from the earlier round: PIT → 3320 vs current 3325 interim, PENSION_ER expense → 7490 vs current 7411.
-6. Is the `paid` state on payslips operationally required (reports, HR queries), or is payment tracking in Accounting sufficient? (Determines how hard we must fight gap #1.)
+## Configuration Checklist
 
-## 6. Current garbage in gec_modules_hr3 (cleanup list, do not mistake for regressions)
+1. Company on the `ge` chart with `gec_localization` installed; 310310, 332010 and 331320 Payable
+   and reconcilable.
+2. NET rule of each structure credits the net-payable account with **Set employee on account
+   line** on; pension and PIT rules carry the Pension Agency / State Treasury partners.
+3. **Batch Payroll Move Lines** off (Pay Salaries refuses shared entries).
+4. Employees: a work contact and a trusted bank account (`allow_out_payment`).
+5. Pension Agency: a bank account. State Treasury: its treasury code.
+6. Payroll → Configuration → Settings → **Default Salary Bank**; employee **Salary Bank** where it
+   differs.
+7. The payroll administrator also holds an accounting group.
 
-- Payments 1-5 (July, Abigail) and 24-26 (Aug 5, Aka Foster): all `in_process`, `move_id=NULL`, zero GL impact, orphaned from deleted slip moves → cancel when convenient. (Extends handoff §5 list.)
-- Payslip 10 (Abigail July) back in draft, move deleted; payslip 36 (Aka Foster Aug) validated on move 49 which credits bank 1210 directly — must be reset/recomputed after the NET rule decision.
-- Only struct 7 (GEO Daily) NET rule has accounts at all; GEO Monthly/Hourly/Unit NET rules are empty → same guard error awaits them.
-- Mitchell Admin June duplicates (slips 3, 4) — pre-existing, see handoff §5.
+---
+
+## Gotchas & Non-Obvious Behavior
+
+- **The stock Pay button never touches accounting.** Paid payslips from the report wizard leave
+  the salary entry open.
+- **The stock "paid when settled" transition is dead** (residuals on expense lines, above). Any
+  flow built on `hr_payroll_payment_register` needs its own paid transition, as `geo_payroll` and
+  `gec_payroll_bank` have.
+- **Register Payment on several payslips crashes** when a grouped authority payment reconciles
+  lines of two entries: core `_reconcile_payments` posts a message on both payslips at once and
+  `message_post` requires one record ([account_payment_register.py:34](../enterprise/hr_payroll_account/wizard/account_payment_register.py#L34),
+  [mail_thread.py:2308](../addons/mail/models/mail_thread.py#L2308)). The form button is
+  single-record; Pay Salaries avoids it by paying authorities without the payroll context.
+- **The payroll IBAN check never runs.** `hr_payroll_account` filters payslips on state `done`,
+  which does not exist in 20.0 ([hr_payroll_payment_report_wizard.py:11](../enterprise/hr_payroll_account/wizard/hr_payroll_payment_report_wizard.py#L11)).
+- **Older payslips on 331310** cannot pay their income tax through Pay Salaries; the wizard warns
+  about them instead of blocking the run.
+- **A work contact that is a child contact** would send the salary to the parent's bank account;
+  the pre-flight refuses it.
+
+---
+
+## Related Docs
+
+- [`INDEX.md`](INDEX.md)
+- [`hr_payroll_account.md`](hr_payroll_account.md) — how the salary entry is built
+- [`geo_payroll.md`](geo_payroll.md) — Georgian structures, tax rules and account mapping
+- [`basis_bank.md`](basis_bank.md) — sending batches to Basis Bank
+- [`gec_payroll_bank` README](../custom_addons/gec_odoo_modules/gec_payroll_bank/README.md) — Pay Salaries for users
+- [`hr_payroll.md`](hr_payroll.md) — payslip states
+- [`../BASIS_SALARY_NET_PAYMENT_HANDOFF.md`](../BASIS_SALARY_NET_PAYMENT_HANDOFF.md) — the handoff that chose the net-payable layout

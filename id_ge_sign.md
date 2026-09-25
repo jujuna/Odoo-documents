@@ -1,50 +1,68 @@
-# Sign with Georgian ID Card (QES)
+# Sign with Georgian ID Card (QES) (`id_ge_sign`)
 
-> **Module:** `id_ge_sign` | **Path:** [`custom_addons/gec_id_sign/id_ge_sign/`](../custom_addons/gec_id_sign/id_ge_sign/)
-> **Mode:** Document mode (v19.0.3.x) — the desktop app signs the whole PDF and returns it. (Earlier hash-mode design was replaced; see [Design Journey](#design-journey--why-the-module-looks-like-this-session-analysis).)
+> **Module:** `id_ge_sign` 20.0.3.1.0 | **Path:** [`custom_addons/gec_odoo_modules/id_ge_sign/`](../custom_addons/gec_odoo_modules/id_ge_sign/)
+> Verified against Odoo 20 source on 2026-09-24.
+
+## Odoo 20 Status: The Module Does Not Load Yet
+
+Enterprise Sign 20.0 rebuilt how the completed document is produced, and three parts of this module still target the old design. [Certain] from source; the module is not installed on `gec20_prod1` (checked 2026-09-24).
+
+| Break | What 20.0 does | Effect |
+|---|---|---|
+| [`sign_completed_document.py`](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_completed_document.py) extends `sign.completed.document` | That model does not exist in 20.0; the working copy of each document is `sign.request.document` ([sign_request_document.py:19](../enterprise/sign/models/sign_request_document.py#L19), enterprise commit `d542cb352d8`) | Registry load fails with "Model 'sign.completed.document' does not exist in registry" ([model_classes.py:188](../odoo/orm/model_classes.py#L188)), so the module cannot be installed |
+| `_geoeid_render_document()` calls `.getvalue()` on the result of `render_document_with_items()` | That method returns `(overlay, regions)`: the field values only, to be merged into the original as an incremental update ([sign_document.py:594](../enterprise/sign/models/sign_document.py#L594)) | The first launch would fail; the overlay alone has no page content |
+| The completed file is the card-signed PDF | `_generate_completed_documents()` calls `sign.request.document._finalize_documents()`, which stamps the values onto the original bytes and seals them with the company certificate when one is set ([sign_request.py:1070](../enterprise/sign/models/sign_request.py#L1070), [sign_request_document.py:151](../enterprise/sign/models/sign_request_document.py#L151)) | Without a new hook, the card signatures would not reach the completed document |
+
+What still matches 20.0: `sign(..., validation_required=True)` fills values without completing the signer ([sign_request_item.py:338](../enterprise/sign/models/sign_request_item.py#L338)); `_post_fill_request_item()` completes the signer and the request ([sign_request_item.py:424](../enterprise/sign/models/sign_request_item.py#L424)); the patched JS classes and methods exist; the templates the reports extend keep their xpath targets; `/sign/send_public` still exists ([main.py:609](../enterprise/sign/controllers/main.py#L609)).
+
+**Where a port would plug in.** Sign 20.0 has its own flow for signers who sign the document themselves: a role with `requires_external_signature` ([sign_item_role.py:44](../enterprise/sign/models/sign_item_role.py#L44); `sign_itsme` sets it for *Qualified Signature via itsme®*, [sign_item_role.py:23](../enterprise/sign_itsme/models/sign_item_role.py#L23)). The working copy is frozen before the signer signs ([sign_request_document.py:106](../enterprise/sign/models/sign_request_document.py#L106)) and the returned signature increment is appended to it ([sign_request_document.py:126](../enterprise/sign/models/sign_request_document.py#L126)). The card app already returns an incremental update of the exact bytes it received (the module checks this), so its tail is such an increment. [Likely] that is the seam; the core flow reaches the signer through an Odoo-hosted QES service, which the desktop-app hand-off would have to replace.
+
+The rest of this document describes the module as written.
+
+---
 
 ## What It Does & Why It Exists
 
-Stock Odoo Sign produces a *simple electronic signature* — a drawn or typed mark with an audit trail, but no certificate and no cryptographic binding. For documents where Georgian law expects a signature equal to a handwritten one (labour contracts, commercial agreements), that is not enough.
+Stock Odoo Sign produces a *simple electronic signature*: a drawn or typed mark with an audit trail, but no certificate and no cryptographic binding. For documents where Georgian law expects a signature equal to a handwritten one (labour contracts, commercial agreements), that is not enough.
 
-This module lets a signer sign an Odoo Sign document with their **Georgian ID Card**, producing a **Qualified Electronic Signature (QES)** embedded in the PDF as a PAdES signature. It adds a "Georgian ID Card" option to the *Extra Authentication Step* of a Sign role — the same slot SMS uses — so templates, roles, the signer list and the portal are unchanged.
+This module lets a signer sign an Odoo Sign document with their **Georgian ID Card**, producing a **Qualified Electronic Signature (QES)** embedded in the PDF as a PAdES signature. It adds "Georgian ID Card" to the **Authentication** field of a Sign role, the slot SMS uses ([sign_item_role.py:7](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_item_role.py#L7)), so templates, roles, the signer list and the portal stay standard.
 
-The signing itself happens in the desktop **Georgian ID Card Universal Program** (the `geoeid-unitool://` app from id.ge), launched from the browser. In the current design Odoo hands the app the **whole PDF**; the app downloads it, lets the signer place a visible signature block, signs it with the card, and uploads the finished PDF back. Odoo verifies the embedded signature, records the cardholder's identity from the certificate, and stores the signed PDF as the completed document.
+The signing itself happens in the desktop **Georgian ID Card Universal Program** (the `geoeid-unitool://` app from id.ge), launched from the browser. Odoo hands the app the **whole PDF**; the app downloads it, lets the signer place a visible signature block, signs it with the card, and uploads the finished PDF back. Odoo verifies the embedded signature, records the cardholder's identity from the certificate, and stores the signed PDF.
 
-It supports **any mix of signers and multiple Georgian-ID signers on one document** — each adds their own card signature, stacked on top of the previous one. Verification reuses `cryptography` + `asn1crypto` (already in Odoo), so there is **no new Python dependency**.
+It supports **any mix of signers and several Georgian ID signers on one document**: each adds their own card signature on top of the previous one. Verification uses `cryptography` and `asn1crypto`, which Odoo already requires ([requirements.txt:3](../requirements.txt#L3), [requirements.txt:8](../requirements.txt#L8)), so there is no new Python dependency.
 
 ---
 
 ## The Big Picture — How It Works
 
 ```
-Signer fills fields, clicks "Validate"        (role auth = Georgian ID Card)
-        │
-        ▼
-GeoeidSignerDialog ──► POST /sign/geoeid/launch ──► Odoo renders the PDF (or takes the
-        │                                            previous card signer's signed PDF),
-        │                                            stores it, mints a one-time token,
-        │                                            returns a geoeid-unitool:// URL
-        ▼
-Dialog opens geoeid-unitool://…/init/<token>  ──►  Universal Program (desktop)
-        │                                            GET  /sign/geoeid/init/<token>     → JSON {dataType:"document", dataUrl, submitUrl, …}
-        │  (browser idle, dialog polls status)       GET  /sign/geoeid/document/<token> → downloads the PDF
-        ▼                                            user places the block, enters PIN3, card signs the PDF
-Dialog polls /sign/geoeid/status                     POST /sign/geoeid/submit/<token>   → uploads the signed PDF (multipart "signedFile")
-        │                                                       │
-        │                                            Odoo verifies the embedded PAdES signature,
-        │                                            captures the cardholder identity from the cert,
-        ▼                                            stores the signed PDF, completes the signer.
-"Thank you" page                                     Completed document = the signed PDF.
+Signer fills fields, clicks "Validate"        (role Authentication = Georgian ID Card)
+        |
+        v
+GeoeidSignerDialog --> POST /sign/geoeid/launch --> Odoo renders the PDF (or takes the
+        |                                            previous card signer's signed PDF),
+        |                                            stores it, mints a one-time token,
+        |                                            returns a geoeid-unitool:// URL
+        v
+Dialog opens geoeid-unitool://.../init/<token>  -->  Universal Program (desktop)
+        |                                            GET  /sign/geoeid/init/<token>     -> JSON {dataType:"document", dataUrl, submitUrl, ...}
+        |  (browser idle, dialog polls status)       GET  /sign/geoeid/document/<token> -> downloads the PDF
+        v                                            signer places the block, enters PIN, card signs the PDF
+Dialog polls /sign/geoeid/status                     POST /sign/geoeid/submit/<token>   -> uploads the signed PDF (multipart "signedFile")
+        |                                                       |
+        |                                            Odoo verifies the embedded PAdES signature,
+        |                                            captures the cardholder identity from the certificate,
+        v                                            stores the signed PDF, completes the signer.
+"Thank you" page
 ```
 
-The browser is only the trigger. After it opens the `geoeid-unitool://` link, the desktop app talks to Odoo directly (init → document → submit), and the dialog just polls until the signature lands.
+The browser is only the trigger. After it opens the `geoeid-unitool://` link, the desktop app talks to Odoo directly (init, document, submit), and the dialog polls until the signature lands.
 
 ### Key Decision Points
-- **Role auth method = `geoeid`** — turns a normal Sign role into a card-signing role. The single integration seam; everything else keys off it.
-- **One signer or several?** A document can have several card signers. They are notified together but sign **one at a time**, each stacking a new PAdES signature on the previous signed PDF. The completed document is the last signer's file (it carries every signature).
-- **Trust anchor configured?** With a PSDA root/intermediate PEM set, the signing certificate is validated against it and the result is a QES. Without one, the signature is still fully verified (digest + signature + validity) but marked "chain not verified".
-- **Partner personal number set?** If set, the certificate's personal number must match (strict identity binding). If not, the certificate identity is recorded and accepted (the signer already proved control via their unique link / their card).
+- **Role Authentication = `geoeid`** turns a normal Sign role into a card-signing role. It is the single integration seam; everything else keys off it.
+- **One card signer or several?** Card signers are notified together but sign **one at a time**, each stacking a new PAdES signature on the previous signed PDF. The completed document is the last card signer's file, which carries every signature.
+- **Trust anchor configured?** With the PSDA issuing certificates set as anchor, the signing certificate is checked against them and the result counts as a QES. Without an anchor the signature is still fully verified (digest, signature, validity) but marked "chain not verified".
+- **Partner personal number set?** If set, the certificate's personal number must match. If not, the certificate identity is recorded and accepted: the signer already proved control through their unique link and their card.
 
 ---
 
@@ -52,12 +70,12 @@ The browser is only the trigger. After it opens the `geoeid-unitool://` link, th
 
 ### This module is for:
 - Georgian employees or counterparties signing contracts that need QES-level legal weight, on a **desktop** with a card reader and the Universal Program installed.
-- Documents with one **or several** Georgian-ID signers, optionally mixed with ordinary Odoo Sign signers.
+- Documents with one **or several** Georgian ID signers, optionally mixed with ordinary Odoo Sign signers.
 
 ### Use something else when:
-- **Mobile signers** — the `geoeid-unitool://` scheme has no mobile build; fall back to standard Odoo Sign or a cloud QES.
-- **Multiple PDFs in one request** — not supported; launch raises a clear error. One document per request.
-- **Long-term archive (LT/LTA)** — needs pyHanko + live TSA/OCSP; out of scope.
+- **Mobile signers**: the `geoeid-unitool://` scheme has no mobile build; use standard Odoo Sign or a cloud QES.
+- **Several PDFs in one request**: not supported; creating or launching such a request raises a clear error.
+- **Long-term archive (LT/LTA)**: needs live timestamp and revocation services; out of scope.
 
 ---
 
@@ -65,87 +83,94 @@ The browser is only the trigger. After it opens the `geoeid-unitool://` link, th
 
 ### Scenario 1: One internal employee signs (Sign Now)
 **Situation:** An employee signs their employment contract from the backend Sign app.
-**What they do:** Click the signature field — it is **auto-filled** (no "Adopt Your Signature" dialog) — then Validate. The Georgian ID dialog launches the app; they place the block and enter PIN3.
-**What happens:** The app returns the signed PDF, Odoo verifies it and completes the request. The completed document is a PAdES-signed PDF; the Certificate of Completion lists the cardholder's name, personal number, serial and expiry.
+**What they do:** Click the signature field; it is **auto-filled**, so no "Adopt Your Signature" dialog appears. Click **Validate**. The Georgian ID dialog launches the app; they draw the block and enter the card PIN.
+**What happens:** The app returns the signed PDF, Odoo verifies it and completes the request. The sign log report gains a "Georgian ID Card Signatures" table with the certificate subject, personal number, serial, expiry and whether the chain was verified ([sign_completion_report.xml:17](../custom_addons/gec_odoo_modules/id_ge_sign/report/sign_completion_report.xml#L17)).
 
 ### Scenario 2: Two counterparties both sign with their cards
 **Situation:** A two-party agreement; both parties must sign with their Georgian ID cards.
-**What they do:** You **Send** the request to both emails (Signing Order off). Both receive the link. Each opens it, the field is auto-filled, they Validate and sign with their card.
-**What happens:** The first to sign produces a signed PDF; the second's app receives **that** PDF and adds a second signature on top. The final document carries **both** signatures; both names are captured. If both click "sign" at the same moment, one briefly sees "another signer is signing, try again" — a guard that prevents a lost signature.
+**What they do:** **Send** the request to both emails. Both receive the link. Each opens it; the field is auto-filled; they validate and sign with their card.
+**What happens:** The first to sign produces a signed PDF; the second one's app receives **that** PDF and adds a second signature. The final document carries **both** signatures and both identities are recorded. If both launch at the same moment, one sees "Another Georgian ID Card signer is signing right now", a guard that prevents a lost signature.
 
 ### Scenario 3: Anonymous public link, zero typing
 **Situation:** You publish a self-service link for someone who is not an Odoo contact.
-**What they do:** Open the link, sign with the card. **No name/email is asked** — the card is the identity.
-**What happens:** Odoo silently creates a placeholder contact (a synthetic, non-routable `@id-card.invalid` email), the app signs, and after signing the contact is **renamed to the cardholder's real name** from the certificate.
+**What they do:** Open the link and sign with the card. **No name or email is asked**; the card is the identity.
+**What happens:** Odoo creates a placeholder contact with a unique, non-routable `@id-card.invalid` email, turns the shared link into a real sent request, the app signs, and the contact is **renamed to the cardholder's name** from the certificate ([geoeid.py:69](../custom_addons/gec_odoo_modules/id_ge_sign/controllers/geoeid.py#L69)).
 
 ---
 
 ## How Things Work Under the Hood
 
-### The endpoints ([`controllers/geoeid.py`](../custom_addons/gec_id_sign/id_ge_sign/controllers/geoeid.py))
+### The endpoints ([`controllers/geoeid.py`](../custom_addons/gec_odoo_modules/id_ge_sign/controllers/geoeid.py))
 
 | Endpoint | Caller | Purpose |
 |---|---|---|
-| `POST /sign/geoeid/launch/<req>/<token>` | signing page (browser) | persist the filled values, prepare the PDF to sign, mint a one-time token, return the `geoeid-unitool://` URL |
-| `POST /sign/geoeid/status/<req>/<token>` | signing page (polling) | report `idle / launched / signed / failed` |
-| `POST /sign/geoeid/public/<req>/<token>` | signing page (public link only) | create the signer with **no name/email** (placeholder contact + synthetic email) and turn the shared link into a real sent request |
-| `GET /sign/geoeid/init/<token>` | desktop app | return the document-mode JSON spec (`dataType:"document"`, `dataUrl`, `submitUrl`, `signatureProfile`, …) |
-| `GET /sign/geoeid/document/<token>` | desktop app | serve the exact PDF the app must sign |
-| `POST /sign/geoeid/submit/<token>` | desktop app | receive the finished signed PDF (multipart field `signedFile`), verify and finalize |
+| `POST /sign/geoeid/launch/<req>/<token>` | signing page | refuses a signer that is not in *sent* state, not a card role, or an expired request; then persists the filled values, prepares the PDF, mints a one-time token and returns the `geoeid-unitool://` URL ([geoeid.py:33](../custom_addons/gec_odoo_modules/id_ge_sign/controllers/geoeid.py#L33)) |
+| `POST /sign/geoeid/cancel/<req>/<token>` | signing page | puts a launched or failed attempt back to idle and drops the prepared PDF ([geoeid.py:54](../custom_addons/gec_odoo_modules/id_ge_sign/controllers/geoeid.py#L54)) |
+| `POST /sign/geoeid/status/<req>/<token>` | signing page (polling) | reports `idle / launched / signed / failed` |
+| `POST /sign/geoeid/public/<req>/<token>` | signing page (public link only) | creates the signer with **no name/email**; only for a shared request with exactly one card role and no partner |
+| `GET /sign/geoeid/init/<token>` | desktop app | returns the document-mode JSON |
+| `GET /sign/geoeid/document/<token>` | desktop app | serves the exact PDF the app must sign |
+| `POST /sign/geoeid/submit/<token>` | desktop app | receives the signed PDF (multipart field `signedFile`), verifies and finalizes; answers 409 on a concurrent submit and 400 on a rejected signature ([geoeid.py:130](../custom_addons/gec_odoo_modules/id_ge_sign/controllers/geoeid.py#L130)) |
 
-`init`/`document`/`submit` are plain HTTP scoped by the unguessable one-time token (10-min TTL); the caller is the desktop app, not a browser, so CSRF does not apply.
+`init`, `document` and `submit` are plain HTTP scoped by the unguessable one-time token, valid 10 minutes ([sign_request_item.py:15](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L15)) and burned on success. The caller is the desktop app, not a browser, so CSRF does not apply.
 
-### Core model logic ([`models/sign_request_item.py`](../custom_addons/gec_id_sign/id_ge_sign/models/sign_request_item.py))
+### Core model logic ([`models/sign_request_item.py`](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py))
 
-- **`create()`** — orders signers so the card seals the document last: regular signers get orders `1..n`; **all** card signers share order `n+1` (so they are notified together but still sign one at a time).
-- **`_geoeid_launch()`** — validates (single document; all earlier-ordered signers completed; no other card signer mid-signing), persists the field values via `sign(..., validation_required=True)` (fills without completing), computes the PDF to sign via `_geoeid_prepared_pdf()`, stores it and mints the token.
-- **`_geoeid_prepared_pdf()`** — the key to multi-signer: if an earlier card signer already produced a signed PDF, hand **that** over (so the app stacks a new signature on it); otherwise render the document fresh.
-- **`_geoeid_render_document()`** — fresh render of **all** field values, plus generated guide marks for every Georgian ID Card signer. Those guide marks are baked into the first prepared PDF before the first PAdES seal, so later card signers still see their field position when they receive the previous signer's signed PDF. The card's visible block is added wherever the signer draws.
-- **`_geoeid_submit_document(signed_pdf)`** — locks the row, verifies the **latest** embedded signature, enforces the trust-chain policy and identity match, stores the signed PDF + certificate metadata, renames a public placeholder contact to the cardholder's name, posts the audit message, then calls the stock `_post_fill_request_item()` so completion proceeds normally.
+- **`create()`** ([sign_request_item.py:59](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L59)) — the card seals the document, so card signers must come last. Regular signers keep their signing orders; **all** card signers get the next order after the highest regular one, so they are notified together. A request with a card signer must have exactly one document.
+- **`_geoeid_launch()`** ([sign_request_item.py:83](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L83)) — locks the request, reuses a still-valid token of the same signer, refuses while an earlier-ordered signer is pending or another card signer is mid-signing. It then persists the field values with `sign(..., validation_required=True)` (filled, not completed), prepares the PDF and mints the token.
+- **`_geoeid_prepared_pdf()`** ([sign_request_item.py:206](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L206)) — the key to several card signers: if an earlier card signer already produced a signed PDF, hand over **that** file so the app stacks a new signature on it; otherwise render the document.
+- **`_geoeid_render_document()`** ([sign_request_item.py:135](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L135)) — renders every field value plus a generated name image in each card signer's signature field ([sign_request_item.py:155](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L155)). The guides go into the first prepared PDF, before the first seal, so later card signers still see their field position. This is the method that breaks on 20.0 (see the status section).
+- **`_geoeid_submit_document()`** ([sign_request_item.py:226](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L226)) — locks the request and the signer, treats a repeated submit after success as a no-op, verifies the **latest** embedded signature against the prepared bytes, enforces the trust policy and the identity match, and stores the signed PDF with the certificate data. It renames a placeholder contact to the cardholder's name, posts the audit message, then calls `_post_fill_request_item()` as the signer's own user when they have one.
 
-### Verification ([`tools/cms.py`](../custom_addons/gec_id_sign/id_ge_sign/tools/cms.py))
+### Verification ([`tools/cms.py`](../custom_addons/gec_odoo_modules/id_ge_sign/tools/cms.py))
 
-- **`verify_pdf_signature(pdf_bytes, anchors)`** — extracts the **last** PAdES signature in the PDF (the one just added), recomputes the ByteRange digest, and reuses `verify_card_signature()`.
-- **`verify_card_signature()`** — checks the CMS is well-formed PAdES, that `messageDigest` equals the signed bytes, that the signature verifies against the certificate, that the certificate is valid and allows signing, and (if an anchor is set) that it chains to it; returns the signer identity.
-- **`_extract_pdf_signature()`** — finds the last `/ByteRange` and decodes the `/Contents` CMS. A document may carry several stacked signatures; the last one belongs to the current signer.
+`verify_pdf_signature()` ([cms.py:53](../custom_addons/gec_odoo_modules/id_ge_sign/tools/cms.py#L53)) accepts the returned PDF only when:
 
-### Completed document ([`models/sign_completed_document.py`](../custom_addons/gec_id_sign/id_ge_sign/models/sign_completed_document.py))
+- it starts with the exact bytes Odoo prepared, so it is an incremental update of them;
+- the **last** `/ByteRange` covers the whole file, with nothing unsigned after it except whitespace ([cms.py:73](../custom_addons/gec_odoo_modules/id_ge_sign/tools/cms.py#L73));
+- the CMS has exactly one signer, signed attributes, content type *data* and a `messageDigest` equal to the digest of the signed bytes;
+- the signature verifies with the certificate key; only RSA PKCS#1 v1.5 is accepted ([cms.py:26](../custom_addons/gec_odoo_modules/id_ge_sign/tools/cms.py#L26));
+- the certificate is valid at submit time and its key usage allows signing ([cms.py:187](../custom_addons/gec_odoo_modules/id_ge_sign/tools/cms.py#L187));
+- if an anchor is set: the certificate's issuer equals an anchor's subject, that anchor is a valid CA, and its key verifies the certificate. That makes it trusted ([cms.py:202](../custom_addons/gec_odoo_modules/id_ge_sign/tools/cms.py#L202)). The check is single-level, not full path building.
 
-`_generate_completed_document()` is overridden so a geoeid document's completed file **is** the signed PDF returned by the app — specifically the **last** card signer's PDF (it carries every stacked signature). `_geoeid_item()` picks that signer by signing order.
+The identity comes from the certificate subject: common name and `serialNumber` (the personal number) ([cms.py:251](../custom_addons/gec_odoo_modules/id_ge_sign/tools/cms.py#L251)).
 
-### The init JSON ([`tools/protocol.py`](../custom_addons/gec_id_sign/id_ge_sign/tools/protocol.py))
+### Completed document ([`models/sign_completed_document.py`](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_completed_document.py))
 
-`build_init_document_json()` returns keys that map 1:1 onto the desktop app's internal `JsonMessage` model (verified by decompiling the app — see [Design Journey](#design-journey--why-the-module-looks-like-this-session-analysis)): `dataType:"document"`, `docType:"PDF"`, `dataUrl`, `submitUrl`, `signAlg:"sha256withRSA"`, `padesUsage:true`, `description`, `language`, `keyId:"sign"`, `signatureProfile`.
+`_generate_completed_document()` is overridden so the completed file of a card-signed document **is** the signed PDF of the last card signer, picked by signing time. This is the file that stops the module from loading on 20.0.
 
-### Front-end ([`static/src/`](../custom_addons/gec_id_sign/id_ge_sign/static/src/))
+### The init JSON ([`tools/protocol.py`](../custom_addons/gec_odoo_modules/id_ge_sign/tools/protocol.py))
 
-- **`document_signable_geoeid.js`** — patches the signing page: routes `geoeid` roles to `GeoeidSignerDialog`, and for **public links** overrides `_signDocuments` to skip the name/email "Final Validation" dialog (calls `/sign/geoeid/public`).
-- **`signable_PDF_iframe_geoeid.js`** — auto-fills a geoeid signer's signature field on render, so "Adopt Your Signature" never appears.
-- **`geoeid_signer_dialog.js` / `.xml`** — the launcher dialog: opens the `geoeid-unitool://` URL and polls status.
+`build_init_document_json()` ([protocol.py:26](../custom_addons/gec_odoo_modules/id_ge_sign/tools/protocol.py#L26)) returns `dataType:"document"`, `docType:"PDF"`, `dataUrl`, `submitUrl`, `signAlg:"sha256withRSA"`, `padesUsage:true`, `description` (the request reference), `language`, `keyId:"sign"` and `signatureProfile`. These map 1:1 onto the app's own message class (see the desktop app facts below).
+
+### Front-end ([`static/src/`](../custom_addons/gec_odoo_modules/id_ge_sign/static/src/))
+
+- **`document_signable_geoeid.js`** — patches the signing page: routes `geoeid` roles to `GeoeidSignerDialog` (`getAuthDialog`) and, for **public links**, overrides `_signDocuments` to skip the name/email dialog by calling `/sign/geoeid/public` ([document_signable_geoeid.js:33](../custom_addons/gec_odoo_modules/id_ge_sign/static/src/components/sign_request/document_signable_geoeid.js#L33)). On any failure it falls back to the standard dialog.
+- **`signable_PDF_iframe_geoeid.js`** — auto-fills a card signer's signature field on render ([signable_PDF_iframe_geoeid.js:10](../custom_addons/gec_odoo_modules/id_ge_sign/static/src/components/sign_request/signable_PDF_iframe_geoeid.js#L10)).
+- **`geoeid_signer_dialog.js` / `.xml`** — the launcher dialog (OWL 3): opens the `geoeid-unitool://` URL, polls the status, offers "Open the application again" and "Try again".
 
 ### Important fields (only the ones that matter)
-- `geoeid_state` — `idle → launched → signed` (or `failed`); the dialog polls it.
-- `geoeid_prepared_document` — the PDF handed to the app (fresh render, or the previous signer's signed PDF).
-- `geoeid_signed_document` — the signed PDF the app returned (used to build the completed document and to stack the next signature).
-- `geoeid_cert_common_name` / `geoeid_cert_personal_number` — the cardholder identity captured from the certificate at submit. **This is where "receive full name + passport ID" comes from.**
-- `res.partner.geoeid_personal_number` — set it to enforce strict certificate-to-contact matching.
+- `geoeid_state` — `idle`, `launched`, `signed` or `failed`; the dialog polls it.
+- `geoeid_prepared_document` — the PDF handed to the app (fresh render, or the previous card signer's signed PDF); cleared after a successful submit.
+- `geoeid_signed_document` — the signed PDF the app returned; the next card signer stacks on it.
+- `geoeid_cert_common_name`, `geoeid_cert_personal_number`, `geoeid_cert_serial`, `geoeid_cert_not_after` — the cardholder identity captured at submit. This is where "full name + personal number" comes from.
+- `geoeid_cert_trusted` — true only when the certificate chained to an anchor; only then is the signature called a QES.
 
 ---
 
 ## Configuration & Settings
 
-**Turning it on for a role:** the module restores a **Sign → Configuration → Roles** menu ([`sign_item_role_views.xml`](../custom_addons/gec_id_sign/id_ge_sign/views/sign_item_role_views.xml)); set a role's **Authentication** to "Georgian ID Card". (Also reachable in the template editor via a role's ⋮ → Edit → Signer Settings.)
+**Turning it on for a role:** the module adds **Sign > Configuration > Roles** for Sign managers ([sign_item_role_views.xml:21](../custom_addons/gec_odoo_modules/id_ge_sign/views/sign_item_role_views.xml#L21)); Sign 20.0 has no roles menu of its own. Set the role's **Authentication** to "Georgian ID Card".
 
-Settings → Sign → "Sign with Georgian ID Card" ([`res_config_settings.py`](../custom_addons/gec_id_sign/id_ge_sign/models/res_config_settings.py)):
+**Sign settings, "Sign with Georgian ID Card"** ([res_config_settings.py:7](../custom_addons/gec_odoo_modules/id_ge_sign/models/res_config_settings.py#L7)). Each is a system parameter, read with the same defaults the settings fields use ([sign_request_item.py:331](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request_item.py#L331)):
 
-- **Signature profile** (`id_ge_sign.signature_profile`, default `B`) — value sent to the app. `B` = Baseline-B; `BT` asks the app to add a timestamp (not validated server-side).
-- **Application language** (`id_ge_sign.language`, default `ka`) — UI language of the desktop app (`ka` / `en`).
-- **Require trusted certificate chain** (`id_ge_sign.require_trusted_chain`, default off) — reject a signature that does not chain to the anchor. **Leave off until the anchor is set**, or every signature is rejected.
+- **Signature profile** (`id_ge_sign.signature_profile`, default `B`) — sent to the app. `B` is Baseline-B; `BT` asks the app to add a timestamp, which Odoo does not check.
+- **Application language** (`id_ge_sign.language`, default `ka`) — UI language of the desktop app (`ka` or `en`).
+- **Require trusted certificate chain** (`id_ge_sign.require_trusted_chain`, default off) — rejects a signature that does not chain to the anchor. **Leave it off until the anchor is set**, or every signature is rejected.
 
-System Parameters (Settings → Technical → System Parameters):
-- `id_ge_sign.trust_anchor` — the PSDA trust anchor, a PEM with the issuing **intermediate + root** certificate. Validation pins the immediate issuer, so the intermediate must be included. Set this (and turn on *Require trusted chain*) for real QES.
+**System parameter** `id_ge_sign.trust_anchor` — PEM text with the PSDA issuing **intermediate and root** certificates. Only the immediate issuer is checked, so the intermediate must be included. Set it, then turn on *Require trusted certificate chain*, for real QES.
 
-> Removed in document mode: the old **Stamp signature appearance** and **Read certificate before signing** settings, and the `id_ge_sign.appearance_font` parameter. The app now draws the visible block itself, and the cert-read step never existed in the real app (see Design Journey).
+**Contact field** `geoeid_personal_number` — shown after the VAT field on the contact form to Sign managers only, 11 digits ([res_partner.py:10](../custom_addons/gec_odoo_modules/id_ge_sign/models/res_partner.py#L10)). When set, a card with another personal number is rejected at submit.
 
 ---
 
@@ -157,80 +182,45 @@ System Parameters (Settings → Technical → System Parameters):
 
 | Python | Why |
 |---|---|
-| `cryptography`, `asn1crypto` | Parse and verify the embedded PAdES signature; both ship with Odoo |
+| `cryptography`, `asn1crypto` | Parse and verify the embedded PAdES signature; both are in Odoo's requirements |
 
-No new database models, so no new ACL file. All fields are added to existing Sign models.
+No new models, so no `ir.access.csv`. All fields are added to existing Sign models and `res.partner`.
 
 ---
 
 ## Gotchas & Non-Obvious Behavior
 
-- **The card signer signs last; content locks after the first card signature.** PAdES forbids changing content once a document is signed. So all regular signers and field values must come first, and **a card signer should have only signature field(s)** — a card signer's text/date fields would not reach the final PDF. `create()` enforces the order.
-- **One visible block per card signer, placed by hand.** The app builds its visible signature from coordinates the signer **draws with the mouse**; there is no way to pass a position or auto-place it (proven from the app — see Design Journey). So a single signature field per geoeid signer is the supported shape; a second field for the same signer would stay blank.
-- **The card stamps the certificate identity, not the Odoo name.** The app generates its own block showing the cardholder's real name + personal number + "Digitally signed by … / Date …" from the card certificate; Odoo cannot change that text. The auto-filled Odoo name mark (e.g. "zh") is kept on the page only as a **placement guide** and stays in the final output (see *Design Journey* §3).
-- **Multiple card signatures stack.** The app signs incrementally (DSS PAdES), so each signer's app receives the previous signed PDF and adds a new signature; earlier signatures stay valid. The completed document is the last signer's PDF.
-- **"QES" is conditional on trust.** A signature is reported as a QES only when its certificate chains to `id_ge_sign.trust_anchor` (`geoeid_cert_trusted`). With no anchor it is verified but marked "chain not verified".
-- **Public-link signers get a synthetic email.** Sign requires every signer to have an email, but a card signer types none, so a public-link signer is created with a unique non-routable `@id-card.invalid` address (nothing is ever sent there). The contact is renamed to the cardholder's real name after signing. Expect one contact per public signing (no email-based dedup; clean up periodically).
-- **Name/email step only on public links.** For **Sign Now** (internal) and **Send to a contact**, the signer is already known, so the "Final Validation" name/email dialog never appears. It is only the anonymous public link that needs it, and the module bypasses even that for geoeid (above).
-- **Identity number.** `res.partner.geoeid_personal_number` is shown on the Contacts form and validated as 11 digits; when set, a mismatched card is rejected at submit.
-- **`documents_sign` gap.** Like stock `sign_itsme`/`sign_emsigner`, geoeid finalizes via `_post_fill_request_item` (out-of-band), so the `documents` bridge's "grant the signer access" step doesn't run; the completed file is still attached normally.
-- **Asset bundles.** The signing-page patches load in both `web.assets_backend` and `sign.assets_public_sign` (the portal page doesn't use `web.assets_frontend`).
-- **Out of scope:** LT/LTA archive profiles, the PSDA qualified `DocTimeStamp` (needs a TSA endpoint), and server-side OCSP/CRL. The chain check is single-level (issuer == anchor), not full path building.
+- **Card signers sign last; content locks after the first card signature.** PAdES forbids changing content once a document is signed. All regular signers and field values must come first, and **a card signer should have only signature fields**: a card signer's text or date fields would not reach the final PDF.
+- **One visible block per card signer, placed by hand.** The signer draws the block; there is no way to pass a position. A second signature field for the same signer stays blank.
+- **The card stamps the certificate identity, not the Odoo name.** The app's block shows the cardholder's name and personal number from the certificate; Odoo cannot change that text. The Odoo name image stays on the page as a placement guide and remains in the final PDF.
+- **"QES" is conditional on trust.** A signature is reported as QES only when `geoeid_cert_trusted` is true. With no anchor it is verified but marked "chain not verified".
+- **Certificate validity is checked at submit time**, not at a signing time inside the signature. A card that expires between signing and upload is rejected.
+- **Public-link signers get a synthetic email.** Sign requires an email for every signer, so a public card signer gets a unique `@id-card.invalid` address. Completion mails to such contacts are skipped ([sign_request.py:9](../custom_addons/gec_odoo_modules/id_ge_sign/models/sign_request.py#L9)) and the address is hidden in the completion mail and the sign log ([sign_completion_report.xml:4](../custom_addons/gec_odoo_modules/id_ge_sign/report/sign_completion_report.xml#L4)). Expect one contact per public signing; nothing deduplicates them.
+- **Name/email step only on public links.** For Sign Now and Send-to-contact the signer is already known, so the dialog never appears; the module bypasses it on public links too.
+- **`documents_sign` access.** `documents_sign` gives the signer view access to the completed documents in `sign.request.item._sign()` ([sign_request.py:75](../enterprise/documents_sign/models/sign_request.py#L75)). The card signer is completed through `_post_fill_request_item()` instead, so [Likely] that grant does not run when a card signer finishes the request. The completed file is still attached.
+- **Asset bundles.** The signing-page patches load in both `web.assets_backend` and `sign.assets_public_sign`; the public signing page does not use `web.assets_frontend`.
+- **Out of scope:** LT/LTA profiles, the PSDA qualified document timestamp and server-side OCSP/CRL checks.
 
 ---
 
-## Design Journey — Why the Module Looks Like This (session analysis)
+## Desktop App Facts the Design Rests On
 
-This section records how the current design was reached, because almost none of it was obvious up front. The original module used **hash mode** (Odoo hashed the PDF, the card signed only the hash, Odoo embedded the CMS and drew its own visible block). That worked against a mock but **failed on the first real card**. The investigation that followed reshaped the module.
+Checked against the installed app (`/Applications/Georgian ID Card.app`) on 2026-09-24:
 
-### 1. The first crash, and reverse-engineering the real app
-The real desktop app threw `java.lang.NullPointerException` at `WebSignerWindow.initializeFromJson` the moment it read Odoo's init JSON. We decompiled the app (`/Applications/Georgian ID Card.app`, `plugins/web-signer.jar`, using the app's bundled `javap`) and found the ground truth:
-- The init JSON is deserialized into a class `JsonMessage` whose only fields are `dataType, dataHex, dataUrl, hash, signAlg, submitUrl, description, docType, language, keyId, signatureProfile, padesUsage`. There is **no `action` and no `certUrl`**.
-- The old module sent `{"action":"getCertificate", "certUrl":…}` for its "read certificate before signing" feature. The real app has **no such step** — that whole flow was fictional (it had only ever been tested against the project's own mock). The app saw no `dataType`, dereferenced null, and crashed.
-
-**Lesson baked into the code:** the cert-read flow and its settings/fields were deleted. The init JSON now maps 1:1 onto `JsonMessage`.
-
-### 2. Two real modes — and why we chose `document`
-The app supports exactly two `dataType` values:
-- **`hash`** — the app signs a hash and returns a CMS; it draws **no** visible block.
-- **`document`** — the app downloads the whole PDF, opens a placement dialog, draws its **own** visible signature block from the card certificate, signs the PDF, and uploads it back.
-
-The client wanted the signature to look the way the id.ge app renders it. That block exists **only in document mode**. So the module was rewritten from hash mode to document mode: Odoo serves the PDF at `dataUrl`, the app signs it, and `/submit` receives the finished file. The hash-mode plumbing (`tools/pades.py`) and Odoo's own appearance drawing (`tools/appearance.py`) were removed.
-
-### 3. What document mode costs (verified from the app)
-Decompiling further (`cmssigner.jar`, `visual-signer.jar`) showed the visible signature is built from `VisualSignatureParameters` (originX/Y, width, height, page) taken **only from the interactive mouse-draw dialog**. There is no init-JSON field for position and no detection of existing PDF signature fields. Consequences, now documented as limitations:
-- The signer must **draw** the block; it cannot be auto-placed.
-- The app places **one** block and signs once, so **one signature field per card signer**.
-
-**What the visible stamp contains (verified from `visual-signer.jar`).** The app builds the block itself, at sign time, with JasperReports (`SignatureImageGeneratorService.generate`) — not from anything Odoo sends. On clicking *Sign* it reads the card's `CERT_ELECTRONIC_SIGNATURE` certificate and renders: the cardholder's **full name** and **personal number** (from the certificate subject / SubjectAlternativeNames), plus the lines `Digitally signed by <name>` and `Date: <app-local timestamp>`, over the PSDA watermark (`psda_transparent.png`). Odoo has **no control over this text** — the init JSON (`JsonMessage`) has no appearance field — so the stamp always shows the **certificate identity**, never the Odoo signer label. Odoo-generated guide marks are **kept** in the PDF handed to the app (`_geoeid_render_document`) as placement guides, so signers see their field positions and draw the card block over them; they stay in the final signed PDF alongside the card's own block. Apart from those guides, the placement dialog renders only the source PDF page plus a red draw-overlay, so any other text seen there before signing is content of the source PDF itself (e.g. a decorative "Signature" graphic). The only placement the signer controls is *where* the card block lands (the mouse-drawn rectangle).
-
-### 4. The multipart upload that "arrived" but parsed to nothing
-After signing, `/submit` returned 400 with "no signedFile", even though the app clearly POSTed a file. Logging the request showed the body was there but `request.httprequest.files` was empty. The cause: the app builds its multipart boundary as `===<timestamp>===`, so the header is `boundary====1780578020325===` — an **unquoted boundary containing `=`**, which **werkzeug 3.0.1 cannot parse** (`parse_options_header` returns no boundary). werkzeug then raises "Missing boundary" and silently returns empty form/files — **before reading the body**, so the raw body is still intact. The fix (`_read_signed_file` in the controller): when `files` is empty, take the boundary straight from the `Content-Type` header and re-run werkzeug's own `MultiPartParser` on the raw body. Verified against the app's exact wire format.
-
-### 5. Trust chain — a setting, not a bug
-Once uploads worked, a real signature was rejected with "A trusted certificate chain is required". That was correct: **Require Trusted Certificate Chain** was on, but no `id_ge_sign.trust_anchor` was configured, so nothing could be "trusted". For testing the setting is left off (the signature is still verified, just marked "chain not verified"); for production the PSDA intermediate + root PEM goes into the anchor and the setting is turned on.
-
-### 6. Removing the typing steps (the card is the authentication)
-The client's point: signing with the ID card *is* the authentication, so Odoo shouldn't ask the signer to type anything.
-- **"Adopt Your Signature"** (draw a mark) — redundant, because the app draws the real block. The front-end now **auto-fills** a geoeid signer's signature field on render. The server still needs non-empty signature values, so generated name images are rendered into the first prepared PDF as placement guides for every card signer. They remain in the final output.
-- **"Final Validation" (name + email)** — only appears for **anonymous public links** (Odoo must create a contact before the card step). For Sign Now and Send-to-contact it never appears. For public links, the module creates the contact silently with a synthetic `@id-card.invalid` email (Sign requires *some* valid-format email; `.invalid` is reserved and never routes) and **renames it from the certificate** after signing.
-
-### 7. Multiple card signers — the email ordering subtlety
-The goal: any number of card signers on one document, each validated by their card. The app uses DSS incremental signing, so signatures **stack** — each signer's app receives the previous signed PDF and adds another. Implementing this surfaced two traps:
-- **Sequence vs. notification.** A first attempt gave each card signer a distinct signing order — which made Odoo send the link to **only the first signer**. The fix: card signers share **one** order, so they are all emailed together, but a launch-time guard lets only one sign at a time (and each picks up the latest signed PDF to stack on). Regular signers still take lower orders and sign first.
-- **Verify the right signature.** With several stacked signatures, verification must check the **last** ByteRange (the one the current signer just added), and the completed document must be the **last** signer's file.
-
-The net result is the behaviour documented above: send to everyone, everyone is notified, each signs with their card in turn, and the final PDF carries every signature.
+- **The init message has no position and no certificate-read step.** The app's `JsonMessage` class (`web-signer.jar`) has exactly these fields: `dataType`, `dataHex`, `dataUrl`, `hash`, `signAlg`, `submitUrl`, `description`, `docType`, `language`, `keyId`, `signatureProfile`, `padesUsage`.
+- **Two data types.** `hash`: the app signs a hash and returns a CMS, with no visible block. `document`: the app downloads the PDF, opens a placement dialog, draws its **own** visible block from the card certificate, signs, and uploads the PDF. The module uses `document`, because only that mode produces the id.ge visible block.
+- **The visible block is built by the app.** `visual-signer.jar` holds the stamp generator (`SignatureImageGeneratorService`) and the PSDA watermark image. The block geometry (`VisualSignatureParameters` in `cmssigner.jar`: `originX`, `originY`, `width`, `height`, `page`) comes from the app itself, since the init message cannot carry it.
+- **The upload uses an unparseable multipart boundary.** The app sends an unquoted boundary containing `=` (for example `boundary====1780578020325===`). Werkzeug 3.0.1, pinned for Python 3.12+ ([requirements.txt:58](../requirements.txt#L58)), returns no files for it without reading the body. `_read_signed_file()` takes the boundary from the header and re-parses the raw body with Werkzeug's own parser ([geoeid.py:153](../custom_addons/gec_odoo_modules/id_ge_sign/controllers/geoeid.py#L153)).
 
 ---
 
 ## Testing Without a Card
 
-[`dev/mock_universal_program.py`](../custom_addons/gec_id_sign/id_ge_sign/dev/mock_universal_program.py) is a standalone "fake Universal Program". **Note:** it was written for the old **hash mode** and is now out of date — it does not exercise document mode (download the PDF, return a fully signed file). Real verification of the current flow needs a real card. The mock is kept for reference and should be rewritten or removed before relying on it.
+[`dev/mock_universal_program.py`](../custom_addons/gec_odoo_modules/id_ge_sign/dev/mock_universal_program.py) is a standalone fake Universal Program for **hash mode**. It does not exercise document mode (download the PDF, return a signed file), so testing the current flow needs a real card.
 
 ---
 
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
-- Module README (developer reference): [`custom_addons/gec_id_sign/id_ge_sign/README.md`](../custom_addons/gec_id_sign/id_ge_sign/README.md)
+- Module README (developer reference): [`custom_addons/gec_odoo_modules/id_ge_sign/README.md`](../custom_addons/gec_odoo_modules/id_ge_sign/README.md)

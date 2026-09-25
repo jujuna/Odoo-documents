@@ -7,6 +7,13 @@ move through the system.
 > **Current scope:** the module calculates gross wage and custom payroll components. It does not
 > yet provide complete Georgian income tax, pension, accounting, or production sign-off.
 
+> **Odoo 20 (2026-09-23):** sections 13, the line-edit paragraph, the payment paragraph, the Work
+> Entry Source row, the troubleshooting rows and (2026-09-24) the payslip header paragraph in
+> section 10 describe the Odoo 20 port. Other sections were
+> written for Odoo 19 and are not re-verified yet. In Odoo 20 a full month means the working
+> schedule's hours (January 2026: 22 days / 176 hours), not 20 days / 160 hours: Odoo 20 prorates a
+> monthly wage against the schedule, not against the payslip's own worked-day hours.
+
 The examples use these rates:
 
 - Monthly Wage: **1,600 GEL**
@@ -78,7 +85,7 @@ values.
 | **Wage** | `wage` | Monthly amount used by Fixed, Fixed + Daily, and Fixed + Hourly |
 | **Hourly Wage** | `hourly_wage` | Hourly base, timesheet rate, and/or overtime rate, depending on the scheme |
 | **Daily Wage** | `daily_wage` | Daily base or Fixed + Daily addition |
-| **Work Entry Source** | Odoo `work_entry_source` | Whether Odoo creates normal work entries from Working Schedule, Attendances, or Planning |
+| **Tracked by Attendance** | Odoo `attendance_based` (Odoo 20, from `hr_attendance`; replaces v19 `work_entry_source`) | Whether work entries come from badge attendances instead of the Working Schedule. An hourly employee tracked by attendance cannot get work logs approved |
 | **Pay Overtime Work Logs** | `worklog_ot_enabled` | Allows approved work logs whose **Type is Overtime** to pay `hours × Hourly Wage × Rate %` |
 | **Hourly Source** | `hourly_source` | Only for pure Hourly: regular pay comes from Work Entries or Timesheets |
 | **Payroll Timesheet Projects** | `timesheet_pay_project_ids` | Project allow-list. Timesheets on other projects never pay |
@@ -523,6 +530,45 @@ the restore operation.
 8. Review worked days, salary lines, gross, and net.
 9. Validate the payslip, then complete payment through Odoo's normal flow.
 
+### What the payslip header tells the accountant (Odoo 20, 2026-09-24)
+
+Odoo 20 puts two summary cards at the top of the payslip
+([hr_payslip_views.xml:90](../enterprise/hr_payroll/views/hr_payslip_views.xml#L90)). The module
+leaves them as Odoo built them, so read them knowing what they count:
+
+| Card | What Odoo counts | What that means on GEO slips |
+|---|---|---|
+| **Worked days** | paid worked-day lines, i.e. the working schedule ([hr_payslip.py:663](../enterprise/hr_payroll/models/hr_payslip.py#L663)) | right for Fixed and Hourly-from-Work-Entries; on Daily, Per Unit and Hourly-from-Timesheets it still shows the full schedule (22 days / 176 h) although those days pay 0 |
+| **Wage** | the `BASIC` line only ([hr_payslip.py:620](../enterprise/hr_payroll/models/hr_payslip.py#L620)) | shows 0.00 on Daily, Per Unit and Hourly-from-Timesheets (their base is `DAILY_BASIC` / `UNIT_BASIC` / `TIMESHEET_BASIC`); on Fixed + additions it shows the fixed part only |
+| Net under Wage | the `NET` line | includes an advance pay-out: gec20_prod1 slip 1 shows Wage 3,000 and Net 10,686 because 9,800 of the net is the advance |
+
+The module adds a third card, **Work Items**, before them: the amount and quantities of the logs and
+timesheets this payslip pays, for example `1,265.00` and `15.00 days Daily Work (Basic) · 5.00 h
+Overtime`. It reads the payslip's own live claims, the same records as the **Work Items** button and
+the work-item salary lines, so the three always agree. It is hidden when there is nothing (Fixed-only
+slips, refunds and corrections, which hold no claims of their own). After a manual line edit the card
+still shows the claims, while the edited line shows the manual amount.
+
+The **Work Items** button opens the claims grouped by component with quantity and amount totals, the
+project and task of each timesheet or work log, the frozen rate and the priced-by version. Released
+claims sit behind the *Released* filter, for the audit trail.
+
+**Line explanations.** Odoo 20 shows an info icon on a salary line when the rule has an
+`explanation_template` ([hr_payslip.py:1915](../enterprise/hr_payroll/models/hr_payslip.py#L1915),
+Belgian payroll uses the same mechanism). The module fills it on three kinds of lines:
+
+| Line | Example text (demo slips, test DB) |
+|---|---|
+| Work-item lines (`DAILY_BASIC`, `TIMESHEET_BASIC`, `UNIT_BASIC`, `WORKLOG_*`, `*_EXTRA`) | "15 approved Daily Work logs (01/01/2026 - 01/21/2026): 15.00 days × 80.00 = 1,200.00"; overtime adds the Rate %: "2.00 h × 10.00 × 100% + 3.00 h × 10.00 × 150% = 65.00"; timesheets add "Projects: Office Renovation 30.50 h, Warehouse Build 12.00 h"; unit work lists each work type with its unit and price |
+| `PIT` | "Taxable income = gross 3,000.00 + advance pay-out 10,000.00 - tax exemption left 3,000.00 = 10,000.00. Minus employee pension 2%: 200.00. Income tax = 20% × 9,800.00 = 1,960.00." |
+| `NET` | "Net = gross 3,000.00 - deductions 2,020.00 + advance pay-out 9,800.00 = 10,780.00." |
+
+The text is built from the same numbers the rule used, rounded half-up like the line totals. Only
+payslips computed after the module upgrade carry it; validated and paid slips keep the lines they
+were validated with. When a line is edited by hand, the edited line loses its explanation and every
+other line keeps its own
+([`_recompute_with_forced_lines`](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_payslip.py)).
+
 ### What compute does
 
 For a normal, unedited draft payslip on the version's default structure, compute:
@@ -604,12 +650,13 @@ The authoritative per-item quantities and rates remain on the **Work Items** sma
 (settlement ledger) and the **Worked Days** tab. `BASIC`, `GROSS`, and the tax lines still show
 quantity 1.00 — they are aggregates, not per-unit pay.
 
-One interaction is guarded: the standard **Edit Payslip Lines** wizard rebuilds each total from
-the stored cent-rounded amount x 2-decimal quantity, which would corrupt blended per-unit
-amounts (139.00 at 16.5 units re-derives as 138.93). The module therefore reseeds work-item
-lines inside that wizard as `total x 1` (`action_edit_payslip_lines` override), so untouched
-lines round-trip losslessly; after a wizard edit the payslip line shows quantity 1.00 again,
-which is expected — edited slips are outside the claiming pipeline anyway.
+One interaction is guarded: Odoo 20 edits payslip lines directly on the payslip, and after an
+edit it re-forces the other lines from their stored cent-rounded amount x 2-decimal quantity,
+which would corrupt blended per-unit amounts (139.00 at 16.5 units re-derives as 138.93). The
+module therefore forces work-item lines as `total x 1` on every edit
+([`_recompute_with_forced_lines`](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_payslip.py)),
+so untouched lines stay equal to their settlements; after an edit the payslip line shows quantity
+1.00 again, which is expected — edited slips are outside the claiming pipeline anyway.
 
 **Georgian tax layer SHIPPED 19.0.1.4.0 (2026-07-15):** PIT 20% + funded-pension 2%+2% as the
 three rules above (sequences 120/140/160, between GROSS at 100 and NET at 200), on all four
@@ -726,8 +773,11 @@ mechanics in [payroll_payment_flow.md](payroll_payment_flow.md):
 
 **Consequences of this layout:** the payslip entry records the net as a *debt* on `3130`; the Pay
 button clears it against the bank journal chosen **at payment time** — salary rules never name a
-bank account. Since 19.0.1.10.0–19.0.1.12.0 the payment scope is "NET plus partnered authority
-legs": `action_register_payment` passes every open payable-type line that carries a partner (a
+bank account. Odoo 20 removed the core payslip Register Payment action; the module rebuilds it
+(button **Register Payment** on a validated payslip with a posted entry). The payment scope is "NET
+plus partnered authority legs": `action_register_payment` passes every open payable-type line on a
+**reconcilable** account that carries a partner (Odoo 20 keeps a residual on every line, so the
+reconcile flag now does the filtering the v19 residual did; a
 partner-less payable raises, naming the misconfigured rule), so one run yields one NET payment per
 employee plus one aggregated Pension Agency payment per interim account (`3181`/`3182`, both rules
 ship `partner_pension_agency`) and one aggregated State Treasury payment for PIT (`3320`,
@@ -914,26 +964,31 @@ Wage changes are not routing changes:
 
 ## 13. Pay runs and mid-period contract versions
 
-If an employee has more than one effective contract version inside a payroll period, this module
-creates one full-period payslip for every version slice.
+Odoo 20 pays every version of one **contract** (versions with the same contract start and end
+dates) on **one** full-period payslip. Each worked-day line carries its own version and is priced
+by that version's wage. The module follows this model.
 
-Example: Monthly Wage changes from 1,600 to 2,000 on January 16.
+Example: Monthly Wage changes from 1,600 to 2,000 on January 16 (a new version, same contract).
 
-- January gets two full-period payslips, one for each version.
-- Standard `OUT` worked-day lines restrict each slip to its version dates.
-- A normal 20-day month can therefore pay roughly 800 on the old version and 1,000 on the new one.
+- January gets **one** payslip. Its worked days hold 88 hours on the old version and 88 hours on
+  the new one, so it pays 800 + 1,000 = 1,800.
+- Work Logs and Timesheets of both versions are claimed by that one payslip. Each keeps the price
+  of its own work date (a log's approval-time rate, a timesheet's work-date version rate).
 
 Important rules:
 
-- Do not shorten a fixed-wage payslip to the version dates. The module blocks this because Odoo can
-  divide the full monthly wage by the shortened attendance denominator and overpay.
-- Before validating, every employed version slice must have exactly one non-cancelled regular
-  payslip for the period.
-- If creating slips manually, create all sibling drafts before validating any sibling.
-- When possible, start new versions on payroll-period boundaries; mid-period versions create
-  multiple payslips, PDFs, and payment lines.
-- Older carried-forward Work Logs/Timesheets are assigned deterministically to the earliest
-  represented slice and retain their source-date component/rate.
+- One regular payslip per contract and period. A second regular payslip for any version of the
+  same contract is blocked at validation, because it would pay the later days twice.
+- A change of **salary structure type** (for example Fixed to Daily) or of **timesheet-based hourly
+  pay** in the middle of a period needs a **new contract** starting on the change date. Validation
+  blocks a payslip whose contract versions differ on these. A new version that starts on the first
+  day of a pay period is fine.
+- A new contract gets its own payslip: the earlier contract's payslip claims work up to its end
+  date, the new contract's payslip claims work from its start date.
+- Do not shorten a fixed-wage payslip to the version dates. The module blocks this because a
+  shortened slip pays the full monthly wage for a partial period.
+- Older carried-forward Work Logs/Timesheets are claimed by the payslip of the contract that covers
+  their date, and retain their source-date component/rate.
 
 Resetting a pay run refreshes only safe regular draft/base slips. Deleting a pay run releases its
 children's active claims first, unless correction lineage blocks deletion.
@@ -1010,9 +1065,11 @@ These rules keep the root settlements available while refunds/corrections still 
 | Cannot waive a line | It is claimed, unvalidated, already waived, or not payroll-payable under its work-date version (wrong project/cutoff/rate/mode) |
 | Waive/Restore not in Actions menu | Not a Payroll Manager, or you are in grid view — switch to the timesheet List |
 | Cannot reset/cancel a Work Log | A payslip actively claims it; release/recompute that payslip first |
-| Cannot validate a payslip | Resolve Work Entry conflicts, missing version-slice slips, stale claims, salary-line mismatch, or source-zeroing errors |
-| “No payslip for contract version …” | A mid-period version exists; generate one full-period payslip per version slice |
-| “Does not cover its full pay schedule period” | A fixed-wage slip was shortened; use full-period sibling slips and let `OUT` lines prorate |
+| Approved Work Log / Timesheet not on the payslip after Compute | The payslip is marked edited (chatter: "manually edited by …"); edited slips never claim. Cancel → Set to Draft keeps the mark (Odoo 20 never clears `edited`), so cancel it and create a new payslip for the period |
+| Cannot validate a payslip | Resolve stale claims, salary-line mismatch, source-zeroing errors, a second payslip on the same contract, or mixed pay routes inside one contract |
+| “… already has a regular payslip for the same contract …” | Odoo 20 pays all versions of a contract on one payslip; cancel the duplicate |
+| “… covers contract versions with different salary structure types …” | Start a new contract on the change date instead of a new version |
+| “Does not cover its full pay schedule period” | A fixed-wage slip was shortened; use one full-period payslip per contract |
 | Payslip/pay-run cancel-reset-delete blocked by corrections | No longer happens — all lineage guards removed 2026-08-19; only the correction-balance check remains |
 
 ---

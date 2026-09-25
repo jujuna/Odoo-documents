@@ -1,183 +1,235 @@
-# Analytic Accounting — Odoo 20
+# Analytic Accounting
 
-> Reviewed against this checkout on 2026-09-22. [`odoo/release.py`](../odoo/release.py) identifies it as 20.0. This document describes the local implementation, rather than assuming behavior from the original Odoo 19 checkout.
-> **Core:** [`addons/analytic/`](../addons/analytic/). **General-ledger integration:** [`addons/account/`](../addons/account/).
+> **Module:** `analytic` (+ `account` for the journal-entry side) | **Path:** [`addons/analytic/`](../addons/analytic/), [`addons/account/`](../addons/account/)
+> Verified against Odoo 20 source on 2026-09-24.
 
-## What It Does
+## What It Does & Why It Exists
 
-Analytic accounting classifies costs and revenues by business dimension—project, department, cost center—independently of the general ledger (GL). One journal item can allocate its amount across multiple analytic accounts and dimensions. Analytic entries can also exist without a journal entry, notably timesheets and manually entered analytic items.
+Analytic accounting is a second classification of money, next to the chart of accounts. The general ledger answers "which account, which period"; analytic answers "which project, department or cost center". One journal item can feed several analytic accounts, and the analytic structure never has to mirror the chart of accounts.
 
-A **plan** defines a dimension; an **analytic account** is a value within that dimension. Each root plan has its own account column on models inheriting `analytic.plan.fields.mixin`, allowing one analytic line to carry a project and a department together.
+The key idea is **plans as dimensions**. A plan is a dimension (Projects, Departments, Cost Centers); an analytic account is one value inside it (Project A, Finance). Each root plan gets its own column, so one analytic item can carry a project and a department at the same time, and reports can group by either. Controllers, project managers and budget owners use it for cost-center reporting, project margins and budget versus actual. The result is a set of analytic items (`account.analytic.line`) you can pivot, filter and compare with budgets.
 
-Use this for project costs, departmental allocations and budget comparisons. Financial accounts still determine statutory bookkeeping and contribute to analytic profitability classification. Analytic accounts do not replace the chart of accounts or stock valuation records.
+---
 
-## Core Models
+## The Big Picture — How It Works
 
-| Concept | Model / field | Purpose |
-|---|---|---|
-| Plan | `account.analytic.plan` | Dimension, hierarchy and applicability rules |
-| Account | `account.analytic.account` | Value within a plan; computed debit, credit and balance |
-| Source distribution | `analytic.mixin.analytic_distribution` | Stored percentage JSON on journal items and other consuming models |
-| Analytic entry | `account.analytic.line` | Monetary amount, quantity, date, company and plan account columns |
-| Distribution rule | `account.analytic.distribution.model` | Prefills distributions from matching business criteria |
-| Applicability rule | `account.analytic.applicability` | Determines whether a plan is optional, mandatory or unavailable |
-
-The core module depends on `base`, `mail` and `uom`; `account` supplies journal linkage, profitability classification and extra matching criteria. See [`__manifest__.py`](../addons/analytic/__manifest__.py).
-
-## From Distribution to Analytic Entries
-
-```text
-Create plans and accounts
-    → set or auto-fill a source line's analytic distribution
-    → post the journal entry
-    → account.move._post() calls line_ids._create_analytic_lines()
-    → reporting reads account.analytic.line
+```
+Enable Analytic Accounting (Settings)
+        │
+Create PLANS (dimensions) ── each root plan adds a column: account_id, x_plan{N}_id ...
+        │
+Create ANALYTIC ACCOUNTS under each plan (the values)
+        │
+Set analytic_distribution (percentages) on invoice / bill / SO / PO / expense lines,
+   by hand or pre-filled by a Distribution Model
+        │
+Post the journal entry ── _create_analytic_lines() turns each percentage into an analytic item
+        │
+Reports and budgets read the analytic items
 ```
 
-For the standard journal-entry flow, draft distributions do not create analytic postings. Posting creates records with amounts based on **company-currency balance**, not the invoice's foreign-currency amount:
+The distribution is a **percentage JSON on the source line**. It becomes real analytic items only when the journal entry is posted: `_post()` calls `_create_analytic_lines()` ([account_move.py:6262](../addons/account/models/account_move.py#L6262)). Each item's amount is `-balance × percentage / 100`, in company currency ([account_move_line.py:3574](../addons/account/models/account_move_line.py#L3574)). Costs are negative, revenues positive.
 
-```python
-amount = -balance * percentage / 100
-```
+Sale and purchase order lines carry the distribution to their invoices and create no analytic items themselves; purchase lines also feed budget commitments. Timesheets and manually entered analytic items are analytic items from the start and need no journal entry.
 
-Costs normally produce negative analytic amounts and revenues positive amounts. A distribution on a sale or purchase line is not itself a posted GL analytic entry: each integration controls propagation and any independent cost entries. Timesheets and manual analytic entries follow their own creation paths and do not wait for invoice posting.
+### Key decision points
 
-Sources: [`account_move.py`, `_post()`](../addons/account/models/account_move.py), [`account_move_line.py`, `_create_analytic_lines()` and `_prepare_analytic_lines()`](../addons/account/models/account_move_line.py).
+- **How many dimensions?** Each root plan is one dimension and one extra column. Most companies need one to three.
+- **Is a plan mandatory?** A plan's applicability decides whether a line must be 100% distributed on it before posting.
+- **Manual or automatic distribution?** Type it on each line, or let Distribution Models fill it from partner, product or account.
 
-### Examples
+---
 
-| Scenario | Distribution | Result for a GL debit balance of 100 |
+## Core Concepts
+
+| Concept | Model | What it is |
 |---|---|---|
-| One department | `{"12": 100}` | One analytic entry, amount -100 |
-| Two projects in the same plan | `{"12": 60, "13": 40}` | Two entries, amounts -60 and -40 |
-| Project and department together | `{"12,7": 100}` | One entry, amount -100, with both plan columns populated |
+| Plan | `account.analytic.plan` | A dimension. Root plans create columns; sub-plans are hierarchy levels for drill-down |
+| Analytic account | `account.analytic.account` | A value inside one plan; shows computed debit, credit and balance |
+| Distribution | `analytic_distribution` JSON | On a source line: splits its amount, by percentage, across accounts |
+| Analytic item | `account.analytic.line` | The posting: one amount, a date, a company and one account per plan column |
+| Distribution Model | `account.analytic.distribution.model` | A rule that pre-fills the distribution |
+| Applicability | `account.analytic.applicability` | A rule that makes a plan optional, mandatory or unavailable |
 
-IDs in examples are placeholders. In the combined key, accounts 12 and 7 must represent different root plans. A comma-joined key is one multidimensional allocation. Separate keys are separate allocations, and validation totals percentages separately for each root plan.
+The distribution (percentages, on the source line) and the analytic items (amounts, created at posting) are different records.
 
-The preparation code adjusts a slice when a plan's cumulative percentage reaches 100%. It skips amounts that are zero at company-currency precision, then `_round_analytic_distribution_line()` rounds the generated amounts and distributes the rounding error. It is inaccurate to describe all rounding as a residual placed only on the final line. Optional partial distributions are not automatically expanded to 100%.
+---
 
-## Plans and Dynamic Fields
+## When to Use It (and When Not To)
 
-[`analytic_plan.py`](../addons/analytic/models/analytic_plan.py) defines `_strict_column_name()`, `_column_name()` and `_sync_all_plan_column()`:
+### This module is for:
 
-- The configured project plan uses `account_id`.
-- Other root plans use `x_plan{id}_id`.
-- Subplans share their root plan's account column. Non-stored related fields expose plan hierarchy levels for grouping; they do not add another independently entered dimension.
-- Synchronization applies to descendants of `analytic.plan.fields.mixin`, not every model that merely stores a distribution JSON.
+- Cost and revenue by project, department or cost center, without multiplying GL accounts.
+- Project profitability and budget versus actual (with `account_budget`).
+- Splitting one cost across dimensions, for example 60% Project A and 40% Project B.
 
-The project plan is resolved through `analytic.project_plan`, not a hardcoded database ID. It must exist and cannot be given a parent. Changing that parameter invokes validation and dynamic-field handling in [`ir_config_parameter.py`](../addons/analytic/models/ir_config_parameter.py); use the ORM rather than direct SQL.
+### Use something else when:
 
-The mixin's `auto_account_id` has distinct read, write and search behavior:
+- You only need a different GL account per case — use the chart of accounts.
+- You need stock valuation by location or lot — that is `stock_account`.
+- You need tax or statutory segmentation — use GL accounts, tax tags and fiscal positions.
 
-- Reading uses `context['analytic_plan_id']`; without a plan it computes false.
-- Writing selects the column from the assigned account's plan.
-- Supported positive searches OR together the root-plan columns.
+---
 
-Every analytic line must have at least one plan account. See [`analytic_line.py`, `AnalyticPlanFieldsMixin`](../addons/analytic/models/analytic_line.py).
+## Real-World Scenarios
 
-## Distribution JSON and Editing
+### Scenario 1: Cost center on a vendor bill
 
-[`analytic.mixin`](../addons/analytic/models/analytic_mixin.py) supplies a stored, editable computed `analytic_distribution` field. Numeric values are percentages rounded to the **Percentage Analytic** precision (default 2 digits, defined in [`analytic_data.xml`](../addons/analytic/data/analytic_data.xml)). A GIN index on IDs extracted from the JSON keys supports account-based searches using PostgreSQL array overlap. `_search_analytic_distribution()` supplies specialized search behavior; it is not arbitrary JSON matching.
+**Situation:** A controller wants every vendor bill line tagged to a department.
 
-The mixin also exposes `distribution_analytic_account_ids`. `_merge_distribution()` supports updates limited to selected plan columns through the internal `__update__` key, combining them with preserved dimensions. That marker is an update mechanism, not an analytic-account ID.
+**What they do:** Enable Analytic Accounting, create a "Departments" plan with Admin, Sales and R&D, set 100% R&D on the office-supplies line, post the bill.
 
-**Odoo 20 also exposes `analytic_distribution` directly on analytic lines.** This is a separate computed/inverse field: it normally represents the line's existing plan combination at 100%. Editing it can split the original analytic record into several records. The base inverse splits monetary `amount`; `hr_timesheet` overrides `_split_amount_fname()` to split `unit_amount` for project timesheets, after which cost is recalculated. Do not treat this field as the same stored source JSON provided by `analytic.mixin`. See [`analytic_line.py`, `_inverse_analytic_distribution()`](../addons/analytic/models/analytic_line.py) and [`timesheet extension`](../addons/hr_timesheet/models/account_analytic_line.py).
+**What happens:** One analytic item: amount −(line balance), the R&D column set, financial account = the expense account, linked to the journal item. R&D's balance shows the cost.
 
-## Automatic Distribution Models
+### Scenario 2: One invoice line, two projects
 
-Sources: [`analytic_distribution_model.py`](../addons/analytic/models/analytic_distribution_model.py), [`account extension`](../addons/account/models/account_analytic_distribution_model.py).
+**Situation:** A consulting line covers two projects, 60/40.
 
-Base criteria are partner, partner category and company. `account` adds product, product category and financial-account prefixes. Empty rule criteria act as wildcards. Account prefixes are checked after the search and can be separated with commas or semicolons.
+**What they do:** Distribution `{"<Project A id>": 60, "<Project B id>": 40}`.
 
-Rules are processed by **sequence ascending, then ID descending**. They are not ranked by specificity. A broadly matching rule can win over a more specific rule if it comes first.
+**What happens:** Two analytic items, 60% and 40% of the line balance. Amounts are rounded to the currency and the rounding difference is spread over the items so they sum to the balance ([account_move_line.py:3622](../addons/account/models/account_move_line.py#L3622)).
 
-`_get_distribution()` tracks covered root plans, including any supplied `related_root_plan_ids`. If a rule covers **any** root plan already covered, the entire rule is skipped—even if it also contains a new dimension. Otherwise its distribution is merged into the result. This is different from taking whichever uncovered pieces remain in every rule.
+### Scenario 3: Project and department on the same line
 
-For example, a rule can assign every matching vendor line to one department. Separate compatible rules can contribute other dimensions, provided their plan sets do not overlap. A constraint rejects company-specific analytic accounts in a rule shared between companies or assigned to a different company.
+**Situation:** A cost belongs to Project A and to R&D.
 
-## Mandatory Plans and Applicability
+**What they do:** Distribution `{"<Project A id>,<R&D id>": 100}`: **one comma-joined key**.
 
-A plan's default applicability is optional, mandatory or unavailable. `_get_applicability()` selects the highest-scoring qualifying applicability rule above its baseline, otherwise retains the default. Unlike distribution models, these rules do use scores. Company filtering, business domain, account prefixes and product category can affect applicability. See [`analytic_plan.py`](../addons/analytic/models/analytic_plan.py) and [`account_analytic_plan.py`](../addons/account/models/account_analytic_plan.py).
+**What happens:** **One** analytic item with both columns set. A comma key is one combination spanning plans; separate keys are separate allocations. The two accounts must belong to different root plans.
 
-At posting, `_validate_analytic_distribution()` checks journal items with `display_type == 'product'`, passing invoice, bill or general business context. `_validate_distribution()` requires each relevant mandatory root plan to total 100%, using the configured percentage precision. It is gated by `context['validate_analytic']`; the standard posting buttons supply that context in [`account_move_views.xml`](../addons/account/views/account_move_views.xml). A direct programmatic post without it does not guarantee mandatory-plan enforcement. This is not an unconditional validation on every draft edit. A single-move failure raises `ValidationError`; a multi-move failure can raise a `RedirectWarning` leading to the affected items.
+### Scenario 4: Distribution filled by rule
 
-Sources: [`account_move_line.py`](../addons/account/models/account_move_line.py), [`analytic_mixin.py`](../addons/analytic/models/analytic_mixin.py).
+**Situation:** All bills from one vendor go to the same cost center.
 
-## Journal Linkage and Synchronization
+**What they do:** Create a Distribution Model with that partner and the cost center.
 
-[`account_analytic_line.py`](../addons/account/models/account_analytic_line.py) adds:
+**What happens:** New bill lines for that vendor get the distribution pre-filled. The rule order and overlap rules are explained below.
+
+### Worked amounts
+
+| Distribution | Result for a GL debit of 100 |
+|---|---|
+| `{"12": 100}` | one item, −100 |
+| `{"12": 60, "13": 40}` | two items, −60 and −40 |
+| `{"12,7": 100}` | one item, −100, with both plan columns set |
+
+IDs are placeholders.
+
+---
+
+## How Things Work Under the Hood
+
+### Plans create columns
+
+When a root plan is created, `_sync_all_plan_column()` adds a stored Many2one column to every model that inherits `analytic.plan.fields.mixin`: analytic items, budget lines and projects ([analytic_plan.py:312](../addons/analytic/models/analytic_plan.py#L312)).
+
+- The plan stored in the system parameter `analytic.project_plan` uses the column `account_id`; every other root plan uses `x_plan{id}_id` ([analytic_plan.py:113](../addons/analytic/models/analytic_plan.py#L113)). Without that parameter Odoo raises "A 'Project' plan needs to exist..." ([analytic_plan.py:103](../addons/analytic/models/analytic_plan.py#L103)). The project plan cannot get a parent.
+- Sub-plans share their root plan's column. They only add a non-stored field for grouping by hierarchy level.
+- Every analytic item needs at least one plan account: "At least one analytic account must be set" ([analytic_line.py:94](../addons/analytic/models/analytic_line.py#L94)).
+
+`auto_account_id` is a helper field over all plan columns. Reading it needs `analytic_plan_id` in the context (otherwise it is empty); writing it fills the column of the account's plan; searching it ORs all plan columns ([analytic_line.py:26](../addons/analytic/models/analytic_line.py#L26)).
+
+### The distribution JSON
+
+`analytic.mixin` gives source models a stored `analytic_distribution` JSON ([analytic_mixin.py:17](../addons/analytic/models/analytic_mixin.py#L17)). Keys are analytic account IDs (comma-joined for combinations); values are percentages rounded to the **Percentage Analytic** precision (2 digits by default). A GIN index on the account IDs in the keys makes "lines of analytic account X" searches fast ([analytic_mixin.py:33](../addons/analytic/models/analytic_mixin.py#L33)).
+
+### Materialization at posting
+
+- `_create_analytic_lines()` validates mandatory plans, builds one item per key and creates them with `skip_analytic_sync` so the change does not bounce back ([account_move_line.py:3546](../addons/account/models/account_move_line.py#L3546)).
+- When a plan reaches 100% on its last key, that slice is computed as the remainder, so each plan's items sum to the balance. Zero amounts are skipped.
+- Category: `invoice` for customer documents, `vendor_bill` for vendor documents, `other` otherwise.
+
+### The link back to the journal item
+
+On `account.analytic.line`, `account` adds ([account_analytic_line.py:19](../addons/account/models/account_analytic_line.py#L19)):
 
 | Field | Behavior |
 |---|---|
-| `move_line_id` | Journal item; cascade deletion removes linked analytic entries |
-| `general_account_id` | Stored editable compute from the journal item; a constraint requires equality when linked; restricts account deletion |
-| `journal_id` | Stored related financial journal |
-| `category` | Adds `invoice` and `vendor_bill` to base `other` |
-| `analytic_profitability` | Computed revenue/loss/uncategorized classification, with SQL support |
+| `move_line_id` | The journal item; deleting it deletes its analytic items (cascade) |
+| `general_account_id` | The financial account; must equal the journal item's account ([account_analytic_line.py:82](../addons/account/models/account_analytic_line.py#L82)) |
+| `journal_id` | Stored related journal |
+| `analytic_profitability` | Revenue, loss or uncategorized, used by budgets ([account_analytic_line.py:98](../addons/account/models/account_analytic_line.py#L98)) |
 
-Creating, changing or deleting linked analytic entries updates the journal item's distribution through `account.move.line._update_analytic_distribution()`. Conversely, changing a posted journal item's distribution removes and recreates its analytic lines. `skip_analytic_sync` prevents recursion during these operations.
+The sync works both ways. Creating, editing or deleting an analytic item rewrites the journal item's distribution ([account_move_line.py:3612](../addons/account/models/account_move_line.py#L3612)). Editing the distribution of a posted journal item deletes and recreates its analytic items ([account_move_line.py:1793](../addons/account/models/account_move_line.py#L1793)). Reset to draft deletes them, keeping the distribution for the next posting ([account_move.py:6904](../addons/account/models/account_move.py#L6904)); Cancel resets to draft first.
 
-Resetting a move to draft deletes its analytic entries with synchronization skipped, retaining the source distribution for reposting. Canceling a posted move first resets it to draft. See [`account_move.py`, `button_draft()` / `button_cancel()`](../addons/account/models/account_move.py) and [`account_move_line.py`, `_inverse_analytic_distribution()`](../addons/account/models/account_move_line.py).
+### Splitting an analytic item
 
-## Profitability and Budgets
+Analytic items also have an `analytic_distribution` field, computed as their own combination at 100% ([analytic_line.py:244](../addons/analytic/models/analytic_line.py#L244)). Editing it splits the item into several, one per key. The amount is split; for project timesheets the hours are split instead and the cost is recomputed ([account_analytic_line.py:483](../addons/hr_timesheet/models/account_analytic_line.py#L483)).
 
-Odoo 20 classification in [`_compute_analytic_profitability()`](../addons/account/models/account_analytic_line.py) is significant for budgets:
+### Mandatory plans (applicability)
 
-| Entry | Classification |
+A plan has a default applicability: Optional, Mandatory or Unavailable. Applicability rules can override it. `_get_applicability()` starts from a score of 0.5 and takes the best rule scoring above it ([analytic_plan.py:244](../addons/analytic/models/analytic_plan.py#L244)):
+
+| Rule criterion | Score |
 |---|---|
-| Expense financial account | loss |
-| `asset_current`, `asset_non_current`, `asset_fixed` | loss |
-| Income financial account | revenue |
-| No financial account, category `other`, negative amount | loss |
-| No financial account, category `other`, positive amount | revenue |
-| No financial account, category neither `invoice` nor `other` | loss |
-| Remaining cases | uncategorized |
+| Company set on the rule and on the document | +0.5 |
+| Business domain equals the document's (Invoice, Vendor Bill, Miscellaneous...) | +1; a different domain disqualifies the rule |
+| Financial account prefix matches (`account`) | +1; no match disqualifies |
+| Product category matches (`account`) | +1; no match disqualifies |
 
-For normal positive timesheet hours and a positive employee hourly cost, `amount = -hours × hourly_cost`, so they are costs. The sign of hours and the sign of monetary amount are opposite in that case.
+A rule with only a company never beats the default. Sources: [analytic_plan.py:447](../addons/analytic/models/analytic_plan.py#L447), [account_analytic_plan.py:58](../addons/account/models/account_analytic_plan.py#L58).
 
-The budget report first limits eligible financial-account types, then filters profitability according to budget type. Eligible asset purchases can contribute immediately to expense budgets. Analytic account balances, in contrast, aggregate analytic amounts without that budget eligibility filter. See [analytic_budget.md](analytic_budget.md) for matching, purchase commitments, liquidation and depreciation examples.
+At posting, product lines are checked for business domain `invoice`, `bill` or `general` ([account_move_line.py:3513](../addons/account/models/account_move_line.py#L3513)). Each mandatory root plan must total exactly 100%: "One or more lines require a 100% analytic distribution." The check runs only with the `validate_analytic` context, which the Confirm buttons of the entry form pass ([analytic_mixin.py:182](../addons/analytic/models/analytic_mixin.py#L182)). Posting from code or by the auto-post cron does not enforce it.
 
-## Account Balances and Company Rules
+### Distribution Models
 
-[`analytic_account.py`, `_compute_debit_credit_balance()`](../addons/analytic/models/analytic_account.py) aggregates analytic amounts by plan column and currency:
+Criteria: partner, partner category and company ([analytic_distribution_model.py:61](../addons/analytic/models/analytic_distribution_model.py#L61)), plus product, product category and financial-account prefixes from `account` ([account_analytic_distribution_model.py:34](../addons/account/models/account_analytic_distribution_model.py#L34)). An empty criterion matches anything; prefixes are compared after the search and may be separated by commas or semicolons.
 
-- Debit is the absolute total of negative amounts; credit is the total of nonnegative amounts.
-- Balance is credit minus debit.
-- The computation limits companies to enabled companies and respects optional `from_date` / `to_date` context.
-- Aggregated foreign-currency amounts are converted to the environment company's currency using the conversion default date, rather than each original transaction date.
+- Rules are read by **sequence, then newest first**. They are not ranked by how specific they are.
+- A rule is skipped completely if any of its root plans is already covered by an earlier rule, even if it also covers a new plan. Otherwise it is merged into the result.
+- A rule shared between companies cannot use company-specific analytic accounts ([analytic_distribution_model.py:41](../addons/analytic/models/analytic_distribution_model.py#L41)).
 
-These fields are non-stored computed values. Normal ORM caching applies; “computed” does not mean a fresh SQL aggregation on every repeated access.
+### Account balances
 
-The company constraint is not a blanket ban on any account that already has lines. For a nonempty assigned company, it rejects existing analytic items outside that company's descendant-company hierarchy. Branch/company relationships therefore matter.
+Debit, credit and balance of an analytic account are computed on read, not stored ([analytic_account.py:156](../addons/analytic/models/analytic_account.py#L156)). Debit is the total of negative items, credit of positive ones, balance = credit − debit. The totals cover the allowed companies, respect `from_date` / `to_date` in the context, and convert foreign currencies at today's rate.
 
-## Configuration and Integrations
+An analytic account's company cannot change once it has items outside that company and its branches ([analytic_account.py:97](../addons/analytic/models/analytic_account.py#L97)). Moving an account to another root plan moves its items to the new plan's column, and is refused when some of them already have a value there ([analytic_account.py:197](../addons/analytic/models/analytic_account.py#L197)).
 
-The **Analytic Accounting** setting enables the implied group `analytic.group_analytic_accounting`; it controls group-gated UI access, rather than being a universal switch that stops all analytic processing. See [`res_config_settings.py`](../addons/analytic/models/res_config_settings.py).
+---
 
-Accounting exposes analytic accounts, plans and distribution models through its configuration menus, and Analytic Items through Transactions, subject to installed modules and permissions.
+## Configuration & Settings
 
-| Integration | Contribution |
+- **Analytic Accounting** (Accounting → Configuration → Settings) — adds the group `analytic.group_analytic_accounting` ([res_config_settings.py:10](../addons/analytic/models/res_config_settings.py#L10)). Without it the analytic fields and menus are hidden in Sales, Purchase, Expenses and Accounting.
+- **`analytic.project_plan`** system parameter — which plan owns the `account_id` column. Change it only through the UI or ORM: the change is validated and rebuilds the plan columns ([ir_config_parameter.py:11](../addons/analytic/models/ir_config_parameter.py#L11)).
+- **Percentage Analytic** decimal precision — rounding of distribution percentages ([analytic_data.xml](../addons/analytic/data/analytic_data.xml)).
+
+Menus (with the group): Accounting → Configuration → Analytic Accounting → Analytic Distribution Models, Analytic Accounts, Analytic Plans; Accounting → Accounting → Transactions → Analytic Items; Accounting → Reporting → Management → Analytic Report ([account_menuitem.xml:64](../addons/account/views/account_menuitem.xml#L64)).
+
+---
+
+## Dependencies
+
+| Requires | Why |
 |---|---|
-| `account` | Journal distribution, posting, reverse synchronization and profitability classification |
-| `sale`, `purchase`, `hr_expense` | Source distributions and propagation through their business flows |
-| `hr_timesheet` | Extends analytic lines directly with time and employee-cost behavior |
-| `account_budget`, `account_budget_purchase` | Budget actuals and purchase commitments |
-| `project_account_budget` | Project budget totals and panel actions |
-| `account_asset` | Analytic distribution on asset depreciation entries |
+| `base`, `mail`, `uom` | ORM, chatter on accounts, units on items ([__manifest__.py](../addons/analytic/__manifest__.py)) |
 
-## Gotchas
+| Works With (optional) | What It Adds |
+|---|---|
+| `account` | Distribution on journal items, analytic items at posting, profitability, applicability by account/product, distribution models by product/account |
+| `sale`, `purchase`, `hr_expense` | Distribution on their lines, passed to invoices, bills and expense entries |
+| `hr_timesheet` | Timesheets as analytic items: amount = −hours × employee hourly cost |
+| `account_budget`, `account_budget_purchase`, `project_account_budget` | Budgets on analytic items and purchase commitments — see [analytic_budget.md](analytic_budget.md) |
+| `account_asset`, `account_accountant` (deferrals) | Distribution copied onto depreciation and deferral entries |
 
-- A draft journal distribution is not an actual, but independently created analytic lines can already exist.
-- Account IDs in a combined distribution key must correspond to the intended dimensions. Validation totals percentages per root plan.
-- Distribution-rule priority comes from sequence/ID, not specificity; overlapping rules can be skipped wholesale.
-- Asset analytic entries can affect Odoo 20 expense budgets. Do not reuse an Odoo 19 explanation that excludes all balance-sheet accounts.
-- Editing a posted distribution recreates linked analytic records, so consumers should not assume their IDs remain stable.
-- An analytic account balance and a budget achieved amount can differ because they use different date, company and eligibility rules.
-- These descriptions cover standard source in this checkout. Custom overrides and database configuration need separate review for a specific observed result.
+---
+
+## Gotchas & Non-Obvious Behavior
+
+- **No items until posted.** A draft entry's distribution appears in no analytic report. Timesheets and manual items are the exception.
+- **Comma key = one combination.** `{"12,7": 100}` is one item on two plans; `{"12": 50, "7": 50}` is two items.
+- **Mandatory means exactly 100% per root plan**, and only on form posting (the `validate_analytic` context).
+- **Rule order, not specificity.** A broad Distribution Model with a lower sequence wins; overlapping rules are skipped whole.
+- **Posted edits recreate items.** Changing a posted line's distribution deletes and recreates its analytic items; do not rely on their IDs.
+- **Balances use today's rate.** Foreign-currency items are converted at today's rate, not at their transaction date.
+- **Analytic balance ≠ budget achieved.** Budgets filter by account type, profitability, dates and company; the account balance does not.
+- **The project plan is a parameter, not ID 1.** Code must resolve it with `_get_all_plans()`.
+
+---
 
 ## Related Docs
 
-- [Documentation index](INDEX.md)
-- [Analytic budget](analytic_budget.md)
-- [Fixed costs guide](accounting_fixed_costs_guide.md)
-- [Multi-company and branches](accounting_multicompany_branches.md)
+- [`INDEX.md`](INDEX.md)
+- [`analytic_budget.md`](analytic_budget.md) — budgets read these analytic items
+- [`accounting_fixed_costs_guide.md`](accounting_fixed_costs_guide.md) — analytic distribution from the fixed-cost angle
+- [`accounting_multicompany_branches.md`](accounting_multicompany_branches.md) — analytic accounting with branches
+- [`deferred_expenses_revenue.md`](deferred_expenses_revenue.md) — analytic distribution on deferral entries

@@ -116,8 +116,6 @@ Consequence: **Native is the compliance-aligned default post-1-Sep-2025.** Net i
 
 **Implemented fix (2026-06-22):** finals now auto-resolve their settlement mode at creation — `_rs_native_advance_eligible()` ([account_move_seller.py](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move_seller.py)) returns true when every down-payment offset is backed by a confirmed, strictly-earlier-month advance (refreshing the advance's rs.ge status on demand if locally stale); `create()` sets `native_attach` when eligible and the caller didn't choose a mode, else leaves Net. The waybill wizard no longer hard-codes `native_attach` — both entry points share this one rule.
 
-Design implication: the manual default `'net'` ([account_move.py:145](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move.py#L145)) is the weaker one; prefer a company-level Native default that falls back to Net via the existing eligibility checker `_rs_check_native_advance_eligibility` ([account_move_seller.py:328](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move_seller.py#L328)).
-
 ## Restriction summary
 
 | # | Restriction | Where |
@@ -134,4 +132,4 @@ Design implication: the manual default `'net'` ([account_move.py:145](../custom_
 | 10 | Settlement mode locked after filing; Native→Net blocked once attached | [account_move.py:1373](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move.py#L1373) |
 | 11 | Advances cannot be Cancel/Correct-&-Reissued | [rs_replace_orchestrator.py:87](../custom_addons/gec_odoo_modules/rs_einvoice/models/rs_replace_orchestrator.py#L87) |
 | 12 | Fully-settled / below-settled advance correction blocked | [account_move_seller.py:458](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move_seller.py#L458) |
-| 13 | Waybill wizard forces Native when SO has DP lines | [rs_invoice_from_waybill_wizard.py:478](../custom_addons/gec_odoo_modules/rs_base_methods/wizards/rs_invoice_from_waybill_wizard.py#L478) |
+| 13 | Mode auto-picked at create: Native if eligible, else Net (same rule for manual and waybill-wizard invoices) | [account_move.py:1316](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move.py#L1316), [account_move_seller.py:366](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move_seller.py#L366) |

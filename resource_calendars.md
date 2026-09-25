@@ -1,223 +1,299 @@
 # Resource Calendars — The Time Math Engine
 
 > **Module:** `resource` (community core) | **Path:** [`addons/resource/models/`](../addons/resource/models/)
-> **Updated by Codex and verified from source 2026-07-12.** Related docs: [`public_holidays_flow.md`](public_holidays_flow.md), [`hr_employee_versions.md`](hr_employee_versions.md), [`work_entries.md`](work_entries.md), [`payroll_wage_types.md`](payroll_wage_types.md).
+> Verified against Odoo 20 source on 2026-09-24.
 
 ## What It Does & Why It Exists
 
-`resource.calendar` is where "8 hours a day, Monday to Friday" is defined, and its interval engine is the math foundation under payroll, work entries, time off, attendance overtime, and planning. Every "how many hours/days did X work between two dates" question in Odoo ends up here. Payroll cares because `hours_per_day` converts work-entry hours into payslip days, and the flexible/fully-flexible distinctions decide whether that math works at all. The module itself is `category: Hidden` with no business UI of its own ([__manifest__.py:7](../addons/resource/__manifest__.py#L7)) — it exists to be consumed.
+`resource.calendar` is the working schedule: "8 hours a day, Monday to Friday", "these dates only",
+or "no fixed slots at all". Its interval engine answers every "how many hours or days of work are
+there between two dates" question in Odoo: time off durations, accruals, time rules, attendance
+expectations, planning, helpdesk SLAs, manufacturing and payroll.
+
+Payroll depends on it in three places:
+
+1. **The monthly wage rate.** A fixed-wage worked-day line is priced at
+   wage x line hours / the calendar's scheduled hours in the payslip period
+   ([hr_payslip_worked_days.py:90](../enterprise/hr_payroll/models/hr_payslip_worked_days.py#L90)).
+2. **Days on the payslip.** `number_of_days` = hours / the calendar's `hours_per_day`
+   ([hr_payslip.py:1356](../enterprise/hr_payroll/models/hr_payslip.py#L1356)).
+3. **Whether a schedule exists at all.** The calendar type decides if the payslip projection has
+   scheduled hours to fill.
+
+The module has no business menu of its own (`category: Hidden`,
+[__manifest__.py:6](../addons/resource/__manifest__.py#L6)). HR exposes it as Employees →
+Configuration → Working Schedules.
+
+---
 
 ## The Model Family
 
 | Model | What it is | Key point |
 |---|---|---|
-| `resource.calendar` | A weekly (or two-weekly) working schedule + the interval engine | One per company minimum; every company auto-creates a "Standard 40 hours/week" at creation ([res_company.py:35-45](../addons/resource/models/res_company.py#L35), bootstrap [resource_data.xml:4-17](../addons/resource/data/resource_data.xml#L4)) |
-| `resource.calendar.attendance` | One time slot: weekday + hour_from/hour_to + day_period | Carries `duration_days` — the day-weight used by all day counting |
-| `resource.calendar.leaves` | A calendar exception: public holiday (global) or one resource's absence | This is where validated `hr.leave` records materialize |
-| `resource.resource` | The schedulable thing (human or material) | Holds `calendar_id` (empty = fully flexible) and the mandatory `tz` |
-| `resource.mixin` | Abstract glue: auto-creates one resource per record | `hr.employee` inherits it; exposes the employee-facing day-math API |
-| `res.users.resource_calendar_id` | Related to the user's resources' calendar | Trap: admin's *first* login tz write also rewrites the default calendar's tz ([res_users.py:16-27](../addons/resource/models/res_users.py#L16)) |
+| `resource.calendar` | A working schedule plus the interval engine | Every company gets a "40 hours/week" calendar at creation ([res_company.py:42](../addons/resource/models/res_company.py#L42)) |
+| `resource.calendar.attendance` | One work slot: a weekday (fixed) or a date with optional recurrence (variable) | Entered as a time range or as a duration only |
+| `resource.calendar.leaves` | A calendar exception: a public holiday (no resource) or one resource's absence | Validated `hr.leave` records materialize here; `count_as` decides absence vs worked time |
+| `resource.resource` | The schedulable thing (person or machine) | `calendar_id` and `tz` are **required** ([resource_resource.py:52](../addons/resource/models/resource_resource.py#L52)) |
+| `resource.mixin` | Abstract glue that creates one resource per record | `hr.employee` inherits it; its company, calendar and timezone are related to the resource ([resource_mixin.py:21](../addons/resource/models/resource_mixin.py#L21)) |
+| `res.company` | Default calendar and a timezone | `tz` is computed from the country when the country has one timezone, else from the user ([res_company.py:20](../addons/resource/models/res_company.py#L20)). A Georgian company gets `Asia/Tbilisi` |
 
-Sibling `resource_mail` only adds `color`/`im_status` to resources for avatar cards — no business logic ([resource_resource.py:8-19](../addons/resource_mail/models/resource_resource.py#L8)).
+`resource.calendar.tz` does not exist in 20.0; use `hr.version.tz` or `res.company.tz`.
 
 ---
 
-## The Fields That Drive Everything
+## The Three Calendar Types
 
-| Field | How it's computed | Why payroll cares |
-|---|---|---|
-| `hours_per_week` | Sum of non-lunch, non-section attendance spans, ÷2 for two-week calendars ([resource_calendar.py:691-697](../addons/resource/models/resource_calendar.py#L691)); recomputed on any attendance change, **skipped for flexible calendars** ([resource_calendar.py:217-221](../addons/resource/models/resource_calendar.py#L217)) | `work_time_rate` denominator |
-| `hours_per_day` | `hours_per_week ÷ distinct weekdays with any attendance` — **a half-day counts as a full weekday** ([resource_calendar.py:680-703](../addons/resource/models/resource_calendar.py#L680)); same flexible skip ([resource_calendar.py:210-215](../addons/resource/models/resource_calendar.py#L210)) | The hours→days conversion on every payslip line ([hr_payslip.py:831-855](../enterprise/hr_payroll/models/hr_payslip.py#L831)) |
-| `schedule_type` / `flexible_hours` | Selection `fully_fixed`/`flexible`; `flexible_hours` is a stored compute+inverse mirror of it ([resource_calendar.py:163-170](../addons/resource/models/resource_calendar.py#L163)) | Flips all the math below |
-| `full_time_required_hours` | **Silently resets to the company calendar's hours_per_week on recompute** (triggered by own `hours_per_week` changes too), despite being user-editable; company-less calendars keep the manual value ([resource_calendar.py:158-161](../addons/resource/models/resource_calendar.py#L158)) | Weekly cap for flexible employees; `is_fulltime` denominator |
-| `two_weeks_calendar` | Alternating week-0/week-1 rows; which real week is which comes from `(toordinal-1)//7 % 2` — deliberately not ISO weeks ([resource_calendar_attendance.py:67-75](../addons/resource/models/resource_calendar_attendance.py#L67)) | Alternating schedules |
-| `duration_based` | "Attendance based on duration" mode: slots are entered as durations and auto-centered around 12:00 via the `duration_hours` inverse; lunch rows are forbidden ([resource_calendar_attendance.py:61-96](../addons/resource/models/resource_calendar_attendance.py#L61)) | Cosmetic hours, real durations |
-| `tz` | Required on the calendar, defaults from user | All interval math is tz-localized |
-| `work_time_rate` / `is_fulltime` | `hours_per_week / full_time_required_hours × 100`; fulltime = equality at 3 digits ([resource_calendar.py:250-258](../addons/resource/models/resource_calendar.py#L250)) | Part-time detection |
+`calendar_type` ([resource_calendar.py:78](../addons/resource/models/resource_calendar.py#L78)) is
+the first decision on the form. It changes which lines exist and how every number is computed.
 
-For **flexible** calendars, `hours_per_day`/`hours_per_week` are *not computed* — they're manually entered values that act as caps.
-
-**Company change rewrites the calendar:** changing `company_id` on an existing calendar re-copies `attendance_ids`, `tz`, `two_weeks_calendar` **and calendar-specific `global_leave_ids`** from the new company's default calendar ([resource_calendar.py:172-181](../addons/resource/models/resource_calendar.py#L172), [202-208](../addons/resource/models/resource_calendar.py#L202)). `default_get` seeds attendance/full-time fields, while the stored `_compute_global_leave_ids` performs the leave copy on create/company change. All-Schedules (`calendar_id=False`) rows are not copied because they already apply dynamically.
-
-## The Three Flavors of Time
-
-Note the asymmetry that confuses everyone: the calendar's `schedule_type` selection has only **two** values (`fully_fixed` / `flexible`). "Fully flexible" is **not a calendar type** — it is the *absence* of a calendar (the employee's Working Hours field left empty; help text on `resource.resource.calendar_id` defines it, [resource_resource.py:47-51](../addons/resource/models/resource_resource.py#L47); tests: `_is_fully_flexible` = no calendar, `_is_flexible` = that or `flexible_hours` [resource_resource.py:218-231](../addons/resource/models/resource_resource.py#L218)).
-
-| | Fixed | Flexible (`flexible_hours`) | Fully flexible (no calendar at all) |
+| | Fixed | Variable | Undefined |
 |---|---|---|---|
-| Schedule | Real weekday slots | No slots; `hours_per_day` cap + `full_time_required_hours`/week cap | None |
-| Attendance intervals | The slots | Synthetic: rolling 7-day windows from the query start, `min(hours_per_day, remaining weekly cap)` per day, centered at 12:00 ([resource_calendar.py:414-478](../addons/resource/models/resource_calendar.py#L414)) | One interval spanning the whole query range, dummy attendance with `duration_days = hours/24` ([resource_calendar.py:405-413](../addons/resource/models/resource_calendar.py#L405)) |
-| `_get_work_days_data_batch` | Real hours/days | Days = hours ÷ hours_per_day | **`{'days': 0, 'hours': 0}`** ([resource_mixin.py:111-113](../addons/resource/models/resource_mixin.py#L111)) |
-| Leave duration | Leave ∩ schedule | Expanded/capped | The **whole period** counts as leave — `_get_leave_days_data_batch` returns calendar days × 24h ([resource_mixin.py:152-158](../addons/resource/models/resource_mixin.py#L152)) |
-| Payroll consequence | Normal | Day counts approximate | Work entries get duration 0; OUT lines zero; day math collapses — the wage-types daily-rate hazard |
+| Lines | Undated, one set per weekday | Dated lines, each optionally recurring every N days or weeks, forever / N times / until a date, with excluded occurrences | None |
+| `hours_per_week`, `days_per_week` | Computed from the lines | Typed by the user | Typed by the user (may be 0) |
+| What the engine returns | The weekday lines on every matching day | The lines whose date or recurrence matches the day ([_filter_by_date](../addons/resource/models/resource_calendar_attendance.py#L382)) | Synthetic hours (see below) |
+| Typical use | Office Mon–Fri | Rotations, one-off schedules, alternating weeks | Freelance-like, "work whenever" |
 
-**Inconsistency worth knowing:** the interval engine's flexible fill uses rolling 7-day windows from the query start, while planning's flexible helpers (`_get_flexible_resource_work_hours`) cap by **locale calendar weeks** — two different week conventions for the same employee ([resource_resource.py:287-397](../addons/resource/models/resource_resource.py#L287)).
+- **Flexible** means an Undefined calendar with an hours target
+  ([_is_flexible](../addons/resource/models/resource_calendar.py#L96)).
+  **Fully flexible** means Undefined with no `hours_per_week` and no `hours_per_day`
+  ([_is_fully_flexible](../addons/resource/models/resource_calendar.py#L100)).
+- Every resource and every `hr.version` must have a calendar
+  ([hr_version.py:159](../addons/hr/models/hr_version.py#L159)). An empty Working Hours field does
+  not exist in 20.0; use an Undefined calendar.
+- `two_weeks_calendar` does not exist in 20.0; use a Variable calendar with a 2-week recurrence.
+- **Switching type deletes lines.** After every create and write, lines that do not fit the type
+  are unlinked: Fixed drops dated lines, Variable drops undated lines, Undefined drops all lines
+  ([_get_attendances_to_unlink](../addons/resource/models/resource_calendar.py#L105),
+  [:278](../addons/resource/models/resource_calendar.py#L278)). The form's radio asks for
+  confirmation first.
+
+---
+
+## The Fields That Drive the Math
+
+| Field | How it is computed | Why payroll cares |
+|---|---|---|
+| `hours_per_week` | Fixed: sum of `duration_hours` of work-period lines ([:212](../addons/resource/models/resource_calendar.py#L212)). Other types: typed, 0–168 ([:230](../addons/resource/models/resource_calendar.py#L230)) | Denominator of `work_time_rate`; weekly target of flexible calendars |
+| `days_per_week` | Fixed: number of distinct weekdays with a work-period line ([:197](../addons/resource/models/resource_calendar.py#L197)). Other types: typed | Divisor of `hours_per_day` |
+| `hours_per_day` | `hours_per_week / days_per_week` ([:207](../addons/resource/models/resource_calendar.py#L207)) | Converts payslip hours into days; reference for half-day counting |
+| `full_time_required_hours` ("Full Time Equivalent") | Reference calendar's `hours_per_week`, else the company calendar's, else its own ([:172](../addons/resource/models/resource_calendar.py#L172)) | Full-time benchmark. A typed value is overwritten when those hours change |
+| `work_time_rate` / `is_fulltime` | `hours_per_week / full_time_required_hours`, a ratio (1.0 = 100%, 1.0 when no benchmark); full time = equal at 3 digits ([:241](../addons/resource/models/resource_calendar.py#L241)) | Part-time detection. Payroll's `hr.version.work_time_rate` is own hours ÷ reference calendar hours, rounded to 2 digits ([hr_version.py:402](../enterprise/hr_payroll/models/hr_version.py#L402)) |
+| `reference_calendar_id` | Defaults to the company calendar | Which schedule counts as "full time" |
+
+A weekday with only a morning slot still counts as one full weekday. Mon–Fri 8 h plus Saturday
+4 h gives 44 / 6 = 7.33 `hours_per_day`, which lowers the day count on every payslip line of
+employees on that calendar.
 
 ---
 
 ## Attendance Lines (`resource.calendar.attendance`)
 
-One record per slot ("Monday Morning 8-12"). The decision-point fields:
+- **Time range or duration.** A line with `hour_from = hour_to = 0` is *duration based*
+  ([_compute_duration_based](../addons/resource/models/resource_calendar_attendance.py#L301)).
+  The engine places it around noon: an 8 h duration becomes 08:00–16:00, and several duration
+  lines on one day stack around 12:00. The default lines of a new fixed calendar are five 8 h
+  duration lines, Monday to Friday ([_get_default_attendance_ids](../addons/resource/models/resource_calendar.py#L686)).
+- **`day_period`** is computed: `full_day` when the line lasts more than 75% of `hours_per_day`
+  or is duration based, otherwise `morning` or `afternoon` by its position around 12:00
+  ([_compute_day_period](../addons/resource/models/resource_calendar_attendance.py#L306)).
+  Half-day leaves use it.
+- **Per-day rules** ([_check_attendance_for_date](../addons/resource/models/resource_calendar_attendance.py#L102)):
+  at most 24 h per day, no overlap, and no mix of duration-based and time-based lines on one day.
+  Each line lasts more than 0 and at most 24 h ([:76](../addons/resource/models/resource_calendar_attendance.py#L76)).
+  The overlap check locks the calendar row so two concurrent saves cannot both pass
+  ([_lock_calendars_for_overlap_check](../addons/resource/models/resource_calendar_attendance.py#L120));
+  a variable calendar whose recurrences collide in more than 1000 ways is refused as "Too Complex Calendar".
+- **Editing one occurrence of a recurrence** goes through `exclude_occurence`, `create_ad_hoc`
+  (detach one date) or `create_new_recurrency` (change the series from a date on)
+  ([resource_calendar_attendance.py:418](../addons/resource/models/resource_calendar_attendance.py#L418)).
+- **Monthly clean-up.** The cron "Resource: Clean up calendar attendances"
+  ([ir_cron.xml](../addons/resource/data/ir_cron.xml)) deletes lines that do not fit their
+  calendar type, drops stale excluded dates and turns a recurrence with one occurrence left into a
+  plain dated line ([_calendar_clean_up](../addons/resource/models/resource_calendar.py#L160)).
+- **Time type per line.** `hr_work_entry` adds `work_entry_type_id`
+  ([resource_calendar_attendance.py:13](../addons/hr_work_entry/models/resource_calendar_attendance.py#L13)),
+  so a schedule can emit its own payroll type ("Saturday = Site Day"). A line whose type counts
+  as absence is left out of `hours_per_week` and `days_per_week`
+  ([_is_work_period](../addons/hr_work_entry/models/resource_calendar_attendance.py#L64)) and is
+  subtracted from work intervals ([resource_calendar.py:38](../addons/hr_work_entry/models/resource_calendar.py#L38)),
+  but the day keeps its whole span as the reference for half-day counting
+  ([_get_reference_hours_per_day](../addons/hr_work_entry/models/resource_calendar.py#L23)).
+  The choice is limited to the company country's types; see the gotcha below.
+  Full story: [`work_entries.md`](work_entries.md).
 
-- `day_period` — `morning` / `lunch` / `afternoon` / `full_day`. **Lunch rows exist only to model the midday gap**: `duration_hours = 0` for them ([resource_calendar_attendance.py:77-80](../addons/resource/models/resource_calendar_attendance.py#L77)), they're excluded from every hours computation and from attendance intervals unless explicitly requested with `lunch=True`.
-- `duration_days` — the day weight used by all day counting: lunch = 0, full_day = 1, otherwise **0.5 if the slot's hours ≤ 75% of the calendar's `hours_per_day`, else 1** ([resource_calendar_attendance.py:98-106](../addons/resource/models/resource_calendar_attendance.py#L98)). Stored, `readonly=False` — manually overridable per slot.
-- `week_type` — `'0'`(first)/`'1'`(second) for two-week calendars; parity via `get_week_type` (absolute weeks since year 1 — never resets at year end, never matches ISO numbers).
-- `display_type = 'line_section'` — the "First week"/"Second week" section headers in two-week mode. Deleting them is blocked ([resource_calendar.py:183-200](../addons/resource/models/resource_calendar.py#L183)); a line's `week_type` is assigned by which section it sits under.
-- Overlap constraint: slots on the same weekday (per week-type) may touch but not overlap — contiguous intervals are allowed via a 0.000001h fudge ([resource_calendar.py:605-615](../addons/resource/models/resource_calendar.py#L605)).
-
-**Extension point:** `hr_work_entry` adds `work_entry_type_id` to each attendance line (default: Attendance) — this is how a schedule can emit custom work entry types automatically ([resource_calendar_attendance.py:9-22](../addons/hr_work_entry/models/resource_calendar_attendance.py#L9)); lines whose type `is_leave` are excluded from `hours_per_week` and `_get_global_attendances` ([resource_calendar.py:9-15](../addons/hr_work_entry/models/resource_calendar.py#L9)). Full story in [`work_entries.md`](work_entries.md).
+---
 
 ## Calendar Exceptions (`resource.calendar.leaves`)
 
-One record = one absence interval. Two axes decide its meaning:
-
 | Axis | Values | Effect |
 |---|---|---|
-| `resource_id` | empty = **global** (public holiday) / set = one resource's absence | Global leaves hit everyone on the calendar (same company); resource leaves hit only that resource |
-| `time_type` | `leave` / `other` | `_leave_intervals_batch`'s default domain only picks `leave`; `other` (e.g. training) still blocks the schedule for work-entry purposes but is bucketed as worked time ([hr_version.py:223-226](../addons/hr_work_entry/models/hr_version.py#L223)) |
+| `resource_id` | Empty = public holiday / set = one resource's absence | A public holiday hits every resource of the same company on the calendar; a resource leave hits that resource only |
+| `calendar_id` | Empty = every calendar of the company / set = that calendar | For resource leaves it follows the resource's calendar ([:52](../addons/resource/models/resource_calendar_leaves.py#L52)); `hr` stamps the calendar of the employee version active at `date_from` ([resource_calendar_leaves.py:12](../addons/hr/models/resource_calendar_leaves.py#L12)) |
+| `count_as` | `absence` (default) / `working_time` ([:48](../addons/resource/models/resource_calendar_leaves.py#L48)) | The engine subtracts only `absence` rows by default. `working_time` rows (training) count as worked time in the payslip projection |
 
-`calendar_id` is computed from `resource_id.calendar_id` ([resource_calendar_leaves.py:53-56](../addons/resource/models/resource_calendar_leaves.py#L53)); a leave with **no calendar** applies to every calendar (the search domain is `calendar_id in [False] + self.ids`, [resource_calendar.py:511](../addons/resource/models/resource_calendar.py#L511)). `hr` overrides the compute to be contract-aware: the leave is stamped with the calendar of the employee's **version active at `date_from`** ([resource_calendar_leaves.py:12-33](../addons/hr/models/resource_calendar_leaves.py#L12)). `date_to` auto-fills to 23:59:59 of the start day ([resource_calendar_leaves.py:63-73](../addons/resource/models/resource_calendar_leaves.py#L63)).
+`company_id` is computed from the calendar ([:57](../addons/resource/models/resource_calendar_leaves.py#L57));
+`hr_holidays` takes the employee's company of the linked leave first. `date_to` fills itself with
+23:59:59 of the start day in the user's timezone, or the company's
+([_compute_date_to](../addons/resource/models/resource_calendar_leaves.py#L62)).
 
-### Where they come from
-
-1. **Time-off validation:** `hr.leave._validate_leave_request` → `_create_resource_leave` creates one per leave, carrying `holiday_id`, the leave type's `time_type` and `work_entry_type_id` ([hr_leave.py:996-1013](../addons/hr_holidays/models/hr_leave.py#L996), vals at [hr_leave.py:985-994](../addons/hr_holidays/models/hr_leave.py#L985)); refusal/cancel unlinks them ([hr_leave.py:1003-1007](../addons/hr_holidays/models/hr_leave.py#L1003)).
-2. **Public holidays:** created manually (Time Off ▸ Configuration) as global records; `hr_holidays` blocks overlapping same-scope holidays ([resource.py:19-37](../addons/hr_holidays/models/resource.py#L19)). Only calendar-specific **create** explicitly reinterprets user-entered wall time in the calendar timezone; All Schedules and write skip that conversion ([resource.py:124-156](../addons/hr_holidays/models/resource.py#L124)). See the timezone policy in [`public_holidays_flow.md`](public_holidays_flow.md).
-
-### Global leave propagation
-
-Creating, writing, or unlinking a **global** leave triggers `_reevaluate_leaves`: every non-refused `hr.leave` overlapping the company/time window gets its duration recomputed, its state bounced through `confirm` and back, employees get chat notifications, and leaves that no longer fit their allocation are **auto-refused** ([resource.py:56-93, 142-163](../addons/hr_holidays/models/resource.py#L56)). The search is broader than calendar applicability. Auto-refusal can enter the work-entry bridge and deactivate linked validated entries, while the public-holiday work entries themselves are not regenerated. Retroactive changes therefore require a payroll impact guard.
-
-`transfer_leaves_to(other_calendar, resources, from_date)` (added by `hr`) rewrites `calendar_id` on this calendar's leaves starting after `from_date` (default today) — all of them, or only the given resources' ([resource_calendar.py:9-24](../addons/hr/models/resource_calendar.py#L9)). **Nothing in v19 production code calls it** (only tests) — switching an employee's calendar does *not* migrate their leave records automatically.
-
-### Security
-
-Base `resource` rules restrict ordinary users to reading global/own rows and modifying their own resource rows. After `hr_holidays` loads, it adds unrestricted read for internal users and unrestricted CRUD for Time Off Officers ([hr_holidays_security.xml:238-254](../addons/hr_holidays/security/hr_holidays_security.xml#L238)). The central menu is Administrator-only, but menu visibility is not a security boundary. Calendars and attendances remain read-only for ordinary users.
+Where rows come from: validated time off creates one row per leave (`holiday_id` set) and
+refusal or cancellation removes it; public holidays are entered by hand, loaded by a wizard or
+created by a monthly cron. Their effects on leaves, time rules and payroll are in
+[`public_holidays_flow.md`](public_holidays_flow.md).
 
 ---
 
 ## Resource ↔ Employee Wiring
 
-`resource.resource` carries the materialized current `calendar_id` (default: company calendar; **empty = fully flexible** by definition) and the required `tz` (defaulted from user, then calendar, at create — [resource_resource.py:66-77](../addons/resource/models/resource_resource.py#L66)). `resource_type` is `user`/`material`; `time_efficiency` only matters to MRP work centers.
+- **Timezone lives on the version.** `resource.resource.tz` is computed from the employee's current
+  version and writes back to it ([resource.py:30](../addons/hr/models/resource.py#L30)); the
+  version's `tz` is required ([hr_version.py:162](../addons/hr/models/hr_version.py#L162)).
+  All interval math is localized per resource timezone.
+- **Calendar by date.** The engine asks each resource for its calendar and hours at the query
+  start ([_get_calendar_data_at](../addons/hr/models/resource.py#L132)). For employees this
+  resolves to the version in contract on that date
+  ([_get_calendars](../addons/hr/models/hr_employee.py#L2001)); without a version in contract the
+  resource's current calendar is used. Details: [`hr_employee_versions.md`](hr_employee_versions.md).
+- **Guards added by `hr`.** A calendar used by versions of companies the user is not logged into
+  cannot be written ([resource_calendar.py:21](../addons/hr/models/resource_calendar.py#L21)),
+  and its company cannot change to one incompatible with those versions
+  ([:15](../addons/hr/models/resource_calendar.py#L15)). The employee form can duplicate a
+  calendar and assign the copy to that employee
+  ([action_duplicate_and_apply_to_employee](../addons/hr/models/resource_calendar.py#L67)).
+- `transfer_leaves_to` ([resource_calendar.py:50](../addons/hr/models/resource_calendar.py#L50))
+  has no caller outside tests: changing an employee's calendar does not move their leave rows.
 
-`hr.employee` inherits `resource.mixin` ([resource_mixin.py:29-48](../addons/resource/models/resource_mixin.py#L29)): creating an employee auto-creates its resource; `company_id`, `resource_calendar_id`, `tz` on the employee are all *related* fields into the resource, and `employee.active` is stored-related to `resource.active` ([hr_employee.py:115](../addons/hr/models/hr_employee.py#L115)) — archiving one archives the other. `hr` closes the loop the other way: writing `resource.calendar_id` pushes into `employee.resource_calendar_id` ([resource.py:56-59](../addons/hr/models/resource.py#L56)).
+### The day-math API (what HR code calls)
 
-Date-aware calendar resolution is delegated back to hr's version engine: base `_get_calendar_at` just returns `calendar_id` ([resource_resource.py:223-224](../addons/resource/models/resource_resource.py#L223)); the hr override routes through `employee._get_calendars(date)` ([resource.py:131-137](../addons/hr/models/resource.py#L131)), which picks the version in contract at that date ([hr_employee.py:1553-1563](../addons/hr/models/hr_employee.py#L1553)) — see [`hr_employee_versions.md`](hr_employee_versions.md) for the contract-gated fallback trap. Similarly, `_get_calendars_validity_within_period` (used by planning) is overridden in hr to slice the period by contract validity, with contract-less employees falling back to the plain calendar ([resource.py:92-108](../addons/hr/models/resource.py#L92)).
-
-### The mixin's day-math API (what HR code actually calls)
-
-| Method | Returns | Fully-flexible behavior |
+| Method | Returns | Fully flexible calendar |
 |---|---|---|
-| `_get_work_days_data_batch(from, to)` | `{employee_id: {'days', 'hours'}}` of work time | `{'days': 0, 'hours': 0}` ([resource_mixin.py:110-114](../addons/resource/models/resource_mixin.py#L110)) |
-| `_get_leave_days_data_batch(from, to)` | Same shape, attendance ∩ leave | Whole period: `days = (to-from).days` ([resource_mixin.py:152-158](../addons/resource/models/resource_mixin.py#L152)) |
-| `_list_work_time_per_day(from, to)` | `[(day, hours)]` per record; honors `compute_leaves` context ([resource_mixin.py:181-213](../addons/resource/models/resource_mixin.py#L181)) | n/a (falls back to company calendar) |
-| `list_leaves(from, to)` | `[(day, hours, leave)]` from leaves ∩ attendances ([resource_mixin.py:215-241](../addons/resource/models/resource_mixin.py#L215)) | n/a |
-| `_adjust_to_calendar(start, end)` | Snaps datetimes to nearest schedule boundary via `_get_closest_work_time` ([resource_resource.py:108-143](../addons/resource/models/resource_resource.py#L108)) | n/a |
+| `_get_work_days_data_batch(from, to)` ([resource_mixin.py:91](../addons/resource/models/resource_mixin.py#L91)) | `{employee_id: {'days', 'hours'}}` of work time | Every calendar day in the range counts as one day of up to 24 h, minus leaves |
+| `_get_leave_days_data_batch(from, to)` ([:130](../addons/resource/models/resource_mixin.py#L130)) | Same shape, work time ∩ leaves | The whole period is leave |
+| `_list_work_time_per_day(from, to)` | `(day, hours)` per record; honours the `compute_leaves` context | Same synthetic hours as above |
+| `_adjust_to_calendar(start, end)` ([resource_resource.py:118](../addons/resource/models/resource_resource.py#L118)) | Nearest schedule boundaries on those days | — |
 
-All of these accept an optional `calendar` argument that bypasses the per-record calendar — `hr.leave` uses it to compute durations against a forced calendar.
+All accept a `calendar` argument that replaces the record's own calendar; `hr.leave` uses it to
+compute durations against a given schedule.
 
 ---
 
 ## The Interval Engine
 
-Three batch methods on the calendar, all returning `{resource_id: Intervals}` where each interval is `(start, stop, recordset)`. **Every call also computes a calendar-generic result under key `False`** (empty-resource entry appended to the list, [resource_calendar.py:326-329](../addons/resource/models/resource_calendar.py#L326)) — callers that pass no resources read `[False]`.
+All three batch methods need timezone-aware datetimes and return `{resource_id: Intervals}` of
+`(start, stop, record)`. Called on a calendar, the result also holds a calendar-only entry under
+key `False`.
 
-### `_attendance_intervals_batch(start_dt, end_dt, resources, domain, tz, lunch)` ([resource_calendar.py:322-481](../addons/resource/models/resource_calendar.py#L322))
+**`_attendance_intervals_batch`** ([resource_calendar.py:287](../addons/resource/models/resource_calendar.py#L287)) —
+the theoretical schedule. It fetches the lines per date ([_get_attendances_by_date](../addons/resource/models/resource_calendar.py#L860)),
+builds one interval per line and day, clips to the query, then branches per resource on the
+calendar in force at the query start:
 
-Theoretical schedule. Flow: group resources by tz → search this calendar's attendance rows (`display_type = False`, lunch excluded unless `lunch=True`) → bucket them into 14 weekday slots (7 × two week types; one-week calendars fill both) → `rrule(DAILY)` over the range → per day, pick the bucket by `weekday + 7 × get_week_type(day)` and emit `(day+hour_from, day+hour_to, attendance)` → localize and clamp to the query bounds. The third tuple element is the source `resource.calendar.attendance` recordset — its `duration_days`/`duration_hours` make day-counting possible. Then per resource, `_get_calendar_at(start_dt)` decides the branch:
+- **Fixed / Variable:** the line intervals.
+- **Fully flexible:** one interval covering the whole query
+  ([:383](../addons/resource/models/resource_calendar.py#L383)).
+- **Flexible:** synthetic days. It walks 7-day windows from the query start and gives each day
+  `min(hours_per_day, hours left in the week)`, centred on 12:00
+  ([:390](../addons/resource/models/resource_calendar.py#L390)). A query that starts inside a
+  window assumes the earlier days of that window were worked in full.
 
-- **no calendar at that date** → one interval covering the whole query, dummy attendance `duration_days = hours/24` ([resource_calendar.py:405-413](../addons/resource/models/resource_calendar.py#L405));
-- **flexible calendar** → synthetic fill: walk 7-day windows from the query start date, allocate `min(hours_per_day, remaining weekly quota)` per day centered at 12:00, each day's dummy attendance carrying `duration_days = 1` ([resource_calendar.py:414-478](../addons/resource/models/resource_calendar.py#L414)). A query starting mid-week assumes the *prior* days of that rolling window were fully worked ([resource_calendar.py:436-442](../addons/resource/models/resource_calendar.py#L436));
-- **fixed** → the shared per-tz result.
+**`_leave_intervals_batch`** ([:468](../addons/resource/models/resource_calendar.py#L468)) —
+searches calendar leaves with `count_as = absence` by default
+([:474](../addons/resource/models/resource_calendar.py#L474)), on this calendar or none, for these
+resources or none. A public holiday applies to a resource only when their companies are equal
+([:506](../addons/resource/models/resource_calendar.py#L506)). A flexible resource's own leave is
+widened to whole local days.
 
-`lunch=True` on a flexible calendar returns empty ([resource_calendar.py:331-332](../addons/resource/models/resource_calendar.py#L331)).
+**`_work_intervals_batch`** ([:525](../addons/resource/models/resource_calendar.py#L525)) —
+attendance minus leaves; `hr_work_entry` also subtracts absence-type schedule lines.
+`_unavailable_intervals_batch` ([:552](../addons/resource/models/resource_calendar.py#L552)) is the
+complement; a flexible resource gets only its leave intervals
+([:563](../addons/resource/models/resource_calendar.py#L563)).
 
-### `_leave_intervals_batch(start_dt, end_dt, resources, domain, tz)` ([resource_calendar.py:497-551](../addons/resource/models/resource_calendar.py#L497))
+**Day counting** — `_get_attendance_intervals_days_data` ([:583](../addons/resource/models/resource_calendar.py#L583))
+splits intervals per calendar day. A day made of duration-based lines counts
+hours ÷ that day's line total. Any other day counts **1 if its hours exceed 3/4 of the reference
+day, else 0.5** ([:615](../addons/resource/models/resource_calendar.py#L615)). The sum is rounded
+to 0.001 day.
 
-Searches `resource.calendar.leaves` with: default `time_type = 'leave'`, `calendar_id in [False] + self.ids`, `resource_id in [False] + resources`, date overlap, `company_id in [False] + resource companies`. Pairing rule per (leave, resource): a resource-specific leave applies only to its resource; a global leave applies only when `resource.company_id == leave.company_id` ([resource_calendar.py:531-532](../addons/resource/models/resource_calendar.py#L531)). This strict equality is safe **for this interval helper**. Work-entry generation uses a separate search/pairing implementation and can cross enabled companies; see below. For fully-flexible resources, each leave expands to full local days.
-
-### `_work_intervals_batch` = attendance − leave ([resource_calendar.py:553-569](../addons/resource/models/resource_calendar.py#L553))
-
-Note the asymmetry: the `employee_timezone` context key is forwarded only into the attendance half ([resource_calendar.py:561](../addons/resource/models/resource_calendar.py#L561)). `_unavailable_intervals_batch` is its complement (gaps between work intervals) and **silently skips fully-flexible resources** — they're absent from the result dict ([resource_calendar.py:578-599](../addons/resource/models/resource_calendar.py#L578)).
-
-### Day counting — `_get_attendance_intervals_days_data` ([resource_calendar.py:617-643](../addons/resource/models/resource_calendar.py#L617))
-
-`days += duration_days × interval_hours / duration_hours` — a clipped attendance yields a proportional fraction of its configured day weight (half-day rows carry `duration_days = 0.5`). For a single flexible calendar it divides hours by `hours_per_day` instead. This is the math behind payroll's OUT-of-contract lines and leave durations (`get_work_duration_data`, `_get_work_days_data_batch`, `_get_leave_days_data_batch`).
-
-### External API built on the engine
-
-- `get_work_hours_count(start, end)` — plain hour sum of work intervals ([resource_calendar.py:794-819](../addons/resource/models/resource_calendar.py#L794)). `hr.leave` uses it for durations without an employee ([hr_leave.py:621-626](../addons/hr_holidays/models/hr_leave.py#L621)).
-- `get_work_duration_data(from, to)` — `{'days', 'hours'}` via the day-counting helper, calendar-only (no resource) ([resource_calendar.py:821-843](../addons/resource/models/resource_calendar.py#L821)).
-- `plan_hours(hours, day_dt)` / `plan_days(days, day_dt)` — walk forward/backward through intervals in 14-day chunks (max 100 iterations ≈ 3.8 years) to find the datetime after scheduling that much work ([resource_calendar.py:845-932](../addons/resource/models/resource_calendar.py#L845)). Scheduling-side API (no payroll consumers).
-- `_get_unusual_days(start, end)` — `{date: bool}` map of non-working days for calendar views; for flexible calendars only leave days are "unusual" ([resource_calendar.py:710-729](../addons/resource/models/resource_calendar.py#L710)).
-- `_works_on_date(date)` — weekday-map lookup backed by `_get_working_hours`, which is `@ormcache('self.id')` ([resource_calendar.py:934-942, 1000-1007](../addons/resource/models/resource_calendar.py#L934)).
-- `_get_hours_for_date(date, day_period)` — `(hour_from, hour_to)` bounds for a date; flexible calendars synthesize `12 ± hours_per_day/2` ([resource_calendar.py:944-998](../addons/resource/models/resource_calendar.py#L944)). Feeds `hr.leave` half-day time bounds ([hr_leave.py:1579-1580](../addons/hr_holidays/models/hr_leave.py#L1579)).
-
-### Planning-side machinery (multi-calendar aware)
-
-`resource.resource._get_valid_work_intervals` intersects work intervals with per-resource calendar *validity* periods ([resource_resource.py:182-216](../addons/resource/models/resource_resource.py#L182)); validity comes from `_get_calendars_validity_within_period`, which hr overrides to contract periods ([resource.py:92-108](../addons/hr/models/resource.py#L92)). The flexible twins `_get_flexible_resource_valid_work_intervals` / `_get_flexible_resource_work_hours` build full-day intervals, subtract leaves via `_format_leave` (overridden by hr_holidays for half-day and custom-hour leaves, [resource.py:193-226](../addons/hr_holidays/models/resource.py#L193)), and cap per-day/per-locale-week ([resource_resource.py:287-397](../addons/resource/models/resource_resource.py#L287)). Consumers: enterprise `planning` only.
-
-`utils.py` holds the fallback constant `HOURS_PER_DAY = 8` and the `filter_domain_leaf` domain-rewriting helper ([utils.py:6-9](../addons/resource/models/utils.py#L6)) — no business flow of its own.
-
----
-
-## Multi-Company Notes
-
-- `resource.calendar` has **no multi-company record rule anywhere** — any user reads all companies' calendars; the `company_id` field only filters defaults and leave domains. `resource.resource` and `resource.calendar.leaves` do have company rules ([resource_security.xml:30-40](../addons/resource/security/resource_security.xml#L30)).
-- A calendar's `company_id` is optional. Company-less calendars: exempt from the `full_time_required_hours` reset, usable across companies, and their global leaves get `company_id = env.company` at save ([resource_calendar_leaves.py:58-61](../addons/resource/models/resource_calendar_leaves.py#L58)) — which then only matches resources of that company in the interval engine.
-- Resource-calendar interval matching is strict equality, but work-entry generation uses all enabled companies and lacks the same exact pairing check. Multi-company holidays need one row per company plus a work-entry override/regression test.
-
----
-
-## Gotchas & Non-Obvious Behavior
-
-- **`full_time_required_hours` self-resets** to the company calendar's weekly hours on recompute — a customized value doesn't survive; only company-less calendars keep it.
-- **Half-day weekdays inflate nothing**: a weekday with one 4h slot still counts as a full weekday in the `hours_per_day` divisor, deflating hours_per_day for everyone on that calendar — which changes payslip day counts.
-- **Changing a calendar's company silently rebuilds it** — attendance rows, tz, and global leaves are re-copied from the new company's default calendar (stored computes with `readonly=False`).
-- **The 75% half-day threshold**: an attendance slot is weighted 0.5 days when its span ≤ `hours_per_day × 0.75`, else 1 ([resource_calendar_attendance.py:98-106](../addons/resource/models/resource_calendar_attendance.py#L98)). Two 4h slots on one day = 2 × 0.5 = 1 day, but one 6.5h slot on an 8h calendar = 1 full day.
-- Comment/code mismatch: day rounding claims "closest 16th of a day" but rounds to 0.001 ([resource_calendar.py:640](../addons/resource/models/resource_calendar.py#L640)).
-- **`transfer_leaves_to` is dead code in v19** — defined in hr, called only by tests. This matters to employee-owned resource leaves. Public holidays are not employee-owned: calendar-specific applicability changes dynamically with the employee's date-effective schedule; All Schedules continues to apply.
-- Two-week calendars: week parity is absolute (weeks since year 1), so it never resets at year boundaries — but also never aligns with ISO week numbers.
-- **`_get_working_hours` is `@ormcache`'d and the resource module never invalidates it** ([resource_calendar.py:1000](../addons/resource/models/resource_calendar.py#L1000)) — after editing attendance rows, `_works_on_date` (used by l10n_fr holiday extension, renting) can serve the stale weekday map until a registry cache clear.
-- **Global leave edits are payroll-sensitive**: they re-open/recompute leave, notify employees, may auto-refuse it and indirectly deactivate validated leave work entries, but do not rebuild existing public-holiday entries.
-- **Flexible rolling-window assumption**: querying attendance intervals for a flexible employee starting mid-week assumes all prior days of that 7-day window were worked at `hours_per_day` — short queries near week starts under-allocate.
-- `_unavailable_intervals_batch` omits fully-flexible resources from its result dict entirely — callers indexing by resource id get `KeyError`, not "always available".
-- Work-entry generation does **not** use `_leave_intervals_batch` — it re-implements leave pairing from a direct `resource.calendar.leaves` search with its own calendar-matching rules ([hr_version.py:178-233](../addons/hr_work_entry/models/hr_version.py#L178)); behavior differences between time-off math and work-entry math often trace to this fork.
-- The `employee_timezone` context affects attendance intervals but not leave intervals inside the same `_work_intervals_batch` call ([resource_calendar.py:561](../addons/resource/models/resource_calendar.py#L561)).
+**External API** — `get_work_hours_count` (date inputs are read in the company timezone,
+[:699](../addons/resource/models/resource_calendar.py#L699)), `get_work_duration_data`
+([:739](../addons/resource/models/resource_calendar.py#L739)), `plan_hours` / `plan_days` (walk
+14-day chunks, at most 100, [:764](../addons/resource/models/resource_calendar.py#L764)),
+`_get_unusual_days` (grey days in calendar views; for a flexible resource only leave days,
+[:666](../addons/resource/models/resource_calendar.py#L666)) and `_works_on_date` (always true for
+a flexible calendar, [:854](../addons/resource/models/resource_calendar.py#L854)).
 
 ---
 
 ## Consumer Map — Who Calls the Engine
 
-| Consumer (business feature) | Calls | Where |
+| Business feature | Calls | Where |
 |---|---|---|
-| Work entry generation from calendar | `_attendance_intervals_batch` (attendances, lunch, static-attendance fallbacks); fully-flexible → synthetic whole-range interval | [hr_version.py:113, 130, 246, 257](../addons/hr_work_entry/models/hr_version.py#L113); leaves via direct search [hr_version.py:96-97, 180](../addons/hr_work_entry/models/hr_version.py#L96) |
-| Payslip worked-days → days conversion | `calendar.hours_per_day` | [hr_payslip.py:831-855](../enterprise/hr_payroll/models/hr_payslip.py#L831) |
-| Payslip OUT-of-contract lines | `get_work_duration_data` on the reference calendar | [hr_payslip.py:886-898](../enterprise/hr_payroll/models/hr_payslip.py#L886) |
-| Payroll work-entry validation (out-of-schedule check) | `_attendance_intervals_batch` | [hr_work_entry.py:44](../enterprise/hr_payroll/models/hr_work_entry.py#L44) |
-| Payslip batch calendar (unusual days) | `_get_unusual_days` | [hr_payslip_run.py:424](../enterprise/hr_payroll/models/hr_payslip_run.py#L424) |
-| Payroll version day/hour aggregation | `employees._get_work_days_data_batch` | [hr_version.py:587](../addons/hr_work_entry/models/hr_version.py#L587) |
-| Time-off duration (`number_of_days`/`hours`) | `_list_work_time_per_day`, `_get_work_days_data_batch`, `get_work_hours_count` | [hr_leave.py:575, 579, 621-626](../addons/hr_holidays/models/hr_leave.py#L575) |
-| Time-off validation → calendar exception | creates/unlinks `resource.calendar.leaves` | [hr_leave.py:996-1013](../addons/hr_holidays/models/hr_leave.py#L996) |
-| Accrual/allocation math | `_get_leave_days_data_batch`, `_get_work_days_data_batch` | [hr_leave_allocation.py:385-402](../addons/hr_holidays/models/hr_leave_allocation.py#L385) |
-| Leave-type "closest allocation" duration | `_work_intervals_batch` + `_get_attendance_intervals_days_data` | [hr_leave_type.py:596-597](../addons/hr_holidays/models/hr_leave_type.py#L596) |
-| Employee calendar-view grey days | `employee._get_unusual_days` → per-version `calendar._get_unusual_days` | [hr_employee.py:1613-1635](../addons/hr/models/hr_employee.py#L1613) |
-| Expected attendance / lunch (attendance & overtime base) | `_work_intervals_batch`, `_attendance_intervals_batch(lunch=True)`, `get_work_duration_data` | [hr_employee.py:1637-1715](../addons/hr/models/hr_employee.py#L1637) |
-| Attendance overtime rules | `_leave_intervals_batch`, `_attendance_intervals_batch` (incl. lunch), `_get_unusual_days` | [hr_employee.py:279-306](../addons/hr_attendance/models/hr_employee.py#L279), [hr_attendance_overtime_rule.py:192, 227, 238, 491-492](../addons/hr_attendance/models/hr_attendance_overtime_rule.py#L192) |
-| "Working now" presence check | `_work_intervals_batch` (calendar-generic key) | [hr_employee.py:844](../addons/hr/models/hr_employee.py#L844) |
-| Planning slot allocation | `_get_valid_work_intervals`, `_get_flexible_resource_valid_work_intervals`, `_get_flexible_resource_work_hours`, `_adjust_to_calendar` | [planning_slot.py:254-255, 410-413, 634-672, 1239-1337](../enterprise/planning/models/planning_slot.py#L254) |
-| FR/IN holiday localizations | `_works_on_date` | [l10n_fr hr_leave.py:90-167](../addons/l10n_fr_hr_holidays/models/hr_leave.py#L90), [l10n_in hr_leave.py:82](../addons/l10n_in_hr_holidays/models/hr_leave.py#L82) |
-| Half-day leave hour bounds | `_get_hours_for_date` | [hr_leave.py:1579-1580](../addons/hr_holidays/models/hr_leave.py#L1579) |
-| Version-aware calendar resolution (everything above) | `resource._get_calendar_at` → `employee._get_calendars(date)` | [resource.py:131-137](../addons/hr/models/resource.py#L131), [hr_employee.py:1553-1563](../addons/hr/models/hr_employee.py#L1553) |
+| Fixed-wage rate on the payslip | `_work_intervals_batch(compute_leaves=False)` over the payslip period; Undefined calendars fall back to the slip's own non-extra hours | [hr_payslip_worked_days.py:66](../enterprise/hr_payroll/models/hr_payslip_worked_days.py#L66) |
+| Payslip days | `calendar.hours_per_day` | [hr_payslip.py:1356](../enterprise/hr_payroll/models/hr_payslip.py#L1356) |
+| Out-of-contract line | `get_work_duration_data` on the version calendar (company calendar for flexible ones) | [hr_payslip.py:1365](../enterprise/hr_payroll/models/hr_payslip.py#L1365), [:1418](../enterprise/hr_payroll/models/hr_payslip.py#L1418) |
+| Payslip time projection | `_attendance_intervals_batch`; absence durations from `_get_work_days_data_batch(compute_leaves=False)` | [hr_version.py:72](../addons/hr_work_entry/models/hr_version.py#L72), [:493](../addons/hr_work_entry/models/hr_version.py#L493) |
+| Time rule thresholds | `_attendance_intervals_batch`, `_leave_intervals_batch` | [hr_time_rule.py:422](../addons/hr_work_entry/models/hr_time_rule.py#L422) |
+| Time off durations | `_list_work_time_per_day`, `_get_work_days_data_batch`, `get_work_hours_count` | [hr_leave.py:904](../addons/hr_holidays/models/hr_leave.py#L904) |
+| Half-day leave hours | `hr.employee._get_hours_for_date` | [hr_employee.py:848](../addons/hr_holidays/models/hr_employee.py#L848) |
+| Accruals on worked time | `_get_work_days_data_batch`, `_get_leave_days_data_batch` | [hr_leave_allocation.py:526](../addons/hr_holidays/models/hr_leave_allocation.py#L526) |
+| Expected attendance (tolerance validation, auto check-out) | `hr.employee._get_expected_attendances` | [hr_employee.py:2261](../addons/hr/models/hr_employee.py#L2261) |
+| Grey days in calendar views | `hr.employee._get_unusual_days` | [hr_employee.py:2216](../addons/hr/models/hr_employee.py#L2216) |
+| Planning allocation | `_get_valid_work_intervals` and the flexible helpers (locale weeks) | [resource_resource.py:196](../addons/resource/models/resource_resource.py#L196) |
+| French and Indian time-off rules | `_works_on_date` | [l10n_fr hr_leave.py:145](../addons/l10n_fr_hr_holidays/models/hr_leave.py#L145) |
+
+---
+
+## Multi-Company Notes
+
+- `resource.calendar` has no company restriction: every internal user reads all calendars and HR
+  Officers hold an unrestricted create/write/delete row
+  ([resource ir.access.csv:2](../addons/resource/security/ir.access.csv#L2),
+  [hr ir.access.csv:40](../addons/hr/security/ir.access.csv#L40)). The only barrier is `hr`'s
+  write guard above.
+- `resource.calendar.leaves` and `resource.resource` carry company restrictions
+  ([resource ir.access.csv:7](../addons/resource/security/ir.access.csv#L7),
+  [:11](../addons/resource/security/ir.access.csv#L11)).
+- A calendar without company is visible to all companies. Its public holidays still carry the
+  company that created them, so they reach only that company's resources in the engine.
+
+---
+
+## Gotchas & Non-Obvious Behavior
+
+- **Half-day weekdays lower `hours_per_day`** for everyone on the calendar, which changes payslip
+  day counts (not amounts; amounts are priced on hours).
+- **The 3/4 threshold decides full vs half days.** On an 8 h calendar a 6 h day counts 0.5 day and
+  a 6.5 h day counts 1.
+- **Fully flexible employees count 24 h per calendar day** in `_get_work_days_data_batch` and in
+  payslip absence durations. A one-day public holiday or leave on such a calendar can become a
+  24 h line.
+- **Flexible rolling windows start at the query date**, while planning's flexible helpers count
+  locale calendar weeks — two week conventions for the same employee.
+- **`full_time_required_hours` does not keep a typed value**; it follows the reference calendar.
+- **Changing the calendar type deletes lines** that do not fit the new type, immediately on save.
+- **Time types on schedule lines follow the company country.** As soon as one
+  `hr.work.entry.type` with the company's country exists, only that country's types can be
+  chosen ([_compute_allowed_work_entry_type_ids](../addons/hr_work_entry/models/resource_calendar_attendance.py#L22)).
+  Georgia has no core set, so a single Georgian type (such as the `GE_PUBLIC_HOLIDAY` that
+  `geo_payroll` shipped until 2026-09-24) takes the generic types away here; see
+  [`public_holidays_flow.md`](public_holidays_flow.md).
+- **Payslip projection and time-off math search leaves differently.** Work-entry generation builds
+  its own calendar-leave domain from the version's company and calendar
+  ([_get_leave_domain](../addons/hr_work_entry/models/hr_version.py#L60)) instead of
+  `_leave_intervals_batch`; differences between a leave's duration and its payslip hours usually
+  trace to this fork.
 
 ---
 
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
-- [`hr_employee_versions.md`](hr_employee_versions.md) — who owns the calendar per date (version/contract engine)
-- [`work_entries.md`](work_entries.md) — the main consumer of attendance intervals; `work_entry_type_id` extension point
-- [`payroll_wage_types.md`](payroll_wage_types.md) — hours_per_day in payslip day math (§8.2 #1)
-- [`hr_payroll.md`](hr_payroll.md) — payslip flow that consumes the day counts
-- [`attendance_work_entry.md`](attendance_work_entry.md) — attendance-sourced work entries vs calendar-sourced
-- [`hr_holidays_time_off_units.md`](hr_holidays_time_off_units.md) — how leave days/hours units build on these durations
-- [`hr_holidays_accrual_plans.md`](hr_holidays_accrual_plans.md) — accrual math over `_get_work_days_data_batch`
+- [`hr_employee_versions.md`](hr_employee_versions.md) — which version (and calendar) applies on a date
+- [`work_entries.md`](work_entries.md) — the payslip projection and time types on schedule lines
+- [`public_holidays_flow.md`](public_holidays_flow.md) — public holiday rows and their effects
+- [`payroll_wage_types.md`](payroll_wage_types.md) — how hours and days become money
+- [`hr_payroll.md`](hr_payroll.md) — payslip lifecycle
+- [`attendance_work_entry.md`](attendance_work_entry.md) — attendance-based versus schedule-based pay
+- [`hr_holidays_time_off_units.md`](hr_holidays_time_off_units.md) — day/half-day/hour time-off units
+- [`hr_holidays_accrual_plans.md`](hr_holidays_accrual_plans.md) — accruals over worked time

@@ -1,1521 +1,554 @@
 # Manufacturing (MRP)
 
-> **Module:** `mrp` | **Path:** [`addons/mrp/`](../addons/mrp/)
-> **Odoo Apps category:** Manufacturing
-> **Enterprise extension:** `mrp_workorder` | **Path:** [`enterprise/mrp_workorder/`](../enterprise/mrp_workorder/)
+> **Module:** `mrp` (+ `mrp_account`, `mrp_subcontracting`; enterprise `mrp_workorder`, `quality_mrp*`, `mrp_mps`; `maintenance` + enterprise `mrp_maintenance`) | **Path:** [`addons/mrp/`](../addons/mrp/)
+> Verified against Odoo 20 source on 2026-09-24.
+
+## What It Does & Why It Exists
+
+Manufacturing turns components into finished products inside Odoo. A **Bill of Materials (BoM)** is the recipe: components, optional operations (steps on work centers) and optional by-products. A **Manufacturing Order (MO)** applies the recipe to a quantity: it creates stock moves that consume components and receive the finished product, and one **work order** per operation. Planners schedule work orders on work-center calendars, operators record time and quantities (in the back office or on the enterprise **Shop Floor** app), and `mrp_account` turns consumed components and work-center time into the finished product's cost. Quality checks (enterprise) and maintenance requests plug into the same work orders and work centers. The result: stock that matches what was really consumed and produced, a cost per MO, and a schedule per machine.
 
 ---
 
-## What It Does
+## Key Terms
 
-The MRP module manages the full manufacturing process: defining how products are built (Bills of Material), scheduling production on work centers, tracking component consumption, and recording finished goods output. It creates Manufacturing Orders (MOs) that drive stock moves for raw materials and finished products. When Work Orders are enabled, each manufacturing step is tracked separately on specific work centers with time logging, capacity planning, and optional quality checks (enterprise).
-
----
-
-## Key Concepts (Glossary)
-
-Before diving in, here are the terms you will encounter throughout this document:
-
-| Term | What It Means |
+| Term | Meaning |
 |---|---|
-| **Bill of Material (BOM)** | A recipe/blueprint that lists what components (raw materials) and operations (steps) are needed to make a product. Think of it like a cooking recipe. |
-| **Manufacturing Order (MO)** | A work ticket that tells the factory "make X units of this product using this BOM." It tracks the entire production run from start to finish. |
-| **Work Order (WO)** | A single step within an MO. If your BOM has 3 operations (Cut, Assemble, Paint), the MO will have 3 work orders -- one per step. |
-| **Work Center** | A physical machine, workstation, or area where operations happen -- e.g., "CNC Machine #2", "Assembly Line A", "Paint Booth". |
-| **Operation** | A manufacturing step defined on a BOM -- e.g., "Cutting", "Welding", "Quality Check". Each operation runs on a specific work center. |
-| **Component** | A raw material or sub-product consumed during manufacturing. Listed as BOM lines. |
-| **Finished Product** | The output of manufacturing. What the MO produces. |
-| **By-Product** | A secondary/incidental output created during manufacturing. Example: sawdust produced when cutting wood. |
-| **Kit (Phantom BOM)** | A product that is never physically assembled. When sold or used in another BOM, it "explodes" into its individual components. No MO is created. |
-| **Backorder** | When you produce fewer units than planned and click "Mark as Done", Odoo creates a new MO for the remaining quantity. That new MO is the backorder. |
-| **Scrap** | Removing defective components or products from inventory during production. |
-| **Unbuild** | The reverse of manufacturing -- disassembling a finished product back into its components. |
-| **BOM Explosion** | The process of breaking down a BOM (and any nested BOMs) into a flat list of individual components. Happens automatically. |
-| **Flexible Consumption** | Controls whether workers can consume more/less/different components than the BOM prescribes. |
-| **OEE** | Overall Equipment Effectiveness -- a percentage measuring how productively a work center is used. |
-| **MPS** | Master Production Schedule -- a planning tool for forecasting demand and scheduling production across time periods. |
-| **Lead Time** | How many days it takes to manufacture a product. Used by the scheduler to plan when to start production. |
+| **BoM** | Recipe for a product: components (BoM lines), operations, by-products. Type **Manufacture this product** (`normal`) or **Kit** (`phantom`); `mrp_subcontracting` adds **Subcontracting** |
+| **MO** | Order to produce a quantity of one product with one BoM |
+| **Work order (WO)** | One operation of the MO, executed on a work center |
+| **Operation** | A step on a BoM (`mrp.routing.workcenter`): work center, duration, cost mode |
+| **Work center** | Machine, line or team with a calendar, capacity, efficiency and hourly cost |
+| **Kit** | BoM that is never produced: it explodes into its components on sales, deliveries and parent MOs |
+| **Backorder** | New MO for the quantity not produced when the MO is closed early |
+| **Unbuild order** | Reverse of an MO: consumes the finished product and returns the components |
+| **OEE** | Overall Equipment Effectiveness of a work center over the last month |
+| **MPS** | Master Production Schedule (enterprise `mrp_mps`): demand forecast grid per period |
 
 ---
 
-## When to Use This Module
+## The Big Picture — How It Works
 
-Use MRP when your business transforms raw materials or components into finished products and you need to track that process inside Odoo.
-
-### Best For
-- Companies that manufacture, assemble, or kit products
-- Tracking component consumption and finished goods production
-- Scheduling production across work centers with capacity constraints
-- Costing manufactured products (material + labor)
-- Managing multi-step manufacturing with operation dependencies
-
-### Not For
-- Pure resellers (use Sales + Inventory instead)
-- Subcontracting only without in-house manufacturing (use `mrp_subcontracting` standalone)
-- Simple kitting without production tracking (phantom BOMs work without MOs)
-
----
-
-## Quick Start Guide
-
-New to MRP? Follow these steps to get your first manufacturing order running:
-
-### Step 1: Enable Manufacturing
-Install the **Manufacturing** app from Apps. That is it -- the module is ready.
-
-### Step 2: Create a Product to Manufacture
-1. Go to **Manufacturing -> Products -> Products -> New**
-2. Set **Product Type** to "Goods" (must be a storable product)
-3. Save
-
-### Step 3: Create a Bill of Material
-1. Go to **Manufacturing -> Bills of Materials -> New**
-2. Select your product
-3. Set **BOM Type** to "Manufacture this product"
-4. In the **Components** tab, add raw materials with quantities
-5. Save
-
-### Step 4: Create a Manufacturing Order
-1. Go to **Manufacturing -> Operations -> Manufacturing Orders -> New**
-2. Select your product (the BOM auto-fills)
-3. Set the quantity to produce
-4. Click **Confirm** -- Odoo reserves your components from stock
-5. Click **Mark as Done** -- Odoo consumes components and adds the finished product to inventory
-
-**That is the simplest possible flow.** Everything below builds on this foundation.
-
----
-
-## Real-World Use Cases
-
-### Use Case 1: Furniture Manufacturer with Multi-Step Assembly
-**Situation:** A furniture company builds tables. Each table requires a wooden top, 4 legs, screws, and varnish. Assembly happens in two steps: frame assembly, then finishing.
-
-**In Odoo:** Create a BOM for "Dining Table" with components and two operations (Frame Assembly on "Assembly Line" work center, Finishing on "Paint Booth"). Create an MO for 10 tables. Confirm and plan. Workers start each work order, log time, and mark done. Odoo consumes components and receives finished tables into stock.
-
-**Result:** Full traceability of materials consumed, labor time per operation, and production cost per unit.
-
-### Use Case 2: Electronics Company with Partial Production
-**Situation:** A batch of 100 circuit boards is in production but only 80 pass quality. The remaining 20 need to be produced in a follow-up run.
-
-**In Odoo:** Start the MO for 100 units. After producing 80, click "Mark as Done". Odoo asks whether to create a backorder for the remaining 20. Confirm backorder. A new MO is created for 20 units with components already reserved.
-
-**Result:** Inventory is accurate (80 boards received), and the remaining production is tracked separately.
-
-### Use Case 3: Kit Product (Phantom BOM)
-**Situation:** An e-commerce company sells a "Starter Kit" containing 3 products but never physically assembles them. When a sale order is confirmed, all 3 components should be picked from stock individually.
-
-**In Odoo:** Create a BOM of type "Kit" (phantom) for the Starter Kit with the 3 component products. When a SO is confirmed, Odoo explodes the kit into 3 separate delivery lines. No MO is created.
-
-**Result:** No manufacturing overhead. Stock is managed at the component level. The kit is just a sales convenience.
-
-### Use Case 4: Auto-Created MO from a Sale Order
-**Situation:** A customer orders 50 custom chairs. You want Odoo to automatically create a manufacturing order when the sale is confirmed.
-
-**In Odoo:** Install `sale_mrp`. On the product, set the route to "Manufacture". Create a BOM. When the sale order is confirmed, Odoo's procurement engine calls [`_run_manufacture()`](../addons/mrp/models/stock_rule.py#L81) which automatically creates and confirms an MO for 50 chairs.
-
-**Result:** No manual MO creation needed. Sales demand directly drives production.
-
-### Use Case 5: Subcontracted Manufacturing
-**Situation:** You design circuit boards but a vendor assembles them. You send components; they send back finished boards.
-
-**In Odoo:** Install `mrp_subcontracting`. Create a BOM of type "Subcontracting" and link it to the vendor. When you receive goods from that vendor, Odoo automatically creates an MO at the subcontractor's virtual location, consuming components and producing finished goods.
-
-**Result:** You track what the vendor makes without managing their shop floor.
-
----
-
-## How-To Scenarios
-
-### How to Create a Bill of Material
-1. **Manufacturing -> Bills of Materials -> New**
-2. Set the **Product** (must be a storable product)
-3. Set **BOM Type**: "Manufacture this product" (normal) or "Kit" (phantom)
-4. Add **Components** tab: each line specifies a component product and quantity per unit
-5. (Optional) Add **Operations** tab: each operation specifies a work center, duration, and sequence. Requires "Work Orders" setting enabled.
-6. (Optional) Add **By-Products** tab: secondary outputs from manufacturing
-7. (Optional) Set **Flexible Consumption**: Allowed / Allowed with warning / Blocked
-
-**What happens behind the scenes:** The BOM is the blueprint. When an MO is created for the product, [`_compute_workorder_ids()`](../addons/mrp/models/mrp_production.py#L605) generates work orders from operations, and component moves are created from BOM lines.
-
-### How to Create and Process a Manufacturing Order
-1. **Manufacturing -> Operations -> Manufacturing Orders -> New**
-2. Select the **Product** and **Bill of Material** (auto-selected if only one BOM exists)
-3. Set **Quantity** to produce
-4. Click **Confirm** -- reserves components, creates stock moves
-5. Click **Plan** (if work orders exist) -- schedules operations on work center calendars
-6. For each work order: click **Start**, then **Done** when finished
-7. Click **Mark as Done** on the MO -- posts inventory (consumes components, receives finished product)
-
-**What happens behind the scenes:** Confirm calls [`action_confirm()`](../addons/mrp/models/mrp_production.py#L1581) which creates stock moves and confirms work orders. Mark as Done calls [`button_mark_done()`](../addons/mrp/models/mrp_production.py#L2170) which posts all moves to inventory.
-
-### How to Enable Work Orders
-1. **Settings -> Manufacturing -> Operations**
-2. Enable **"Work Orders"** (field `group_mrp_routings`, implies group `mrp.group_mrp_routings`)
-3. Save. Now BOMs show an **Operations** tab and MOs show **Work Orders** tab.
-
-### How to Set Up Operation Dependencies
-1. Enable **"Work Order Dependencies"** in Settings -> Manufacturing -> Operations (field `group_mrp_workorder_dependencies`, implies group `mrp.group_mrp_workorder_dependencies`)
-2. On the BOM Operations tab, use the **Blocked By** field on each operation to specify which operations must complete first
-3. When an MO is created, work orders inherit these dependencies. Blocked work orders show state "Waiting for another WO" until predecessors complete.
-
-### How to Manufacture with Lot/Serial Numbers
-1. On the finished product, enable **Tracking** = "By Lots" or "By Unique Serial Number" (in product form -> Inventory tab)
-2. On components, enable tracking if you need to trace which lot of raw material went into which finished product
-3. Create and confirm your MO
-4. Before clicking **Mark as Done**, assign a **Lot/Serial Number** to the finished product
-5. If using serial tracking, each individual unit needs its own serial -- Odoo will prompt you
-
-**Why this matters:** Lot/serial tracking gives you full forward and backward traceability. You can answer "which customer received lot X?" and "which raw material lots went into finished product Y?"
-
-### How to Handle Backorders (Partial Production)
-1. Confirm an MO for, say, 100 units
-2. Set **Quantity Producing** to the actual amount produced (e.g., 80)
-3. Click **Mark as Done**
-4. A wizard appears: "You produced 80 out of 100. Create a backorder for the remaining 20?"
-5. Choose **Create Backorder** -- Odoo creates a new MO for 20 units with components already reserved
-6. Choose **No Backorder** -- Odoo closes the MO. The 20 unproduced units are simply dropped.
-
-**What happens behind the scenes:** [`button_mark_done()`](../addons/mrp/models/mrp_production.py#L2170) detects the under-production and calls [`_action_generate_backorder_wizard()`](../addons/mrp/models/mrp_production.py#L1784). If confirmed, [`_split_productions()`](../addons/mrp/models/mrp_production.py#L1932) creates the backorder MO with proportional stock moves and reservations. The original MO is renamed (e.g., `WH/MO/00001-001`) and the backorder gets the next sequence (e.g., `WH/MO/00001-002`).
-
----
-
-## Understanding Bills of Material (BOM) in Depth
-
-### BOM Types
-
-#### `normal` -- Manufacture this product
-Standard manufacturing BOM. Creates a Manufacturing Order with work orders for each operation. Components are consumed; finished product is produced.
-
-**When to use:**
-- Furniture assembly -- a table BOM defines wood top, legs, screws, varnish as components + operations (frame assembly, finishing). MO reserves components, work orders guide workers, finished tables land in stock with full cost traceability.
-- Partial production -- start an MO for 100 units, produce 80, mark as done. Odoo creates a backorder MO for the remaining 20 with components already reserved.
-- Multi-level manufacturing -- a sub-assembly (e.g., motor) has its own normal BOM. When the parent product MO is confirmed, Odoo triggers a separate MO for the sub-assembly via procurement rules.
-- Make-to-order -- with `sale_mrp` installed, confirming a sale order auto-creates an MO for the exact quantity ordered.
-
-#### `phantom` -- Kit
-No MO is created. When used in a sale order or another MO, the kit is "exploded" into its individual components via [`explode()`](../addons/mrp/models/mrp_bom.py#L409). The kit product itself never appears in stock moves.
-
-**When to use:**
-- Product bundles -- an e-commerce "Starter Kit" containing 3 products. SO confirmation explodes the kit into 3 separate delivery lines, each picked individually from stock.
-- Pre-packed sets -- a cosmetics gift set (lipstick + mascara + case). Stock is tracked at the component level; the customer sees one line item on the quote.
-- Nested kits in manufacturing -- a normal BOM includes a phantom sub-BOM. During MO creation, `explode()` flattens the kit into individual components on the MO -- no separate MO for the sub-assembly.
-- Variable packaging -- 6 bottles of wine sold as a "6-pack" or individually. The phantom BOM maps 1 "6-pack" to 6x single bottle. Stock exists only as single bottles; the 6-pack is a sales-only SKU.
-
-#### `subcontract` -- Subcontracting (requires `mrp_subcontracting`)
-The product is manufactured by an external vendor. No in-house MO is created directly. Instead, when you receive goods from the subcontractor, Odoo automatically creates an MO at the subcontractor's virtual location.
-
-**When to use:**
-- Outsourced assembly -- you design circuit boards but a vendor assembles them
-- Overflow production -- your factory is at capacity, so you send excess work to a partner
-
-### Multi-Level BOMs (Sub-Assemblies)
-
-A finished product can contain components that themselves have BOMs. This creates a multi-level BOM structure.
-
-**Example:**
 ```
-Bicycle (finished product)
-  |-- Frame Assembly (has its own BOM = sub-assembly)
-  |     |-- Steel Tube
-  |     |-- Welding Rod
-  |-- Wheel Set (has its own BOM = sub-assembly)
-  |     |-- Rim
-  |     |-- Spokes
-  |     |-- Tire
-  |-- Seat
-  |-- Handlebars
+BoM ──► MO Draft ──Confirm──► Confirmed ──Start / first WO started / first component picked──► In Progress
+          │                        │                                                               │
+          │  Plan (allowed         │  Plan: work orders get slots                                   │ all WOs done or cancelled
+          │  in draft too)         │  on work-center calendars                                      ▼
+          │                        │                                                            To Close
+          ▼                        ▼                                                               │ Produce
+       Cancel ◄──────────────── Cancel                                                             ▼
+          │                                                                         Done (stock posted, MO locked)
+          └─ Reset to Draft (Administrator)                        Set to In Progress (Administrator) ◄┘
+                                                                   Backorder MO for the rest (if any)
 ```
 
-**How it works:**
-- If the sub-assembly BOM is **normal**: Odoo creates a separate MO for the sub-assembly. The parent MO waits until the sub-assembly is produced. This is triggered by procurement rules.
-- If the sub-assembly BOM is **phantom (kit)**: Odoo flattens the sub-assembly into the parent MO. No separate MO is created -- all components appear directly on the parent MO.
+1. **Draft.** The MO exists; component and finished moves and work orders are computed from the BoM and can still change. Draft MOs can already be planned.
+2. **Confirm.** Moves are confirmed, missing components trigger procurement, pickings of 2/3-step manufacturing are confirmed, and work orders are chained ([`action_confirm()`](../addons/mrp/models/mrp_production.py#L1751)).
+3. **Plan.** Each work order gets a time slot on its work center, dependency order respected ([`button_plan()`](../addons/mrp/models/mrp_production.py#L1829)).
+4. **Execute.** Operators start and finish work orders, record quantities, consume components. The MO moves to **In Progress** as soon as a work order is in progress or done, or a component move is picked ([`_compute_state()`](../addons/mrp/models/mrp_production.py#L607)).
+5. **Produce.** The **Produce** button checks consumption against the BoM, decides about a backorder, finishes open work orders, posts the stock moves and locks the MO ([`button_mark_done()`](../addons/mrp/models/mrp_production.py#L2379)).
 
-**When to use normal sub-assemblies:** When the sub-assembly is stocked independently (you keep Frame Assemblies in inventory) or when it is produced on a different work center/schedule.
-
-**When to use phantom sub-assemblies:** When the sub-assembly is never stocked -- it is always made as part of the parent product.
-
-### Flexible Consumption Modes
-
-Controls what happens when a worker consumes more/less/different components than the BOM prescribes. Set on the BOM; enforced at Mark as Done via [`_get_consumption_issues()`](../addons/mrp/models/mrp_production.py#L1716).
-
-| Mode | Field Value | What Happens | Who Can Override | When to Use |
-|---|---|---|---|---|
-| **Allowed** | `flexible` | No validation. Any quantity accepted. | Everyone | Prototyping, high-waste processes, material substitution |
-| **Allowed with warning** | `warning` | Warning wizard appears. Any manufacturing user can click Confirm. | Any manufacturing user | Standard manufacturing (default). Catches accidents. |
-| **Blocked** | `strict` | Wizard appears but Confirm is hidden. Only a **Force** button is available, restricted to Manufacturing Managers. | Manufacturing Managers only | Pharma, aerospace, food -- strict material accountability |
+### Key Decision Points
+- **BoM type:** `normal` creates MOs; `phantom` (kit) never does, its components are used directly.
+- **Work orders on or off** (Settings → Manufacturing → Work Orders): without them an MO is a single confirm-and-produce step with no scheduling or time tracking.
+- **Operation type of the MO:** whether procurement MOs are confirmed automatically, whether a short production asks for, always creates or never creates a backorder.
+- **Warehouse manufacturing steps:** 1, 2 or 3 steps decide whether components are picked to a pre-production location and whether finished goods pass through a post-production location.
+- **Consumption:** there is no per-BoM "flexible/strict" option. Any mismatch between consumed and expected quantities opens a warning that every manufacturing user can confirm.
 
 ---
 
-## By-Products
+## When to Use It (and When Not To)
 
-By-products are secondary outputs created during manufacturing. They are not the main product but have value or need tracking.
+### This module is for:
+- Manufacturers and assemblers who need component consumption and finished-goods receipts to hit stock.
+- Workshops that schedule several steps on machines or lines and want time per operation.
+- Companies that sell bundles (kits) and want stock kept at component level.
+- Manufacturers that cost products from real consumption and work-center time (with `mrp_account`).
 
-**Examples:**
-- Sawdust produced when cutting wood
-- Whey produced when making cheese
-- Metal shavings from CNC machining
-- Glycerin produced during soap manufacturing
+### Use something else when:
+- You only resell products: Sales + Inventory are enough.
+- A vendor makes the product from your components: use `mrp_subcontracting` (BoM type **Subcontracting**), not in-house MOs.
+- You repair customer items: use `repair`.
 
-### How to Set Up By-Products
+---
 
-1. Enable **By-Products** in Settings -> Manufacturing -> Operations (field `group_mrp_byproducts`)
-2. Open a BOM -> **By-Products** tab -> Add a line
-3. Set the by-product, quantity, and optionally which operation produces it
+## Real-World Scenarios
 
-### By-Product Fields
+### Scenario 1: Furniture workshop with two steps
+**Situation:** A workshop builds dining tables: frame assembly on "Assembly Line", then varnish in "Paint Booth".
+**What they do:** Enable **Work Orders**. Create a BoM with the components and two operations. Create an MO for 10 tables, **Confirm**, **Plan**. The assembler starts the first work order; the painter's work order stays **Blocked** until assembly is done, then turns **To Do**. After varnishing, the MO is **To Close**; the planner clicks **Produce**.
+**What happens:** Components are consumed at the BoM quantity (or what was recorded), 10 tables enter stock, each work order keeps its real duration, and the MO cost includes both work centers' time.
 
-| Field | Purpose |
+### Scenario 2: Partial production and a backorder
+**Situation:** An electronics maker has an MO for 100 boards but only 80 are finished today.
+**What they do:** Set **Quantity** producing to 80 and click **Produce**. With the manufacturing operation type's **Create Backorder** = *Ask*, a wizard offers **Create Backorder** or **Close Production**.
+**What happens:** With a backorder, the MO is renamed `…-001` and closes for 80; a new MO `…-002` holds the remaining 20 (planned automatically if the original was planned). With **Close Production**, the remaining 20 are dropped and consumption is checked against the full 100.
+
+### Scenario 3: Kit sold on a quotation
+**Situation:** A webshop sells a "Starter Kit" of three products it never assembles.
+**What they do:** Create a BoM of type **Kit** for the kit product.
+**What happens:** Procurement for the kit is replaced by procurements for its components ([`StockRule.run()`](../addons/mrp/models/stock_rule.py#L43), `procurements_without_kit`), so the delivery shows three component lines. The kit's on-hand and forecast quantities are computed from its components. A kit cannot have a reordering rule ([`check_kit_has_not_orderpoint()`](../addons/mrp/models/mrp_bom.py#L379)) and cannot be scrapped.
+
+### Scenario 4: Make to order from a sale
+**Situation:** A chair maker produces each order on demand.
+**What they do:** Give the chair a normal BoM. The **Manufacture** route is a warehouse route, active on the main warehouse by default (**Manufacture to Resupply**). Enable **Replenish on Order (MTO)** in Inventory settings and set that route on the product.
+**What happens:** Confirming the sale order runs procurement, which finds the Manufacture rule and creates an MO ([`_run_manufacture()`](../addons/mrp/models/stock_rule.py#L83)). It is confirmed only if the operation type has **Auto Confirm Production** on.
+
+### Scenario 5: Fixed batch sizes
+**Situation:** A bakery mixes dough only in batches of 10 kg.
+**What they do:** On the BoM's Miscellaneous tab tick **Batch Size** and set 10.
+**What happens:** A replenishment of 25 kg creates three MOs of 10 kg each. Automatic MOs always use full batches, so the total is rounded up; batch-size BoMs never merge into an existing MO.
+
+### Scenario 6: Continuous production
+**Situation:** A plant cuts parts and assembles them; assembly should start as soon as the first parts are cut.
+**What they do:** On the BoM tick **Continuous Production**. Operators record the **Quantity Done** on the cutting work order as they go.
+**What happens:** The assembly work order becomes **To Do** as soon as cutting has reported some quantity, and its ready quantity follows what cutting has done ([`_compute_state()`](../addons/mrp/models/mrp_workorder.py#L163), [`_compute_qty_ready()`](../addons/mrp/models/mrp_workorder.py#L220)).
+
+---
+
+## Bills of Materials
+
+### BoM types
+- **Manufacture this product** (`normal`): creates MOs; the only type the Manufacture route accepts ([`_filter_warehouse_routes()`](../addons/mrp/models/stock_rule.py#L75)).
+- **Kit** (`phantom`): exploded by [`explode()`](../addons/mrp/models/mrp_bom.py#L449) wherever it appears: sale deliveries, procurements and parent MOs. A kit inside a normal BoM puts its components directly on the parent MO; its operations become work orders of the parent MO when they differ from the parent's.
+- **Subcontracting** (`subcontract`, from `mrp_subcontracting`, [`mrp_bom.py:11`](../addons/mrp_subcontracting/models/mrp_bom.py#L11)): see [Subcontracting](#subcontracting).
+
+A **multi-level** product has components that have their own normal BoM. Each such component is procured separately; with the Manufacture route this creates a child MO, visible through the **Child MO** / **Source MO** buttons of the MO.
+
+BoM selection for a product is [`_bom_find()`](../addons/mrp/models/mrp_bom.py#L411): among the BoMs of the variant or its template, the lowest **Sequence** wins; procurement first looks for a BoM with the rule's operation type.
+
+### What a BoM holds
+| Tab | Content | Notes |
+|---|---|---|
+| Components | Product, quantity, unit, **Apply on Variants**, **Consumed in Operation** | A line linked to an operation is consumed by that work order |
+| Operations | Work center, duration, cost mode, **Blocked By** | Needs the Work Orders setting; **Copy Existing Operations** reuses another BoM's operations |
+| By-products | Product, quantity, **Produced in Operation**, **Cost Share (%)** | Needs the By-Products setting; cost shares on one BoM cannot exceed 100% ([`_check_bom_lines()`](../addons/mrp/models/mrp_bom.py#L191)) |
+| Miscellaneous | Options below | |
+
+### Miscellaneous options that change behavior
+| Option | Field | Effect |
+|---|---|---|
+| Operation Type | [`picking_type_id`](../addons/mrp/models/mrp_bom.py#L63) | Procurements for that operation type prefer this BoM (multi-step routes group) |
+| Manufacturing Lead Time | [`produce_delay`](../addons/mrp/models/mrp_bom.py#L79) | Days of production; the MO start is the need date minus this ([`_get_date_planned()`](../addons/mrp/models/stock_rule.py#L207)) |
+| Days to prepare | [`days_to_prepare_mo`](../addons/mrp/models/mrp_bom.py#L82) | Extra days the replenishment report adds to create MOs early ("Days to Supply Components" in lead-time details) |
+| Batch Size | [`enable_batch_size`, `batch_size`](../addons/mrp/models/mrp_bom.py#L86) | Automatic MOs are created in full batches (Scenario 5) |
+| Continuous Production | [`continuous`](../addons/mrp/models/mrp_bom.py#L90) | Next work order unblocks when the previous one reports quantity (Scenario 6) |
+| Manufacturing Readiness | [`ready_to_produce`](../addons/mrp/models/mrp_bom.py#L59) | **When all components are available** or **When components for 1st operation are available**; drives the MO's **MO Readiness** |
+| Custom Operation Dependencies | [`allow_operation_dependencies`](../addons/mrp/models/mrp_bom.py#L76) | Off: work orders run one after another in sequence. On: they run in parallel unless **Blocked By** says otherwise |
+| Additional Notes | [`note`](../addons/mrp/models/mrp_bom.py#L89) | Copied to the MO and shown on the Shop Floor |
+| Extra Cost | [`extra_cost`](../addons/mrp_account/models/mrp_bom.py#L8) (`mrp_account`) | Cost per unit added to the MO cost (labour, energy, packaging) |
+
+The BoM form shows a lead-time popover that names the component with the longest lead time and its route ([`_compute_json_popover()`](../addons/mrp/models/mrp_bom.py#L353)), stat buttons **Components / Sub Assemblies**, **Operations Performance** and **BoM Overview** (the BoM structure and cost report).
+
+Changing a BoM used by open MOs flags them **Outdated BoM**; the MO offers **Update BoM**.
+
+---
+
+## Manufacturing Orders
+
+### States
+| State | Label | Set when |
+|---|---|---|
+| `draft` | Draft | Created; nothing reserved |
+| `confirmed` | Confirmed | **Confirm** ([`action_confirm()`](../addons/mrp/models/mrp_production.py#L1751)) |
+| `progress` | In Progress | A work order is in progress or done, a component is picked, or **Start** is clicked ([`action_start()`](../addons/mrp/models/mrp_production.py#L3238)) |
+| `to_close` | To Close | All work orders are done or cancelled |
+| `done` | Done | **Produce** finished; stock moves done, MO locked |
+| `cancel` | Cancelled | **Cancel**; finished moves all cancelled |
+
+Rules: [`state`](../addons/mrp/models/mrp_production.py#L182) and [`_compute_state()`](../addons/mrp/models/mrp_production.py#L607).
+
+**MO Readiness** ([`_compute_reservation_state()`](../addons/mrp/models/mrp_production.py#L693)) shows *Ready*, *Waiting* or *Waiting Another Operation* from the component moves. With **When components for 1st operation are available**, a partially reserved MO is *Ready* once the first operation's components are reserved ([`_get_ready_to_produce_state()`](../addons/mrp/models/mrp_production.py#L1571)).
+
+### Buttons and actions
+| Where | Action | What it does |
+|---|---|---|
+| Header | **Confirm** | Draft only. Confirms moves and work orders, runs procurement for missing components |
+| Header | **Plan** / **Unplan** | Schedules work orders as soon as possible (sets the MO start to now); needs work orders. Unplan is refused once a work order started or finished ([`_unplan_workorders()`](../addons/mrp/models/mrp_production.py#L1873)) |
+| Header | **Start** | Confirmed MOs: moves the MO to In Progress |
+| Header | **Produce** | Closes the MO (below). Hidden in draft; highlighted once In Progress or To Close ([`_compute_validate_button_style()`](../addons/mrp/models/mrp_production.py#L585)) |
+| Header | **Cancel** | Not for done MOs; cancels work orders and open moves ([`action_cancel()`](../addons/mrp/models/mrp_production.py#L1998)) |
+| Header | **Reset to Draft** / **Set to In Progress** | Administrator only, on cancelled / done MOs (below) |
+| Action menu | **Plan at Date** | Plans from the MO's own start date instead of now ([`action_plan_at_date`](../addons/mrp/views/mrp_production_views.xml#L220), `button_plan(as_soon_as_possible=False)`) |
+| Action menu | **Split**, **Merge**, **Lock/Unlock**, **Scrap**, **Unbuild**, **Labels**, **Mark as Done**, **Confirm** | Server actions bound to the MO list, kanban or form |
+| List view | **Plan**, **Reserve**, **Cancel**; **Unreserve** in the action menu | Bulk actions on selected MOs |
+| Components tab | **Catalog** | Add components from the product catalog |
+
+### How components are consumed
+Each component is a `stock.move` in `move_raw_ids`. Its **unit factor** is the planned quantity divided by what is left to produce ([`_compute_unit_factor()`](../addons/mrp/models/stock_move.py#L144)); the expected consumption is `(qty_producing − qty_produced) × unit factor` ([`_compute_should_consume_qty()`](../addons/mrp/models/stock_move.py#L177)).
+
+- Changing **Quantity** producing on the MO recomputes the consumed quantity of every component move that is **not picked** ([`_set_qty_producing()`](../addons/mrp/models/mrp_production.py#L1501)).
+- Typing a consumed quantity on a component marks it **picked** ([`_onchange_quantity()`](../addons/mrp/models/stock_move.py#L213)); picked moves are never recomputed again.
+- Finishing a work order sets and picks the moves of the components consumed in that operation ([`button_finish()`](../addons/mrp/models/mrp_workorder.py#L737)).
+
+### What Produce does
+[`button_mark_done()`](../addons/mrp/models/mrp_production.py#L2379), in order:
+1. **Lots/serials.** For a tracked finished product without lots, it fills the quantity producing if empty and creates one lot, or one serial per unit. For serials, the number of serials must equal the quantity producing.
+2. **Checks** ([`pre_button_mark_done()`](../addons/mrp/models/mrp_production.py#L2518)): serial uniqueness; by-products marked produced; consumption compared with the BoM ([`_get_consumption_issues()`](../addons/mrp/models/mrp_production.py#L1883)); quantity produced compared with the MO quantity ([`_get_quantity_produced_issues()`](../addons/mrp/models/mrp_production.py#L1975)).
+3. **Backorder** split if requested ([`_split_productions()`](../addons/mrp/models/mrp_production.py#L2141)).
+4. **Work orders** still open are finished; remaining component moves are picked.
+5. **Stock** posted ([`_post_inventory()`](../addons/mrp/models/mrp_production.py#L2064)): picked components done, unpicked ones cancelled, finished moves receive the lots, the cost is computed (`_cal_price`, see Costing).
+6. MO set to **Done**, end date now, **locked**; reports configured on the operation type are printed.
+
+**Consumption warning.** The check compares each component's picked quantity with the BoM quantity for what is produced, and also flags components removed from the MO and components not on the BoM. The wizard ([`action_confirm()` / `action_set_qty()`](../addons/mrp/wizard/mrp_consumption_warning.py#L21)) offers **Confirm** (keep what was consumed), **Update Quantities & Validate** (set every line to the expected quantity, creating missing moves) and **Discard**. Any manufacturing user can confirm. When the MO is closed without backorder (or the operation type never creates backorders), the expected quantities are computed for the full MO quantity.
+
+### Backorders
+The manufacturing operation type's **Create Backorder** ([`create_backorder`](../addons/stock/models/stock_picking_type.py#L193)) decides: *Ask* opens the wizard (**Create Backorder** / **Close Production**, [`action_backorder()`](../addons/mrp/wizard/mrp_production_backorder.py#L47), [`action_close_mo()`](../addons/mrp/wizard/mrp_production_backorder.py#L33)); *Always* splits silently; *Never* closes the MO for what was produced.
+
+[`_split_productions()`](../addons/mrp/models/mrp_production.py#L2141) keeps all MOs of the chain in one `production_group_id`, renames the original with `-001` and numbers the backorders `-002`, `-003` ([`_get_name_backorder()`](../addons/mrp/models/mrp_production.py#L2118)). Work orders of a backorder carry what the chain already did (**Carried Quantity**, [`qty_reported_from_previous_wo`](../addons/mrp/models/mrp_workorder.py#L133)); fully done operations are cancelled in the backorder. A backorder of a planned MO is planned automatically; with reservation at confirmation it is reserved right after the original closes.
+
+### Reset to Draft and Set to In Progress
+Two Administrator buttons reopen finished work:
+- **Reset to Draft** (cancelled MOs, [`action_reset_to_draft()`](../addons/mrp/models/mrp_production.py#L2048)): work orders back to To Do with time logs deleted, moves back to draft.
+- **Set to In Progress** (done MOs, [`action_reset_to_progress()`](../addons/mrp/models/mrp_production.py#L2039)): done moves are reverted in place. Quants move back to the source location and are reserved again ([`stock_move_line.py:757`](../addons/stock/models/stock_move_line.py#L757), `_action_reset_to_progress`); with `stock_account` the journal entries are removed and the valuation reset ([`stock_move.py:791`](../addons/stock_account/models/stock_move.py#L791), `_action_reset_to_progress`). Existing lots/serials are reused when the MO is produced again.
+
+### Split, merge, lock
+- **Split** ([`action_split()`](../addons/mrp/models/mrp_production.py#L2689)) needs a BoM. On a draft or confirmed MO with nothing producing, a wizard splits it by **# Splits** or **Max Batch Size** with a date and responsible per part. If the MO is in progress or has a quantity producing, Split immediately cuts the MO into the producing quantity and a backorder for the rest. The serial-number wizard's **Prepare MO** splits the MO into one MO per serial.
+- **Merge** ([`action_merge()`](../addons/mrp/models/mrp_production.py#L2714)): at least two MOs, same product and BoM, same state (draft or confirmed), same operation type, no components or by-products outside the BoM ([`_pre_action_split_merge_hook()`](../addons/mrp/models/mrp_production.py#L3069)). The merged MO keeps the earliest start and deadline; the originals are cancelled.
+- **Lock/Unlock:** a locked MO past draft has read-only **To Consume** quantities; a done MO is read-only while locked. MOs start unlocked when **Unlock Manufacturing Orders** is on ([`_get_default_is_locked()`](../addons/mrp/models/mrp_production.py#L78)).
+
+---
+
+## Work Orders, Operations and Work Centers
+
+### How work orders are created and chained
+- In draft, [`_compute_workorder_ids()`](../addons/mrp/models/mrp_production.py#L636) creates one work order per operation of the exploded BoM, skipping operations limited to other variants. Manual work orders are kept.
+- At confirmation, [`_link_workorders_and_moves()`](../addons/mrp/models/mrp_production.py#L1793) sets dependencies: without **Custom Operation Dependencies**, each work order is blocked by the previous one in sequence; with it, dependencies come from each operation's **Blocked By**. Component and by-product moves are attached to the work order of their operation.
+- Each work order stores the operation's cost mode at confirmation ([`_set_cost_mode()`](../addons/mrp/models/mrp_workorder.py#L1132)).
+
+### Work order states
+| State | Label | Rule ([`_compute_state()`](../addons/mrp/models/mrp_workorder.py#L163)) |
+|---|---|---|
+| `blocked` | Blocked | A predecessor is not done or cancelled, and (with continuous production) it has reported nothing yet |
+| `ready` | To Do | No predecessors, predecessors done, or (continuous) some quantity is ready |
+| `progress` | In Progress | Started, or a quantity was recorded |
+| `done` | Done | Finished |
+| `cancel` | Cancelled | MO cancelled or operation not needed in a backorder |
+
+Work order actions (from [`button_start()`](../addons/mrp/models/mrp_workorder.py#L693) on):
+- **Start** (`button_start`) opens a time log, sets the work order and the MO in progress, and books a calendar slot if the work order was not planned. Without continuous production it sets the quantity producing to what remains.
+- **Pause** (`button_pending`) closes the user's open time log.
+- **Done** (`button_finish`) picks the operation's components at the quantity producing, closes all time logs, records the quantity done and freezes the work center's hourly cost on the work order.
+- Recording **Quantity Done** on a work order (without continuous production) becomes the MO's quantity producing ([`write()`](../addons/mrp/models/mrp_workorder.py#L490)).
+- Work orders carry **Properties** defined per manufacturing operation type ([`properties`](../addons/mrp/models/mrp_workorder.py#L153)) and have their own chatter.
+
+### Operations: duration and cost
+| Setting | Values | Effect |
+|---|---|---|
+| **Duration Computation** ([`time_mode`](../addons/mrp/models/mrp_routing.py#L27)) | **Fixed** (`manual`, default 60 min) / **Computed** (`auto`) | Computed averages the last N done work orders with a produced quantity: real duration ÷ cycles, where cycles = produced qty ÷ capacity rounded up; falls back to the fixed value without history ([`_compute_time_cycle()`](../addons/mrp/models/mrp_routing.py#L76)) |
+| **Cost based on** ([`cost_mode`](../addons/mrp/models/mrp_routing.py#L59)) | **Actual time** / **Theoretical time** | Actual uses tracked time; theoretical uses the expected duration |
+
+**Expected duration** of a work order ([`_get_duration_expected()`](../addons/mrp/models/mrp_workorder.py#L873)):
+
+```
+cycles   = ceil(quantity to produce / capacity)
+duration = setup + cleanup + cycles × cycle time × 100 / time efficiency
+```
+
+Capacity, setup and cleanup come from the work center's capacity lines ([`_get_capacity()`](../addons/mrp/models/mrp_workcenter.py#L437)): a line for the product wins, then a line for the MO's unit without product, then a line for the product's unit. **Without a capacity line the capacity is the BoM quantity**, so a BoM written for 10 units with a 60-minute operation needs 3 cycles (180 min) for 25 units.
+
+Example: 100 brackets, capacity line 4, setup 10, cleanup 5, cycle 15 min, efficiency 100%: `10 + 5 + 25 × 15 = 390` minutes.
+
+### Work centers
+| Field | Effect |
 |---|---|
-| `product_id` | The by-product item |
-| `product_qty` | Quantity produced per BOM unit |
-| `operation_id` | "Produced in Operation" -- ties by-product output to a specific work order step |
-| `cost_share` | Percentage of total manufacturing cost allocated to this by-product (0-100%) |
-
-### Cost Sharing
-
-The `cost_share` field determines how manufacturing costs are split between the main product and by-products.
-
-**Example:** A sawmill BOM produces planks (main product) and sawdust (by-product with `cost_share = 5%`).
-- Total manufacturing cost: $1000
-- Sawdust receives: $1000 x 5% = $50
-- Planks receive: $1000 x 95% = $950
-
-**Constraint:** Total `cost_share` across all by-products on a BOM cannot exceed 100%.
-
----
-
-## Manufacturing Steps (1, 2, 3-Step)
-
-The warehouse setting `manufacture_steps` ([`stock_warehouse.py:31`](../addons/mrp/models/stock_warehouse.py#L31)) controls how many stock operations are involved in manufacturing.
-
-**Configuration:** Inventory -> Configuration -> Warehouses -> select warehouse -> **Manufacture** field.
-
-### 1-Step Manufacturing (`mrp_one_step`)
-
-```
-Warehouse Stock  --->  Manufacturing  --->  Warehouse Stock
-```
-
-- Components are consumed directly from the warehouse stock location
-- Finished products land in stock immediately
-- Simplest setup. No extra transfers.
-
-**When to use:** Small operations. Components are stored near the production area. No staging or post-production inspection needed.
-
-### 2-Step Manufacturing (`pbm`)
-
-```
-Warehouse Stock  --->  Pre-Production Location  --->  Manufacturing  --->  Warehouse Stock
-                 (Pick Components transfer)
-```
-
-- An internal transfer (pick list) moves components from warehouse to a pre-production staging area
-- The MO consumes from the pre-production location
-- Finished products go directly to stock
-
-**When to use:** Storage and production floor are in different areas. You want a picking step to stage components before workers start. Helps warehouse team prepare materials in advance.
-
-### 3-Step Manufacturing (`pbm_sam`)
-
-```
-Warehouse Stock  --->  Pre-Production  --->  Manufacturing  --->  Post-Production  --->  Warehouse Stock
-                 (Pick Components)                           (Store Finished Products)
-```
-
-- Pick components from stock to pre-production
-- Manufacture (consumes from pre-production, produces to post-production)
-- Store finished products from post-production to stock
-
-**When to use:** Full control environments. Post-production step allows quality inspection, packaging, or labeling before products enter sellable stock.
-
-### What Odoo Creates Per Step Configuration
-
-| Picking Type | 1-step | 2-step | 3-step | Purpose |
-|---|---|---|---|---|
-| Manufacturing (`manu_type_id`) | Yes | Yes | Yes | The actual production operation |
-| Pick Components (`pbm_type_id`) | No | Yes | Yes | Internal transfer: Stock -> Pre-Production location |
-| Store Finished Product (`sam_type_id`) | No | No | Yes | Internal transfer: Post-Production -> Stock |
-
-Source: [`stock_warehouse.py:221`](../addons/mrp/models/stock_warehouse.py#L221)
-
----
-
-## Work Centers
-
-A work center represents a physical location or machine where manufacturing operations happen -- an assembly line, a CNC machine, a paint booth. It defines capacity, availability (calendar), cost rate, and efficiency.
-
-**When to create one:** Create a work center for each distinct production resource you need to schedule, track time on, or cost separately. If two machines do the same job, create both and link them as alternatives.
-
-### Key Work Center Fields
-
-| Field | UI Label | What It Controls |
-|---|---|---|
-| `name` | "Work Center" | Display name |
-| `code` | "Code" | Short reference for reports |
-| `time_start` | "Setup Time" | Fixed minutes added before each work order (not scaled by quantity). Example: 15 min to warm up a paint booth. |
-| `time_stop` | "Cleanup Time" | Fixed minutes added after each work order. Example: 10 min to clean equipment. |
-| `costs_hour` | "Cost per Hour" | Hourly rate for product costing. Applied to actual or estimated time depending on operation's `cost_mode`. |
-| `time_efficiency` | "Time Efficiency" | Percentage (default 100%). Values below 100 increase scheduled duration. Example: 80% efficiency means a 15-min cycle is scheduled as 18.75 min (`15 x 100/80`). Use for slower machines or workers in training. |
-| `resource_calendar_id` | "Working Hours" | Calendar defining when this work center operates. Work orders are only scheduled during these hours. |
-| `alternative_workcenter_ids` | "Alternatives" | During planning, Odoo checks the primary work center and all alternatives, picks whichever has the earliest available slot. |
-| `capacity_ids` | "Capacity" | Product-specific capacity overrides (see below) |
-| `oee_target` | "OEE Target" | Target OEE percentage (default 90%), used for visual alerts |
-
-### Work Center Status
-
-Work centers have a real-time status computed from productivity logs:
-
-| Status | Meaning | How It Is Set |
-|---|---|---|
-| **Normal** (idle) | No active work | No open productivity records |
-| **In Production** | Actively producing | A worker has started a work order (productivity log with `loss_type` = productive) |
-| **Blocked** | Equipment down | Someone clicked "Block" or logged an issue (availability/quality loss). All running work orders are stopped. |
-
-To unblock: call [`unblock()`](../addons/mrp/models/mrp_workcenter.py#L285) -- closes the blocking log and returns to Normal.
-
-### Product-Specific Capacity
-
-Override default capacity and setup/cleanup times for specific products via `mrp.workcenter.capacity` lines.
-
-**Example:** A CNC machine processes metal brackets at 4 units/cycle but plastic housings at 2 units/cycle. Add two capacity lines. The bracket work order schedules fewer cycles (shorter duration) than the housing work order for the same quantity.
-
-**Duration formula** ([`mrp_routing.py:115`](../addons/mrp/models/mrp_routing.py#L115)):
-```
-cycle_number = ceil(quantity / capacity)
-total_time = setup + cleanup + cycle_number x cycle_time x 100 / time_efficiency
-```
-
-**Numeric example:** Produce 100 brackets, capacity=4, setup=10min, cleanup=5min, cycle_time=15min, efficiency=100%.
-`cycles = ceil(100/4) = 25`. `total = 10 + 5 + 25 x 15 = 390 minutes`.
-
-### Work Center Time Off and Maintenance
-
-Work centers respect their **Working Hours** calendar. To block a work center for maintenance:
-
-1. Add a **Time Off** entry on the work center's resource calendar (or on the work center directly)
-2. During planning, [`_get_first_available_slot()`](../addons/mrp/models/mrp_workcenter.py#L337) skips these blocked periods
-3. Work orders are scheduled only during available working hours
-
-The scheduling algorithm iterates 14-day windows (up to 700 days forward) to find an available slot large enough for the work order duration.
-
-**Alternative work centers:** If the primary work center has no available slots soon, Odoo automatically checks alternative work centers and picks whichever is available earliest.
-
-### OEE (Overall Equipment Effectiveness)
-
-OEE measures how productively a work center is used over the last 30 days:
-
-```
-OEE = productive_time / (productive_time + blocked_time) x 100
-```
-
-Computed at [`mrp_workcenter.py:242`](../addons/mrp/models/mrp_workcenter.py#L242). Compare against `oee_target` to spot underperforming equipment.
-
-**Performance** metric: `expected_duration / actual_duration x 100` -- shows whether work orders take longer than planned.
-
----
-
-## Operations
-
-An operation is a single manufacturing step on a BOM. Each operation runs on a specific work center and defines how long it takes and how cost is calculated. When an MO is confirmed, each operation becomes a work order.
-
-**When to add operations:** When you need to track individual manufacturing steps, schedule work on specific machines, log labor time, or calculate per-step costs. Without operations, the MO has no work orders and production is a single confirm-and-done step.
-
-### Duration Computation Modes
-
-| Mode | How Duration Is Calculated | When to Use |
-|---|---|---|
-| **Manual** (`manual`) | Uses the fixed `time_cycle_manual` value you enter | New operations with no history. Predictable processes. |
-| **Computed** (`auto`) | Averages the last N completed work orders (default N=10). Falls back to manual if no history. | Mature operations where real data improves accuracy. |
-
-For **auto** mode, [`_compute_time_cycle()`](../addons/mrp/models/mrp_routing.py#L72) calculates: for each past WO, `duration / cycles` where `cycles = ceil(qty_produced / capacity)`, then averages the results.
-
-### Cost Computation Modes
-
-| Mode | Formula | When to Use |
-|---|---|---|
-| **Actual time** (`actual`) | `actual_duration / 60 x costs_hour` | When accurate post-production costing matters. Requires workers to start/stop timers. |
-| **Estimated time** (`estimated`) | `duration_expected / 60 x costs_hour` | For quoting or planning when you don't track actual shop floor time. |
-
----
-
-## Business Flow
-
-### Manufacturing Order Lifecycle
-
-```
-Draft  -->  Confirmed  -->  In Progress  -->  To Close  -->  Done
-  |            |                |
-  v            v                v
-Cancel      Cancel           Cancel
-```
-
-### MO States Explained
-
-| State | What It Means | What You Can Do |
-|---|---|---|
-| **Draft** | MO exists but nothing has happened yet. Components are NOT reserved. You can freely edit product, BOM, quantity. | Confirm, Cancel, or Delete |
-| **Confirmed** | Stock moves created. Components reserved (if available). Work orders ready to start. | Start work orders, Check Availability, Plan, Cancel |
-| **In Progress** | At least one work order has been started, or a worker is actively producing. | Continue working, Mark as Done, Cancel |
-| **To Close** | All work orders are done or cancelled. The MO is ready to be finalized. | Mark as Done |
-| **Done** | Inventory posted. Components consumed, finished product received into stock. MO is locked. | Nothing -- this is final |
-| **Cancelled** | All moves cancelled. Nothing was produced. | Nothing -- this is final |
-
-### Work Order Lifecycle
-
-```
-Waiting (blocked)  -->  Ready  -->  In Progress  -->  Finished (done)
-                                        |
-                                        v
-                                     Cancel
-```
-
-| State | What It Means |
-|---|---|
-| **Waiting for another WO** (`blocked`) | Previous work orders must complete first, or materials are unavailable |
-| **Ready** (`ready`) | Can be started -- predecessors complete, materials available |
-| **In Progress** (`progress`) | Worker is actively producing, timer running |
-| **Finished** (`done`) | Quantities registered, time logged |
-| **Cancelled** (`cancel`) | Skipped or MO was cancelled |
-
-### What Happens When You Click Each Button
-
-| Button | Method Called | What It Does |
-|---|---|---|
-| **Confirm** | [`action_confirm()`](../addons/mrp/models/mrp_production.py#L1581) | Creates stock moves for components and finished product. Confirms work orders. Triggers procurement for missing components. Sets state to Confirmed. |
-| **Plan** | [`button_plan()`](../addons/mrp/models/mrp_production.py#L1663) | Auto-confirms if still draft. Schedules each work order on work center calendars. Finds available time slots. Creates calendar blocks. |
-| **Check Availability** | [`action_assign()`](../addons/mrp/models/mrp_production.py#L1658) | Tries to reserve components from current stock. Updates availability status. |
-| **Start** (on WO) | [`button_start()`](../addons/mrp/models/mrp_workorder.py#L645) | Starts the timer. Moves MO to In Progress state. |
-| **Done** (on WO) | [`button_finish()`](../addons/mrp/models/mrp_workorder.py#L694) | Records produced quantity. Stops timer. Auto-picks unpicked components. |
-| **Pause** (on WO) | [`button_pending()`](../addons/mrp/models/mrp_workorder.py#L742) | Pauses work -- closes current timer without finishing the work order. |
-| **Mark as Done** (on MO) | [`button_mark_done()`](../addons/mrp/models/mrp_production.py#L2170) | Posts all stock moves to inventory. Finishes remaining work orders. Creates backorder if partial production. Locks the MO. |
-| **Cancel** | [`action_cancel()`](../addons/mrp/models/mrp_production.py#L1797) | Cancels all stock moves and work orders. |
-
-### action_confirm() -- Step by Step
-
-1. Copies `consumption` setting from BOM
-2. Creates stock moves for components (`move_raw_ids`) and finished products (`move_finished_ids`)
-3. Confirms all moves via `_action_confirm()`
-4. Triggers procurement scheduler for components not in stock
-5. Confirms work orders and sets their cost mode
-6. Confirms any related picking (for 2/3-step manufacturing)
-7. Transitions state from `draft` to `confirmed`
-
-### button_mark_done() -- Step by Step
-
-1. Runs sanity checks (quantities, serial numbers)
-2. Prompts for serial numbers if product is serial-tracked
-3. Sets quantities on finished product moves
-4. Finishes all work orders
-5. Posts inventory via [`_post_inventory()`](../addons/mrp/models/mrp_production.py#L1862)
-6. Sets state to `done`, locks the MO
-7. If `qty_produced < product_qty`, calls [`_split_productions()`](../addons/mrp/models/mrp_production.py#L1932) to create a backorder for the remaining quantity
-
----
-
-## How Work Orders Are Generated
-
-When a BOM with operations is selected on an MO (or when product/qty changes in draft state), [`_compute_workorder_ids()`](../addons/mrp/models/mrp_production.py#L605) runs:
-
-1. Calls [`bom.explode()`](../addons/mrp/models/mrp_bom.py#L409) to recursively expand the BOM (handles phantom sub-BOMs)
-2. For each BOM that has operations, creates one `mrp.workorder` per operation
-3. Each work order inherits: operation name, work center, expected duration, sequence
-4. Component moves (`move_raw_ids`) are linked to specific work orders based on `bom_line.operation_id`
-5. If operation dependencies are enabled on the BOM, `blocked_by_workorder_ids` is set based on `blocked_by_operation_ids`
-
-Work orders are ordered by `sequence`. In the simplest case (no dependencies), they are all `ready` immediately. With dependencies enabled, only work orders whose predecessors are complete are `ready`; others are `blocked`.
+| **Working Hours** (`resource_calendar_id`) | Work orders are planned inside this calendar |
+| **Time Efficiency** ([`time_efficiency`](../addons/mrp/models/mrp_workcenter.py#L36)) | Below 100% stretches durations (80% turns 15 min into 18.75 min) |
+| **Setup / Cleanup Time** | Minutes added once per work order |
+| **Cost per hour** | Work-center cost; frozen on the work order when it finishes |
+| **Alternative Work Centers** ([`alternative_workcenter_ids`](../addons/mrp/models/mrp_workcenter.py#L74)) | Planning may move a work order to the alternative that finishes it earliest |
+| **Product Capacities** ([`capacity_ids`](../addons/mrp/models/mrp_workcenter.py#L84)) | Capacity and setup/cleanup per product or per unit |
+| **Barcode** ([`barcode`](../addons/mrp/models/mrp_workcenter.py#L35)) | Scanned on the Shop Floor to select the work center |
+| **OEE Target** | Reference value for the OEE figure |
+
+**Status** ([`working_state`](../addons/mrp/models/mrp_workcenter.py#L60), [`_compute_working_state()`](../addons/mrp/models/mrp_workcenter.py#L201)) comes from the open time log: none = **Normal**; productive or performance = **In Progress**; availability or quality loss = **Blocked**. **Block** records a blocking reason and ends every running timer on the work center ([`button_block()`](../addons/mrp/models/mrp_workcenter.py#L593)); **Unblock** closes the blocking log ([`unblock()`](../addons/mrp/models/mrp_workcenter.py#L293)).
+
+**Time logs** use productivity loss categories. A timer is *Productive* while within the expected duration; when it is closed after the expected duration, the excess is split into a separate *Performance* loss log ([`_close()`](../addons/mrp/models/mrp_workcenter.py#L607)).
+
+**OEE** over the last month = productive time × 100 / (productive time + all other logged time), so performance overruns lower OEE too ([`_compute_oee()`](../addons/mrp/models/mrp_workcenter.py#L251)). **Performance** = expected duration ÷ real duration × 100 over the month's done work orders ([`_compute_performance()`](../addons/mrp/models/mrp_workcenter.py#L275)).
 
 ---
 
 ## Scheduling (Planning)
 
-When the user clicks **Plan**, [`button_plan()`](../addons/mrp/models/mrp_production.py#L1663) calls [`_plan_workorders()`](../addons/mrp/models/mrp_production.py#L1672):
-
-1. For each work order (in dependency order):
-   - Calculates expected duration: `(qty / capacity) x cycle_time + setup_time + cleanup_time`, adjusted by `time_efficiency`
-   - Finds the next available slot on the work center's resource calendar
-   - Creates a calendar leave (resource.calendar.leaves) to block that time slot
-   - Sets `date_start` and `date_finished` on the work order
-2. Updates MO `date_start` (earliest WO start) and `date_finished` (latest WO finish)
-3. Sets `is_planned = True`
-
-Alternative work centers are considered if the primary work center has no available slots in the near future.
+- **Plan** plans from now; **Plan at Date** plans from the MO start date. Both skip MOs already planned or without work orders, and work for draft MOs.
+- [`_plan_workorders()`](../addons/mrp/models/mrp_production.py#L1851) plans the final work orders; [`_action_plan()`](../addons/mrp/models/mrp_workorder.py#L586) first plans each work order's blockers, then starts it after the last blocker ends.
+- For the work center and each alternative, the duration is recomputed for that work center and the first free slot is searched ([`_get_first_available_slot()`](../addons/mrp/models/mrp_workcenter.py#L348)); the work center that finishes earliest wins.
+- The slot search walks 14-day windows, 50 of them by default (700 days, system parameter `mrp.workcenter_max_planning_iterations`). Free time is the calendar's working time minus **absence** leaves (time off, maintenance blocks); other work orders' slots are conflicts. No slot raises "Impossible to plan the workorder".
+- The chosen slot is stored as a `resource.calendar.leaves` record with **Count as = Working Time** on the work center, and the work order's dates follow it. Moving a work order in the Gantt view reschedules it; resequencing replans the MO.
 
 ---
 
-## Component Consumption Flow
+## Procurement: MOs Created Automatically
 
-### How Components Are Tracked
+MOs come from sale orders (MTO), reordering rules, the replenishment report, MPS and parent MOs, all through [`_run_manufacture()`](../addons/mrp/models/stock_rule.py#L83):
 
-Each component BOM line creates a `stock.move` in `move_raw_ids`:
+1. **BoM:** the one passed by the procurement, else the reordering rule's BoM, else a normal BoM for the rule's operation type, else any normal BoM ([`_get_matching_bom()`](../addons/mrp/models/stock_rule.py#L145)). No BoM, no MO.
+2. **Merge into an existing MO** ([`_make_mo_get_domain()`](../addons/mrp/models/stock_rule.py#L155)): a draft or confirmed, **unplanned** MO with the same BoM, product, operation type, company and references and **no responsible** gets its quantity increased instead. For reordering rules its start or deadline must fall before the need date minus the lead time. MPS procurements and batch-size BoMs never merge; with enterprise quality, MOs with started checks do not merge ([`stock_rule.py:10`](../enterprise/mrp_workorder/models/stock_rule.py#L10), `_make_mo_get_domain`).
+3. **Create** ([`_prepare_mo_vals()`](../addons/mrp/models/stock_rule.py#L178)): start = need date minus **Manufacturing Lead Time** (minus one hour when it is 0), deadline = need date, no responsible, created as the current user for manual replenishment and as superuser otherwise.
+4. **Confirm** only if the operation type has **Auto Confirm Production** ([`_should_auto_confirm_procurement_mo()`](../addons/mrp/models/stock_rule.py#L35)). MOs for other demand are confirmed at once. MOs from reordering rules are created in draft and confirmed after all reordering rules of the run are processed ([`_post_process_scheduler()`](../addons/mrp/models/stock_orderpoint.py#L225)). An MO without components is confirmed at once only when it has no work orders and comes from a reordering rule or a make-to-stock demand.
 
-| Field | Purpose |
-|---|---|
-| `raw_material_production_id` | Links move to the parent MO |
-| `operation_id` | Which BOM operation consumes this component |
-| `workorder_id` | Specific work order (set during planning) |
-| `unit_factor` | Ratio: `component_qty / bom_qty`. Used to scale consumption with `qty_producing` |
-| `should_consume_qty` | Expected quantity based on BOM formula |
-| `picked` | Boolean: has the quantity been registered/confirmed |
-
-### What Happens During Work Orders
-
-1. When a work order starts, `qty_producing` is set to `qty_remaining` (or user-specified)
-2. Component moves linked to that work order get their `quantity` set to `qty_producing x unit_factor`
-3. When the work order finishes ([`button_finish()`](../addons/mrp/models/mrp_workorder.py#L694)), unpicked moves are auto-picked
-4. When the MO is marked done, all moves are posted to inventory
+**Lead days** for the forecast and reordering rules ([`_get_lead_days()`](../addons/mrp/models/stock_rule.py#L214)): Manufacturing Lead Time + pre-production picking delays (2/3 steps) + Days to prepare; 365 days when no BoM is found.
 
 ---
 
-## Scrap During Manufacturing
+## Manufacturing Steps (1, 2, 3)
 
-Workers can scrap defective components or finished products directly from an MO.
+Warehouse field **Manufacture** ([`manufacture_steps`](../addons/mrp/models/stock_warehouse.py#L31), Inventory → Configuration → Warehouses):
 
-### How to Scrap
-
-1. Open a confirmed/in-progress MO -> click **Scrap** button ([`button_scrap()`](../addons/mrp/models/mrp_production.py#L2359))
-2. Select the product to scrap (component or finished product), quantity, and optionally a lot/serial
-3. Confirm -> creates a `stock.scrap` record
-4. Scrap generates a stock move from the source location to the scrap location (virtual inventory loss location)
-5. The scrapped quantity is removed from available stock but remains traceable
-
-**When to use:** A component is damaged during production, or a finished product fails inspection. Scrap removes it from productive inventory without cancelling the MO.
-
-**Auto-replenishment:** If the scrap record has `should_replenish=True`, Odoo triggers a replenishment rule to reorder the scrapped product.
-
----
-
-## Unbuild Orders
-
-Unbuild orders reverse the manufacturing process -- disassemble a finished product back into its components.
-
-> **Model:** `mrp.unbuild` | [`mrp_unbuild.py:11`](../addons/mrp/models/mrp_unbuild.py#L11)
-
-### How to Unbuild
-
-1. **Manufacturing -> Operations -> Unbuild Orders -> New**
-2. Select the finished **Product**, **BOM**, and **Quantity**
-3. Optionally link to a specific done MO (`mo_id`) and lot/serial
-4. Click **Unbuild** -> [`action_unbuild()`](../addons/mrp/models/mrp_unbuild.py#L165):
-   - Creates **consume moves**: finished product moves from location to production area
-   - Creates **produce moves**: components move from production area back to destination location
-   - If linked to an MO, uses the original MO's lot/serial tracking for accuracy
-   - Posts activity note on the linked MO
-
-**When to use:**
-- Product recalled or returned -- break it down for component recovery
-- Wrong product manufactured -- unbuild and reuse materials
-- Quality failure on finished goods -- recover usable components
-
-**Key constraint:** If linked to an MO, the MO must be in `done` state.
-
----
-
-## Split and Merge Manufacturing Orders
-
-### Splitting an MO
-
-Divide one MO into multiple smaller MOs. Useful for batch sizing, parallel production on different lines, or scheduling flexibility.
-
-1. Open an MO in draft/confirmed state -> **Split** button ([`action_split()`](../addons/mrp/models/mrp_production.py#L2468))
-2. The split wizard shows: number of splits, quantity per split, optional responsible user and schedule date per split
-3. Confirm -> creates backorder MOs with distributed quantities and stock moves
-
-**Bulk split:** Select multiple MOs in list view -> Split opens a batch splitting wizard.
-
-### Merging MOs
-
-Combine multiple MOs into one. Useful when several small orders for the same product can be produced together.
-
-1. Select multiple MOs in list view -> **Merge** ([`action_merge()`](../addons/mrp/models/mrp_production.py#L2484))
-2. Requirements:
-   - All MOs must be in **draft or confirmed** state
-   - Same **product**, same **BOM**, same **picking type**
-   - No manually added components or by-products (only BOM-defined lines)
-3. Creates one merged MO with combined quantity
-
----
-
-## Auto-Creation of Manufacturing Orders
-
-MOs do not always need to be created manually. Odoo can automatically create them from:
-
-### 1. Sale Orders (Make-to-Order)
-- Requires `sale_mrp` module
-- Set the product's route to include "Manufacture"
-- When a sale order is confirmed, the procurement engine calls [`_run_manufacture()`](../addons/mrp/models/stock_rule.py#L81)
-- An MO is automatically created and confirmed for the ordered quantity
-
-### 2. Reorder Rules (Make-to-Stock)
-- Set a reorder rule on the product with the "Manufacture" route
-- When stock drops below the minimum, the scheduler creates an MO to replenish up to the maximum
-- The MO is linked to the reorder rule (`orderpoint_id`)
-
-### 3. Other Manufacturing Orders (Multi-Level BOM)
-- When an MO needs a component that has its own BOM
-- Odoo creates a child MO for the sub-assembly via procurement rules
-- The child MO must complete before the parent MO can consume the component
-
-### How _run_manufacture() Works
-
-1. Finds the matching BOM (checks `values['bom_id']`, then `orderpoint.bom_id`, then `_bom_find`)
-2. Checks if an existing draft/confirmed MO already exists for the same product+BOM -- if yes, increases its quantity instead of creating a duplicate
-3. Otherwise creates a new MO via `_prepare_mo_vals` (sets dates, origin, picking type)
-4. Auto-confirms if the procurement rule says so
-5. Logs chatter links back to the triggering sale order or reorder rule
-
----
-
-## Subcontracting Overview
-
-> Requires `mrp_subcontracting` module ([`addons/mrp_subcontracting/`](../addons/mrp_subcontracting/))
-
-Subcontracting lets you outsource manufacturing to external vendors while tracking production in Odoo.
-
-### How It Works
-
-1. **Create a Subcontracting BOM:** Set BOM type to "Subcontracting" and add the vendor(s) in `subcontractor_ids`
-2. **Create a Purchase Order / Receipt:** When you receive goods from the subcontractor, Odoo detects the subcontracting BOM
-3. **Automatic MO Creation:** On receipt confirmation, [`stock.move._action_confirm`](../addons/mrp_subcontracting/models/stock_move.py#L143) creates a linked MO at the subcontractor's virtual location
-4. **Component Consumption:** Components are consumed from the subcontractor's location (reservation is bypassed -- components are assumed to be at the vendor)
-5. **Finished Goods Receipt:** The finished product appears in your warehouse
-
-### Key Constraints
-- Subcontracting BOMs **cannot** have operations (no work orders -- the vendor handles production)
-- Subcontracting BOMs **cannot** have by-products
-- Components can be sent to the subcontractor via a resupply route
-
----
-
-## Master Production Schedule (MPS)
-
-> Requires `mrp_mps` module (install via Settings -> Manufacturing -> Master Production Schedule)
-
-MPS is a demand planning tool that helps you forecast production needs across time periods.
-
-### What It Does
-- Shows a grid of products x time periods (weeks/months)
-- For each cell: forecasted demand, existing supply, planned production, projected stock
-- Lets you set safety stock targets
-- One-click replenishment: creates MOs or purchase orders to meet the schedule
-
-### How to Use
-1. Enable MPS in Settings -> Manufacturing
-2. Go to **Manufacturing -> Planning -> Master Production Schedule**
-3. Add products to the schedule
-4. Enter demand forecasts per period
-5. Odoo calculates how much to produce to meet demand while maintaining safety stock
-6. Click **Replenish** to create the MOs
-
----
-
-## Manufacturing Costs
-
-> Requires `mrp_account` module ([`addons/mrp_account/`](../addons/mrp_account/))
-
-Manufacturing cost is calculated when an MO is marked done via [`_cal_price()`](../addons/mrp_account/models/mrp_production.py#L57):
-
-```
-Total Cost = Raw Material Cost + Work Center Cost + Extra Cost
-```
-
-| Cost Component | How It Is Calculated |
-|---|---|
-| **Raw Material Cost** | Sum of consumed stock move values (component cost x consumed qty, using product costing method) |
-| **Work Center Cost** | Sum of each work order's cost: `(duration / 60) x workcenter.costs_hour`. Uses actual or estimated time depending on operation's `cost_mode` |
-| **Employee Cost** (enterprise) | `(duration / 60) x workcenter.employee_costs_hour x employee_ratio` per operation |
-| **Extra Cost** | Manual per-unit adjustment field `extra_cost` on the MO x finished qty |
-
-### By-Product Cost Allocation
-
-Each by-product can have a `cost_share` percentage. The finished product receives the remaining share.
-
-**Example:** Total cost = $1000, by-product sawdust has cost_share = 5%
-- Sawdust cost: $1000 x 5% = $50
-- Main product cost: $1000 x 95% = $950
-
-**Final `price_unit`** on the finished product move = `total_cost x (1 - byproduct_share/100) / finished_qty`
-
-### WIP Journal Entries
-When work orders complete, [`_post_labour()`](../addons/mrp_account/models/mrp_production.py#L93) posts a journal entry debiting the production location's valuation account and crediting the expense account (work center or product expense).
-
----
-
-## Manufacturing Lead Time
-
-Two BOM fields control scheduling lead times ([`mrp_bom.py:86`](../addons/mrp/models/mrp_bom.py#L86)):
-
-| Field | UI Label | Purpose |
+| Value | Flow | Extra operation types |
 |---|---|---|
-| `produce_delay` | "Manufacturing Lead Time" | Average days to manufacture. Used by the scheduler to calculate when to start production. |
-| `days_to_prepare_mo` | "Days to prepare Manufacturing Order" | Days in advance to create and confirm MOs, giving time to replenish components. |
+| `mrp_one_step` — Manufacture (1 step) | Stock → production → Stock | none |
+| `pbm` — Pick components then manufacture (2 steps) | Stock → Pre-Production (**Pick Components**) → production → Stock | `pbm_type_id` |
+| `pbm_sam` — Pick components, manufacture, then store products (3 steps) | Stock → Pre-Production → production → Post-Production → Stock (**Store Finished Product**) | `pbm_type_id`, `sam_type_id` |
 
-**How they affect scheduling:** When a demand (sale order, reorder rule) triggers production, the scheduler subtracts `produce_delay + days_to_prepare_mo` from the demand date to determine when the MO should be created and started.
-
-**Example:** Customer needs 50 chairs by March 20. Lead time = 5 days, prep time = 2 days. Odoo schedules the MO to start by March 13 (20 - 5 - 2).
+Rules per step: [`get_rules_dict()`](../addons/mrp/models/stock_warehouse.py#L72). **Manufacture to Resupply** ([`manufacture_to_resupply`](../addons/mrp/models/stock_warehouse.py#L12)) adds or removes the warehouse from the Manufacture route.
 
 ---
 
-## Reports
+## Scrap and Unbuild
 
-### Available Reports
+**Scrap.** `stock.scrap` does not exist in 20.0; a scrap is a `stock.move` with `is_scrap` ([`stock_move.py:139`](../addons/stock/models/stock_move.py#L139), `is_scrap`). **Scrap** from the MO action menu ([`action_scrap()`](../addons/mrp/models/mrp_production.py#L2572)) proposes the MO's open components or, on a done MO, its finished products; the source is the components location (or finished location when done) and the destination the company scrap location. Validation marks the move picked, numbers it with the scrap sequence and posts it; **Should Replenish** triggers a procurement for the scrapped quantity ([`_action_scrap()`](../addons/stock/models/stock_move.py#L2961)). Scraps are listed under Manufacturing → Operations → Scrap and on the MO's **Scraps** button. Kits cannot be scrapped: the scrap form's product domain excludes them ([`stock_move_views.xml:81`](../addons/mrp/views/stock_move_views.xml#L81), `is_kits`).
 
-| Report | What It Shows | Where to Find |
-|---|---|---|
-| **BOM Structure & Cost** | Explodes a BOM tree showing all components, costs per level, routes, and lead times | BOM form -> "Structure & Cost" button |
-| **MO Overview** | Components, replenishments, and supply chain state for a specific MO | MO form -> "Overview" button |
-| **Production Analysis** | Pivot/graph analysis of production data across MOs | Manufacturing -> Reporting -> Production Analysis |
-| **OEE Report** | Equipment effectiveness per work center | Manufacturing -> Reporting -> OEE |
-| **Delays Report** | Manufacturing orders that are late vs. scheduled | Manufacturing -> Reporting -> Delays |
-| **Allocation Report** | Resource allocation across work centers and time periods | Manufacturing -> Reporting -> Allocation |
+**Unbuild** ([`mrp.unbuild`](../addons/mrp/models/mrp_unbuild.py#L11), Manufacturing → Operations → Unbuild Orders or **Unbuild** on a done MO): consumes the finished product and its by-products and returns the components to the destination location.
+- Several serials can be unbuilt in one order; lot-tracked products take one lot per order ([`lot_ids`](../addons/mrp/models/mrp_unbuild.py#L57)).
+- When components or by-products are tracked, the order must point to the done MO, so the original lots come back ([`action_unbuild()`](../addons/mrp/models/mrp_unbuild.py#L173)).
+- Not enough stock at the source opens an "Insufficient Quantity To Unbuild" warning ([`action_validate()`](../addons/mrp/models/mrp_unbuild.py#L329)). A note is posted on the MO.
 
-Source files: [`addons/mrp/report/`](../addons/mrp/report/)
+---
 
-### MO Overview (Valuation & Overview) -- Deep Dive
+## Costing and the MO Overview
 
-The MO Overview is a detailed report accessible from the **"Overview" stat button** on any Manufacturing Order form ([mrp_production_views.xml:268](../addons/mrp/views/mrp_production_views.xml#L268)). It shows component availability, replenishment sources, and **three cost columns** that together form the "valuation" aspect.
-
-Backend model: [`report.mrp.report_mo_overview`](../addons/mrp/report/mrp_report_mo_overview.py) (AbstractModel).
-Frontend OWL component: [`MoOverview`](../addons/mrp/static/src/components/mo_overview/mrp_mo_overview.js).
-
-#### When It Appears
-
-The Overview button is **always visible** on the MO form -- no state/group condition. It works in all MO states: Draft, Confirmed, In Progress, Done. However, the **content changes depending on state**:
-
-| MO State | What's Shown | Cost Columns Visible |
-|---|---|---|
-| **Draft / Confirmed** | Components, availability (free qty, on-hand, reserved), replenishment sources (POs, child MOs, in-transit), receipt dates | BoM Cost, MO Cost |
-| **In Progress** | Same + real-time consumption data | MO Cost, Real Cost |
-| **Done** | Final consumed quantities, unit costs, cost breakdown per product (if byproducts exist) | MO Cost, Real Cost, Unit Costs |
-
-#### The Three Cost Columns
-
-These are the core of the "valuation" feature. Each line (component, operation, byproduct) has three cost values:
-
-| Column | Field | What It Means | How It's Calculated |
-|---|---|---|---|
-| **BoM Cost** | `bom_cost` | The theoretical cost based strictly on the BoM definition | `bom_line.product_qty * unit_price * (mo_qty / bom_qty)` -- scales from BoM ratio to MO quantity |
-| **MO Cost** | `mo_cost` | The expected cost for this specific MO, accounting for replenishment sources and actual planned quantities | For components: `unit_cost * expected_qty` + replenishment costs from child MOs/POs. For operations: `_compute_expected_operation_cost()` based on work center hourly rate * expected duration |
-| **Real Cost** | `real_cost` | The actual cost incurred after production starts/finishes | For components: `unit_cost * actually_consumed_qty`. For operations: `actual_duration * hourly_rate`. When `mrp_account` is installed, uses `move._get_price_unit()` (actual valuation price) instead of `standard_price` |
-
-Source: [_format_component_move()](../addons/mrp/report/mrp_report_mo_overview.py#L524), [_get_operations_data()](../addons/mrp/report/mrp_report_mo_overview.py#L285)
-
-#### Color Decorators (Cost Comparison)
-
-The report highlights cost variances with colors via [`_get_comparison_decorator()`](../addons/mrp/report/mrp_report_mo_overview.py#L270):
-
-| Color | Meaning |
-|---|---|
-| **Green** (`success`) | Actual/current cost is **lower** than the reference cost |
-| **Red** (`danger`) | Actual/current cost is **higher** than the reference cost |
-| No color | Costs match |
-
-What gets compared depends on MO state:
-- **Before production starts**: MO Cost vs BoM Cost (did MO quantities deviate from BoM?)
-- **After production starts**: Real Cost vs MO Cost (did actual consumption deviate from plan?)
-
-#### Component Cost Calculation Details
-
-For each component (`move_raw`):
-
-1. **Unit cost**: `product.standard_price` converted to the move's UoM. With `mrp_account` installed and move done: actual `move._get_price_unit()` ([mrp_account override](../addons/mrp_account/report/mrp_report_mo_overview.py#L10))
-2. **BoM cost**: `unit_cost * bom_line_qty * (mo_qty / bom_qty)` -- the BoM's theoretical amount scaled to MO quantity
-3. **MO cost**: Sums up costs from replenishment sources. If a component comes from a child MO, it recursively computes that child MO's costs. If from a PO, uses the PO price. Remaining (non-replenished) quantity uses `standard_price`
-4. **Real cost**: `unit_cost * quantity_actually_consumed` (only after picking/consumption)
-
-#### Operation Cost Calculation Details
-
-For each work order:
-
-| State | MO Cost | Real Cost |
-|---|---|---|
-| **Not started** | `_compute_expected_operation_cost()` = `(duration_expected / 60) * costs_hour` | Same as MO Cost (estimated) |
-| **In progress** | Same expected cost (or theorical if no expected duration) | `_compute_current_operation_cost()` = `(actual_duration / 60) * costs_hour` |
-| **Done** | Expected cost (without employee cost in mrp_workorder) | `(actual_hours) * costs_hour` per work center |
-
-With `mrp_workorder` (Enterprise), employee costs are added as separate lines per employee, using `employee_costs_hour` rate ([enterprise override](../enterprise/mrp_workorder/report/mrp_report_mo_overview.py#L10)).
-
-#### Byproduct Cost Allocation
-
-Each byproduct move has a `cost_share` field (percentage). The report:
-1. Computes total costs (components + operations)
-2. Multiplies by `cost_share / 100` for each byproduct
-3. The **remaining share** (`1 - sum_of_byproduct_shares`) goes to the finished product
-
-Source: [`_get_byproducts_data()`](../addons/mrp/report/mrp_report_mo_overview.py#L429)
-
-#### Cost Breakdown Table (Done MOs with Byproducts)
-
-When an MO is **done** and has **byproducts with cost_share > 0**, a cost breakdown table appears showing per-unit costs split between components and operations for each output product.
-
-Source: [`_get_cost_breakdown_data()`](../addons/mrp/report/mrp_report_mo_overview.py#L143)
-
-#### Summary Footer (Done MOs)
-
-When MO is done, the footer shows ([_get_report_extra_lines()](../addons/mrp/report/mrp_report_mo_overview.py#L114)):
-
-| Line | Formula |
-|---|---|
-| Unit MO Cost | `total_mo_cost / qty_produced` |
-| Unit BoM Cost | `total_bom_cost / qty_produced` |
-| Unit Real Cost | `total_real_cost / qty_produced` |
-| Component Costs (total + unit) | Sum of all component `mo_cost` / `bom_cost` / `real_cost` |
-| Operation Costs (total + unit) | Sum of all operation `mo_cost` / `bom_cost` / `real_cost` |
-
-#### Data Flow
+### Cost of the finished product (`mrp_account`)
+At posting, [`_cal_price()`](../addons/mrp_account/models/mrp_production.py#L71) computes:
 
 ```
-MO Form -> "Overview" stat button
-  -> action_report_mo_overview (ir.actions.report)
-    -> OWL component calls: report.mrp.report_mo_overview.get_report_values(production_id)
-      -> _get_report_data()
-        -> _get_components_data()     # components + replenishment lines
-        -> _get_operations_data()     # work orders + durations + costs
-        -> _compute_cost_sums()       # totals for components + operations
-        -> _get_byproducts_data()     # cost allocation to byproducts
-        -> _get_mo_summary()          # header row with final costs
-        -> _get_report_extra_lines()  # footer with unit costs (done MOs)
-        -> _get_cost_breakdown_data() # per-product breakdown (done + byproducts)
+total cost = value of consumed components + work-order cost + Extra Unit Cost × quantity
 ```
 
----
+- Work-order cost = duration × hourly cost ([`_cal_cost()`](../addons/mrp/models/mrp_workorder.py#L675)); with **Theoretical time** the expected duration is used. With enterprise `mrp_workorder`, employee time at the **Employee Hourly Cost** is added ([`_cal_cost()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L769)).
+- Only **FIFO and AVCO** products get this computed unit cost: `total × (1 − by-product share) / quantity`. **Standard-price** products keep their standard price; the difference is not written on the move.
+- A FIFO/AVCO by-product receives `total × cost share`; a standard-price by-product keeps its standard price.
+- **Labour entry** ([`_post_labour()`](../addons/mrp_account/models/mrp_production.py#L114)): when the MO is done, for a product with automated valuation and a production location that has a valuation account, one entry debits that account and credits each work center's **Expense Account** (or the product expense account).
 
-## Shop Floor (Enterprise)
+Valuation methods, accounts and closing are in [`stock_valuation.md`](stock_valuation.md).
 
-> Requires `mrp_workorder` module
-
-The Shop Floor is a tablet-optimized interface for production workers. Instead of navigating Odoo's back-office, workers see a simplified view focused on their work center.
-
-### What Workers See
-- List of work orders assigned to their work center
-- Current operation instructions
-- Quality check steps (if configured)
-- Timer controls (Start / Pause / Done)
-- Component scanning (barcode support)
-- Lot/serial number registration
-
-### How to Access
-- **Manufacturing -> Shop Floor** (dedicated menu)
-- Or navigate from a specific work order
-
-### Time Tracking
-The Shop Floor automatically tracks:
-- When each work order was started and finished
-- Pause durations
-- Which employee worked on which order
-- Productive vs. non-productive time (used for OEE calculation)
+### MO Overview report
+The **Overview** button on the MO ([`report.mrp.report_mo_overview`](../addons/mrp/report/mrp_report_mo_overview.py#L69), `_get_report_data`) shows components with availability, reservations, replenishment (child MOs, purchases, transit) and receipt dates, operations, by-products and one **MO Cost** column:
+- **Before Done:** planned cost. Components = cost of their replenishments plus standard price × the rest ([`_format_component_move()`](../addons/mrp/report/mrp_report_mo_overview.py#L409)); operations = expected cost, or actual cost for done work orders ([`_get_operations_data()`](../addons/mrp/report/mrp_report_mo_overview.py#L237)).
+- **Done:** actual cost. Components = unit cost × consumed quantity, where `mrp_account` uses the move's valuation price ([`_get_unit_cost()`](../addons/mrp_account/report/mrp_report_mo_overview.py#L34)); operations = real (or theoretical) hours × hourly cost ([`_get_finished_operation_data()`](../addons/mrp/report/mrp_report_mo_overview.py#L289)). Enterprise adds one line per employee, or an estimated employee-cost line ([`mrp_report_mo_overview.py:10`](../enterprise/mrp_workorder/report/mrp_report_mo_overview.py#L10), `_get_finished_operation_data`).
+- Quantities and durations above plan are shown in red ([`_get_comparison_decorator()`](../addons/mrp/report/mrp_report_mo_overview.py#L231)).
+- By-products take their cost share of the MO cost; the finished product keeps the rest ([`_get_byproducts_data()`](../addons/mrp/report/mrp_report_mo_overview.py#L329)). A done MO with cost-sharing by-products shows a cost breakdown per product ([`_get_cost_breakdown_data()`](../addons/mrp/report/mrp_report_mo_overview.py#L107)); the footer shows unit costs ([`_get_report_extra_lines()`](../addons/mrp/report/mrp_report_mo_overview.py#L92)).
 
 ---
 
-## Enterprise Extension: mrp_workorder
+## Shop Floor (Enterprise `mrp_workorder`)
 
-The enterprise `mrp_workorder` module adds:
+`mrp_workorder` installs automatically with `mrp` in enterprise databases.
 
-| Feature | Description |
+- **Shop Floor** setting (`group_mrp_wo_shop_floor`, [`res_config_settings.py`](../enterprise/mrp_workorder/models/res_config_settings.py#L11)) shows the **Shop Floor** app: a full-screen client action at `/odoo/shop-floor` ([`action_mrp_display`](../enterprise/mrp_workorder/views/mrp_production_views.xml#L14)) with one card per MO or work order, filtered by work center. **Maximum number of cards per page** defaults to 40. **Timer** (`group_mrp_wo_tablet_timer`) shows timers on the cards.
+- **Employees.** Starting a work order needs an employee: in the back office the user must be linked to an employee; on the Shop Floor an employee must be logged in (PIN) and act as session owner ([`button_start()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L218)). A work center can limit **allowed employees** ([`employee_ids`](../enterprise/mrp_workorder/models/mrp_workcenter.py#L14)). Time logs are per employee ([`start_employee()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L736)); an employee can correct their logged time in the log-time dialog ([`set_employee_duration()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L761)).
+- **Employee cost:** **Employee Hourly Cost** on the work center ([`employee_costs_hour`](../enterprise/mrp_workorder/models/mrp_workcenter.py#L19)) adds to the operation cost.
+- Operators register components, lots/serials and by-products, see worksheets and the MO's **Additional Notes**, scan work-center barcodes, run quality checks, log notes and propose changes to instructions.
+- Menus added: Manufacturing → **Overview** (work-center dashboard), Planning → **Work Orders** → Kanban / Planning, Planning → **Employees** → Planning (Gantt).
+
+---
+
+## Quality Checks in Manufacturing (Enterprise)
+
+| Module | Adds |
 |---|---|
-| Shop floor tablet interface | Touch-optimized UI for workers on the production floor |
-| Quality checks | Integration with `quality.check` and `quality.point` -- run inspections during work orders |
-| Employee tracking | Track which employees worked on each work order, login/logout per employee |
-| Barcode scanning | Scan serial numbers, components, and work orders |
-| Quality alerts | Create quality alerts directly from work order issues |
-| Worksheets | Attach instruction pages/worksheets to operations |
-| Production notes | Log notes per work order for future reference |
+| `quality` | Points, checks, alerts, teams |
+| `quality_control` | Pass-Fail, Measure, Spreadsheet checks; control frequency |
+| `quality_mrp` (auto-installed with `quality_control` + `mrp`) | Checks on MOs, alerts from MOs |
+| `quality_mrp_workorder` (auto-installed with `mrp_workorder`) | Checks as steps of work orders |
+| `quality_control_worksheet` | Worksheet checks |
 
----
+**Enable:** Settings → Manufacturing → **Quality** (`module_quality_control`) and optionally **Quality Worksheet**. Every point and check needs a quality team; a default team is created.
 
-## Quality Checks in Manufacturing
+**Flow:**
+1. A quality point is attached to an operation of the BoM.
+2. When the MO is confirmed, each work order creates its checks from its points ([`_create_checks()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L350), called from [`_action_confirm()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L534)). The checks form a chain (previous/next); *Register Consumed Materials* and *Register By-products* get one check per matching move.
+3. Operators complete the current check and move to the next ([`_next()`](../enterprise/mrp_workorder/models/quality.py#L379)). A failed check with a failure message opens the failure wizard.
+4. **Done** on the work order runs [`verify_quality_checks()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L272): *Instructions*, *Register Consumed Materials* and *Register By-products* pass automatically; any other open check blocks with "complete Quality Checks using the Shop Floor".
+5. MO-level checks (points without operation) block **Produce** until done, **except for Quality Managers**, who can close the MO with pending checks ([`pre_button_mark_done()`](../enterprise/quality_mrp/models/mrp_production.py#L53)). On-demand checks are started from the MO ([`action_open_on_demand_quality_check()`](../enterprise/quality_mrp/models/mrp_production.py#L107)).
 
-Quality checks let you define inspections that workers must complete during production. They are an **enterprise** feature spread across several modules:
+**Check types** (`quality.point.test_type` records):
 
-| Module | What It Adds |
-|---|---|
-| `quality` ([`enterprise/quality/`](../enterprise/quality/)) | Base framework: quality points, checks, alerts, teams |
-| `quality_control` ([`enterprise/quality_control/`](../enterprise/quality_control/)) | Pass/fail, measurement with tolerances, frequency control |
-| `quality_mrp` ([`enterprise/quality_mrp/`](../enterprise/quality_mrp/)) | Links checks to Manufacturing Orders |
-| `quality_mrp_workorder` ([`enterprise/quality_mrp_workorder/`](../enterprise/quality_mrp_workorder/)) | Embeds checks as work order steps on shop floor tablet |
-
-### Enabling Quality Checks
-
-1. **Settings -> Manufacturing -> Operations** -> enable **Quality** (installs `quality_control`)
-2. **Work Orders** must also be enabled (quality checks are steps inside work orders)
-3. Create at least one **Quality Team** (Quality -> Configuration -> Quality Control Teams)
-
-### How It Works: End-to-End
-
-```
-1. SETUP (one-time)
-   BOM -> Operation -> add Quality Points (steps)
-         e.g., "Measure thickness" (measure type, tolerance 4.8-5.2mm)
-         e.g., "Visual inspection" (pass/fail type)
-         e.g., "Register components" (register_consumed_materials type)
-
-2. PRODUCTION
-   MO confirmed -> Work Orders created from BOM operations
-
-3. WORK ORDER START
-   Worker clicks Start -> _create_checks() auto-generates quality.check
-   records from the operation's quality points
-   -> Checks form a doubly-linked chain (previous <-> next)
-   -> First check becomes current_quality_check_id
-
-4. CHECK EXECUTION (shop floor tablet)
-   Worker sees current check -> completes it (pass/fail/measure/scan)
-   -> _next() advances to next check in chain
-   -> Failed check? Worker can create a Quality Alert
-
-5. WORK ORDER FINISH
-   Worker clicks Done -> verify_quality_checks() runs:
-   - Auto-passes: register_consumed_materials, register_byproducts, instructions
-   - All other types MUST be explicitly passed/failed
-   - If any non-auto check is still 'none' -> UserError, cannot finish
-```
-
-### Check Types
-
-| Type | What the Worker Does | Auto-pass on WO Finish? |
+| Type | Module | Auto-pass at WO Done |
 |---|---|---|
-| **Pass - Fail** | Clicks Pass or Fail -- operator judgment | No |
-| **Measure** | Enters numeric value; auto-pass/fail by comparing to tolerance range | No |
-| **Instructions** | Reads on-screen instructions | Yes |
-| **Take a Picture** | Uploads or captures photo evidence | No |
-| **Register Consumed Materials** | Scans/selects component being consumed | Yes |
-| **Register Production** | Enters lot/serial for finished product | No |
-| **Register By-products** | Registers by-product output | Yes |
-| **Print Label** | Prints product/lot label (PDF or ZPL) | No |
+| Instructions, Take a Picture | `quality` | Instructions only |
+| Pass - Fail, Measure, Spreadsheet | `quality_control` | No |
+| Register Consumed Materials, Register Production, Register By-products, Print Product Label, Print Lot/SN Label | `mrp_workorder` | Consumed materials and by-products only |
+| Worksheet | `quality_control_worksheet` | No |
 
-### Control Frequency
+*Register By-products* is inactive until the By-Products setting is on.
 
-[`check_execute_now()`](../enterprise/quality_control/models/quality.py#L99) decides whether a check is created:
+**Control frequency** ([`measure_frequency_type`](../enterprise/quality_control/models/quality.py#L26), [`check_execute_now()`](../enterprise/quality_control/models/quality.py#L122)): **All**; **Randomly** (percentage chance per check); **Periodically** (only if no check of that point exists within the last N days/weeks/months); **On-demand** (created by hand), which is refused on work-order points ([`_check_measure_frequency_type()`](../enterprise/quality_mrp_workorder/models/quality.py#L18)).
 
-| Frequency | Behavior |
-|---|---|
-| **All** | Always creates the check (default) |
-| **Randomly** | Creates check N% of the time (e.g., 30% = roughly 3 out of 10 WOs) |
-| **Periodically** | Only if no check from this point exists within the last N days/weeks/months |
-| **On-demand** | Manual creation only. Cannot be used with work order quality points. |
-
-### Quality Alerts
-
-When a check fails, the worker can create a **quality alert** from the work order. The alert auto-fills workorder, production order, work center, and product.
-
-Alerts follow a kanban pipeline: **New -> Confirmed -> Action Proposed -> Solved**. Each alert tracks:
-- **Root cause**: Workcenter Failure, Parts Quality, Work Operation, Others
-- **Corrective action**: what was fixed
-- **Preventive action**: how to prevent recurrence
-- **Priority**: normal / low / high / very high
+**Quality alerts** are raised from a check or work order with the work order, work center and product filled in. Stages: New → Confirmed → Action Proposed → Solved ([`quality_data.xml`](../enterprise/quality/data/quality_data.xml#L13), `quality_alert_stage_0`). Root causes: Workcenter Failure, Parts Quality, Work Operation, Others ([`quality_data.xml`](../enterprise/quality/data/quality_data.xml#L57), `reason_workcenter`). Priority: Normal, Low, High, Very High ([`priority`](../enterprise/quality/models/quality.py#L371)).
 
 ---
 
-## Configuration Reference
+## Planning Tools, Subcontracting, PLM
 
-| Setting | Field | Location | What It Enables |
-|---|---|---|---|
-| Work Orders | `group_mrp_routings` | Settings -> Manufacturing -> Operations | Operations on BOMs, work orders on MOs |
-| By-Products | `group_mrp_byproducts` | Settings -> Manufacturing -> Operations | By-product lines on BOMs |
-| Work Order Dependencies | `group_mrp_workorder_dependencies` | Settings -> Manufacturing -> Operations | "Blocked By" field on operations |
-| Unlock Manufacturing Orders | `group_unlocked_by_default` | Settings -> Manufacturing -> Operations | MOs are unlocked by default (can edit after confirm) |
-| Allocation Report | `group_mrp_reception_report` | Settings -> Manufacturing -> Operations | Shows allocation report for MOs |
-| Subcontracting | `module_mrp_subcontracting` | Settings -> Manufacturing -> Operations | Installs `mrp_subcontracting` module |
-| Quality | `module_quality_control` | Settings -> Manufacturing -> Operations | Installs `quality_control` module |
-| PLM | `module_mrp_plm` | Settings -> Manufacturing -> Operations | Installs `mrp_plm` (Product Lifecycle Management) |
-| Master Production Schedule | `module_mrp_mps` | Settings -> Manufacturing -> Operations | Installs `mrp_mps` for demand-driven planning |
+### Master Production Schedule (enterprise `mrp_mps`)
+Manufacturing → Planning → MPS → **Master Production Schedule**, also under Inventory. A grid with one block per product and one column per period (**Manufacturing Period** on the company: yearly, monthly (default), weekly, daily, [`res_company.py:13`](../enterprise/mrp_mps/models/res_company.py#L13), `manufacturing_period`). Planners enter forecast demand; Odoo proposes quantities to replenish from the **Safety Stock Target** ([`forecast_target_qty`](../enterprise/mrp_mps/models/mrp_mps.py#L48)) and min/max replenish quantities. **Replenish** ([`action_replenish()`](../enterprise/mrp_mps/models/mrp_mps.py#L230)) runs procurements with origin `MPS`, which always create new MOs or purchase orders. Setting: Settings → Manufacturing → **Master Production Schedule**.
+
+### Subcontracting
+With `mrp_subcontracting`, a BoM of type **Subcontracting** lists its **Subcontractors**. It cannot have operations or by-products ([`_check_subcontracting_no_operation()`](../addons/mrp_subcontracting/models/mrp_bom.py#L25)). Confirming a receipt from the subcontractor creates the subcontracting MO at the subcontractor's location ([`_action_confirm()`](../addons/mrp_subcontracting/models/stock_move.py#L143)): one MO for an untracked product, one per lot/serial for a tracked one. **Register Components** on the receipt opens a simplified MO form to record consumed components; receipt move lines and MOs stay in sync through the MO split mechanism.
+
+### PLM
+Enterprise `mrp_plm` manages engineering change orders on BoMs (its own **PLM** app). The `module_mrp_plm` settings field exists but is not shown in the Manufacturing settings page.
+
+---
+
+## Configuration & Settings
+
+### Settings → Manufacturing ([`ResConfigSettings`](../addons/mrp/models/res_config_settings.py#L10))
+| Setting | Field | Effect |
+|---|---|---|
+| **Work Orders** | `group_mrp_routings` | Operations on BoMs, work orders on MOs, planning, work centers. Turning it off archives all operations; turning it back on restores the last archived batch |
+| **Subcontracting** | `module_mrp_subcontracting` | Installs `mrp_subcontracting` |
+| **Barcode** | `module_stock_barcode` | Process MOs from the Barcode app (enterprise) |
+| **Quality** / **Quality Worksheet** | `module_quality_control`, `module_quality_control_worksheet` | Quality checks on work orders; worksheet checks |
+| **Unlock Manufacturing Orders** | `group_unlocked_by_default` | MOs start unlocked so users can edit quantities to consume; toggling it updates the lock of all open MOs |
+| **By-Products** | `group_mrp_byproducts` | By-products tab on BoMs |
+| **Master Production Schedule** | `module_mrp_mps` | Installs `mrp_mps` |
+| **Shop Floor**, **Timer** (enterprise) | `group_mrp_wo_shop_floor`, `group_mrp_wo_tablet_timer` | See Shop Floor |
+
+There is no "Work Order Dependencies" setting (dependencies are the BoM option **Custom Operation Dependencies**) and no "Allocation Report" setting (it is **Show Allocation** on the operation type).
+
+### Manufacturing operation type (Inventory → Configuration → Operation Types)
+| Option | Field | Effect |
+|---|---|---|
+| Auto Confirm Production | [`auto_confirm_production`](../addons/mrp/models/stock_picking.py#L31) | Off: procurement MOs are created in draft |
+| Create Backorder | [`create_backorder`](../addons/stock/models/stock_picking_type.py#L193) | Ask / Always / Never at Produce |
+| Show Allocation | [`auto_show_allocation_report`](../addons/stock/models/stock_picking_type.py#L104) | Shows the **Allocation** button when finished products can serve waiting demand ([`_compute_show_allocation()`](../addons/mrp/models/mrp_production.py#L775)) |
+| Create New Lots/Serial Numbers for Components | [`use_create_components_lots`](../addons/mrp/models/stock_picking.py#L26) | Lets users create component lots on the MO |
+| Auto-print options | [`auto_print_done_production_order`](../addons/mrp/models/stock_picking.py#L35) and following | Print the MO, product labels, lot/SN labels, allocation report when done |
+| Workorder Properties | [`wo_properties_definition`](../addons/mrp/models/stock_picking.py#L64) | Custom fields on work orders of this type |
+| Reservation Method | `reservation_method` | At confirmation / manually / before scheduled date, for component moves |
+
+---
+
+## Access Rights
+
+- Groups: Manufacturing **User** (implies Inventory User) and **Administrator** ([`mrp_security.xml`](../addons/mrp/security/mrp_security.xml#L10), `group_mrp_user`). Reset to Draft / Set to In Progress are Administrator buttons.
+- Company restrictions in [`ir.access.csv`](../addons/mrp/security/ir.access.csv#L24) (`mrp_production_rule`): MOs, work orders, unbuilds and time logs belong to one company; BoMs, BoM lines, by-products, operations and work centers may be shared (no company).
+- The feature groups Work Orders, By-Products and Unlocked by default are also granted to light users ([`res_groups.py`](../addons/mrp/models/res_groups.py#L9), `_get_light_group_xmlids`).
 
 ---
 
 ## Dependencies
 
-### Requires (must be installed)
-
-| Module | Why |
+| Requires | Why |
 |---|---|
-| `product` | Product definitions (BOM references products) |
-| `stock` | Stock moves for component consumption and finished product receipt |
-| `resource` | Work center calendars, capacity planning, scheduling |
+| `product` | Products, variants, units |
+| `stock` | Moves, quants, routes, warehouses, operation types |
+| `resource` | Work-center calendars and leaves used for planning |
 
-### Optional Integrations
-
-| Module | What It Enables |
+| Works With (optional) | What It Adds |
 |---|---|
-| `mrp_workorder` (enterprise) | Shop floor tablet interface, quality checks, employee tracking on work orders |
-| `mrp_subcontracting` | Outsource manufacturing operations to vendors |
-| `mrp_plm` | Product Lifecycle Management -- engineering change orders on BOMs |
-| `mrp_mps` | Master Production Schedule -- demand-driven planning |
-| `quality_control` | Quality checks integrated into work order steps |
-| `stock_account` / `mrp_account` | Manufacturing cost computation and journal entries |
-| `sale_mrp` | Auto-creates MOs from confirmed sale orders |
-| `purchase_mrp` | Triggers purchase orders for missing components |
-
----
-
-## Key Models Reference
-
-### `mrp.production` -- Manufacturing Order
-> [`mrp_production.py`](../addons/mrp/models/mrp_production.py)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `name` | Char | "Reference" | Auto-generated sequence (e.g., WH/MO/00001) |
-| `product_id` | Many2one (product.product) | "Product" | Product being manufactured |
-| `product_qty` | Float | "Quantity" | Quantity to produce |
-| `bom_id` | Many2one (mrp.bom) | "Bill of Material" | BOM used for this production |
-| `state` | Selection | "State" | Lifecycle state (see States table) |
-| `reservation_state` | Selection | "Materials Availability" | `confirmed` (waiting), `assigned` (ready), `waiting` |
-| `date_start` | Datetime | "Start Date" | Planned or actual start |
-| `date_finished` | Datetime | "End Date" | Planned or actual end |
-| `move_raw_ids` | One2many (stock.move) | "Components" | Stock moves for raw materials to consume |
-| `move_finished_ids` | One2many (stock.move) | "Finished Products" | Stock moves for finished goods to receive |
-| `workorder_ids` | One2many (mrp.workorder) | "Work Orders" | Operations to perform |
-| `qty_producing` | Float | "Quantity Producing" | Current batch quantity being produced |
-| `lot_producing_ids` | Many2many (stock.lot) | "Lot/Serial Number" | Lot/serial for finished product |
-| `is_planned` | Boolean | "Is Planned" | True when work orders have scheduled dates |
-| `is_locked` | Boolean | "Is Locked" | Prevents changes after completion |
-| `location_src_id` | Many2one (stock.location) | "Components Location" | Where components are picked from |
-| `location_dest_id` | Many2one (stock.location) | "Finished Products Location" | Where finished goods are stored |
-| `consumption` | Selection | "Flexible Consumption" | `flexible`, `warning`, or `strict` -- copied from BOM on confirm |
-
-### `mrp.workorder` -- Work Order
-> [`mrp_workorder.py`](../addons/mrp/models/mrp_workorder.py)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `name` | Char | "Work Order" | Operation name |
-| `production_id` | Many2one (mrp.production) | "Manufacturing Order" | Parent MO |
-| `operation_id` | Many2one (mrp.routing.workcenter) | "Operation" | BOM operation this WO executes |
-| `workcenter_id` | Many2one (mrp.workcenter) | "Work Center" | Where this operation is performed |
-| `state` | Selection | "Status" | `blocked`, `ready`, `progress`, `done`, `cancel` |
-| `sequence` | Integer | "Sequence" | Execution order |
-| `qty_production` | Float | "Original Production Quantity" | Total qty from MO |
-| `qty_producing` | Float | "Currently Produced Quantity" | Batch being produced now |
-| `qty_produced` | Float | "Quantity Produced" | Already finished |
-| `qty_remaining` | Float | "Quantity Remaining" | Left to produce |
-| `duration_expected` | Float | "Expected Duration" | Planned minutes (from operation) |
-| `duration` | Float | "Real Duration" | Actual minutes (from time logs) |
-| `date_start` | Datetime | "Start Date" | Scheduled/actual start |
-| `date_finished` | Datetime | "End Date" | Scheduled/actual end |
-| `time_ids` | One2many (mrp.workcenter.productivity) | "Time Tracking" | Productivity time logs |
-| `blocked_by_workorder_ids` | Many2many (mrp.workorder) | "Blocked By" | WOs that must complete first |
-| `move_raw_ids` | Many2many (stock.move) | "Moves" | Component moves consumed in this WO |
-
-### `mrp.bom` -- Bill of Material
-> [`mrp_bom.py`](../addons/mrp/models/mrp_bom.py)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `product_tmpl_id` | Many2one (product.template) | "Product" | Product this BOM manufactures |
-| `product_id` | Many2one (product.product) | "Product Variant" | Specific variant (blank = all variants) |
-| `product_qty` | Float | "Quantity" | Base quantity this BOM produces |
-| `type` | Selection | "BOM Type" | `normal` (Manufacture), `phantom` (Kit), `subcontract` (Subcontracting) |
-| `bom_line_ids` | One2many (mrp.bom.line) | "Components" | List of component products and quantities |
-| `operation_ids` | One2many (mrp.routing.workcenter) | "Operations" | Manufacturing steps/operations |
-| `byproduct_ids` | One2many (mrp.bom.byproduct) | "By-Products" | Secondary outputs |
-| `consumption` | Selection | "Flexible Consumption" | `flexible`, `warning`, `strict` |
-| `ready_to_produce` | Selection | "Manufacturing Readiness" | `all_available` or `asap` |
-| `allow_operation_dependencies` | Boolean | "Operation Dependencies" | Enable per-operation sequencing |
-| `produce_delay` | Float | "Manufacturing Lead Time" | Lead time in days |
-
-### `mrp.bom.line` -- BOM Component Line
-> [`mrp_bom.py:656`](../addons/mrp/models/mrp_bom.py#L656)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `product_id` | Many2one (product.product) | "Component" | Component product |
-| `product_qty` | Float | "Quantity" | Quantity per BOM unit |
-| `operation_id` | Many2one (mrp.routing.workcenter) | "Consumed in Operation" | Which operation consumes this component |
-| `bom_product_template_attribute_value_ids` | Many2many | "Apply on Variants" | Restrict line to specific product variants |
-
-### `mrp.bom.byproduct` -- By-Product Line
-> [`mrp_bom.py:829`](../addons/mrp/models/mrp_bom.py#L829)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `product_id` | Many2one (product.product) | "By-product" | The secondary product |
-| `product_qty` | Float | "Quantity" | Quantity produced per BOM unit |
-| `operation_id` | Many2one (mrp.routing.workcenter) | "Produced in Operation" | Which operation creates this by-product |
-| `cost_share` | Float | "Cost Share (%)" | Percentage of manufacturing cost allocated to this by-product (0-100) |
-
-### `mrp.routing.workcenter` -- Operation
-> [`mrp_routing.py:9`](../addons/mrp/models/mrp_routing.py#L9)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `name` | Char | "Operation" | Operation name |
-| `bom_id` | Many2one (mrp.bom) | "Bill of Material" | Parent BOM |
-| `workcenter_id` | Many2one (mrp.workcenter) | "Work Center" | Where this operation runs |
-| `sequence` | Integer | "Sequence" | Execution order |
-| `time_mode` | Selection | "Duration Computation" | `manual` (fixed) or `auto` (computed from past WOs) |
-| `time_mode_batch` | Integer | "Based on last" | Number of past work orders to average (default 10) |
-| `time_cycle_manual` | Float | "Manual Duration" | Fixed cycle time in minutes |
-| `time_cycle` | Float (computed) | "Duration" | Effective cycle time |
-| `blocked_by_operation_ids` | Many2many | "Blocked By" | Operations that must complete first |
-| `cost_mode` | Selection | "Cost Mode" | `actual` or `estimated` cost calculation |
-
-### `mrp.workcenter` -- Work Center
-> [`mrp_workcenter.py:21`](../addons/mrp/models/mrp_workcenter.py#L21)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `name` | Char | "Work Center" | Name |
-| `code` | Char | "Code" | Short reference |
-| `time_start` | Float | "Setup Time" | Fixed minutes before each work order |
-| `time_stop` | Float | "Cleanup Time" | Fixed minutes after each work order |
-| `costs_hour` | Float | "Cost per Hour" | Hourly rate for costing |
-| `time_efficiency` | Float | "Time Efficiency" | Percentage (default 100) |
-| `resource_calendar_id` | Many2one | "Working Hours" | When this work center operates |
-| `alternative_workcenter_ids` | Many2many | "Alternatives" | Fallback work centers for scheduling |
-| `oee` | Float (computed) | "OEE" | Overall Equipment Effectiveness (last 30 days) |
-| `oee_target` | Float | "OEE Target" | Target percentage (default 90) |
-| `performance` | Float (computed) | "Performance" | `expected_duration / actual_duration x 100` |
-
----
-
-## Key Methods Reference
-
-### Manufacturing Order
-
-| Method | Location | Purpose |
-|---|---|---|
-| `action_confirm()` | [`mrp_production.py:1581`](../addons/mrp/models/mrp_production.py#L1581) | Confirm MO: create moves, confirm WOs, trigger procurement |
-| `action_assign()` | [`mrp_production.py:1658`](../addons/mrp/models/mrp_production.py#L1658) | Reserve components from stock |
-| `button_plan()` | [`mrp_production.py:1663`](../addons/mrp/models/mrp_production.py#L1663) | Schedule work orders on calendars |
-| `_plan_workorders()` | [`mrp_production.py:1672`](../addons/mrp/models/mrp_production.py#L1672) | Find calendar slots for each WO |
-| `button_mark_done()` | [`mrp_production.py:2170`](../addons/mrp/models/mrp_production.py#L2170) | Finalize: post inventory, handle backorders |
-| `_post_inventory()` | [`mrp_production.py:1862`](../addons/mrp/models/mrp_production.py#L1862) | Post all stock moves |
-| `action_cancel()` | [`mrp_production.py:1797`](../addons/mrp/models/mrp_production.py#L1797) | Cancel MO, all moves and work orders |
-| `_compute_workorder_ids()` | [`mrp_production.py:605`](../addons/mrp/models/mrp_production.py#L605) | Generate work orders from BOM operations |
-| `_split_productions()` | [`mrp_production.py:1932`](../addons/mrp/models/mrp_production.py#L1932) | Create backorder MO for partial production |
-
-### Work Order
-
-| Method | Location | Purpose |
-|---|---|---|
-| `button_start()` | [`mrp_workorder.py:645`](../addons/mrp/models/mrp_workorder.py#L645) | Start timer, set WO and MO to progress |
-| `button_finish()` | [`mrp_workorder.py:694`](../addons/mrp/models/mrp_workorder.py#L694) | Record produced qty, stop timer, pick components |
-| `button_pending()` | [`mrp_workorder.py:742`](../addons/mrp/models/mrp_workorder.py#L742) | Pause work order |
-| `action_cancel()` | [`mrp_workorder.py:750`](../addons/mrp/models/mrp_workorder.py#L750) | Cancel work order |
-
-### Bill of Material
-
-| Method | Location | Purpose |
-|---|---|---|
-| `explode()` | [`mrp_bom.py:409`](../addons/mrp/models/mrp_bom.py#L409) | Recursively expand BOM (handles phantom/kit sub-BOMs) |
-| `_bom_find()` | [`mrp_bom.py:378`](../addons/mrp/models/mrp_bom.py#L378) | Find the applicable BOM for a given product |
-
-### Procurement
-
-| Method | Location | Purpose |
-|---|---|---|
-| `_run_manufacture()` | [`stock_rule.py:81`](../addons/mrp/models/stock_rule.py#L81) | Auto-create MO from procurement (sale order, reorder rule) |
-
----
-
-## UI Entry Points
-
-| Entry Point | Path in UI | What It Does |
-|---|---|---|
-| Manufacturing Orders | Manufacturing -> Operations -> Manufacturing Orders | Create, view, and manage production orders |
-| Bills of Materials | Manufacturing -> Bills of Materials | Define product recipes (components + operations) |
-| Work Centers | Manufacturing -> Configuration -> Work Centers | Configure machines/stations with capacity and costs |
-| Work Orders | Manufacturing -> Operations -> Work Orders | View all work orders across MOs |
-| Unbuild Orders | Manufacturing -> Operations -> Unbuild Orders | Reverse a manufacturing order (disassemble) |
-| Shop Floor | Manufacturing -> Shop Floor | Tablet-optimized worker interface (enterprise) |
-| Production Analysis | Manufacturing -> Reporting -> Production Analysis | Pivot/graph analysis of MOs |
-| MPS | Manufacturing -> Planning -> Master Production Schedule | Demand-driven production planning |
-
----
-
-## Edge Cases and Gotchas
-
-| Gotcha | Explanation |
-|---|---|
-| **Phantom BOMs don't create MOs** | They are exploded into components. If you need production tracking, use `normal` type. |
-| **Changing BOM after confirm** | Stock moves are already created. Changing the BOM on a confirmed MO does NOT automatically update component moves. Use "Add a line" to manually adjust. |
-| **Strict consumption** | With `strict` consumption, only Manufacturing Managers can close the MO if consumed quantities differ from the BOM formula. |
-| **Backorders are automatic** | If you produce less than planned and click Mark as Done, Odoo offers to create a backorder. The remaining components stay reserved on the new MO. |
-| **Work center blocking** | If a work center's `working_state` is `blocked`, workers cannot start work orders on it. Used for maintenance or equipment failures. |
-| **Duration calculation** | Factors in setup time, cleanup time, cycle time, efficiency percentage, and work center capacity. Actual duration is tracked via productivity time logs. |
-| **Serial-tracked products** | If the finished product uses serial tracking, Odoo requires lot/serial assignment before marking done. Each unit gets its own serial. |
-| **MO locking** | After marking done, the MO is locked. To edit, enable "Unlock Manufacturing Orders" setting, or a Manufacturing Manager can unlock it. |
-| **Merging requires identical BOMs** | You can only merge MOs that have the same product, BOM, and picking type, with no manually added lines. |
-| **Subcontracting BOMs have no operations** | The vendor handles production steps. You cannot add work orders to a subcontracting BOM. |
-| **Auto-MO grouping** | When the procurement engine creates an MO, it first checks if a draft/confirmed MO already exists for the same product+BOM. If yes, it increases the quantity instead of creating a duplicate. |
-
----
-
-## Common Questions (FAQ)
-
-**Q: How do I know if my components are available?**
-A: Check the **Materials Availability** field on the MO. "Available" means all components are reserved. "Waiting" means some are missing. Click **Check Availability** to retry reservation.
-
-**Q: Can I produce more than the MO quantity?**
-A: Yes, if consumption is set to `flexible` or `warning`. Set `qty_producing` higher than `qty_remaining`. The extra quantity will be received into stock.
-
-**Q: What happens if I cancel an MO that has reserved components?**
-A: All reservations are released. The components go back to available stock. Nothing is consumed.
-
-**Q: Can I add components that are not on the BOM?**
-A: Yes, click "Add a line" on the Components tab. This only works if consumption is not `strict` (or you are a Manufacturing Manager).
-
-**Q: How do I see the cost breakdown of what I manufactured?**
-A: Open the done MO -> look for the **Unit Cost** field and the **Cost Analysis** smart button (requires `mrp_account`). The BOM also has a **Structure & Cost** report button.
-
-**Q: What is the difference between Plan and Confirm?**
-A: **Confirm** creates stock moves and reserves components. **Plan** goes further -- it schedules work orders on work center calendars with specific start/end dates. Plan auto-confirms if the MO is still in draft.
-
-**Q: Can I change the quantity after confirming?**
-A: Yes, if the MO is not locked. Odoo will adjust component quantities proportionally. For done MOs, you need the "Unlock Manufacturing Orders" setting.
-
-**Q: How do backorder names work?**
-A: The original MO gets renamed with a suffix (e.g., `WH/MO/00001-001`). The backorder gets the next number (`WH/MO/00001-002`). All share the same `production_group_id`.
-
----
-
-## Relationship Diagram
-
-```
-Manufacturing Order (mrp.production)
-    |
-    |-- BOM (mrp.bom)
-    |     |-- BOM Lines (mrp.bom.line) ............. [components]
-    |     |-- Operations (mrp.routing.workcenter) ... [manufacturing steps]
-    |     |-- By-Products (mrp.bom.byproduct) ....... [secondary outputs]
-    |     '-- Operation Dependencies ................ [if enabled]
-    |
-    |-- Work Orders (mrp.workorder) ................. [one per operation]
-    |     |-- Work Center (mrp.workcenter)
-    |     |-- Time Logs (mrp.workcenter.productivity)
-    |     |-- Quality Checks (quality.check) ........ [enterprise]
-    |     '-- Component Moves (stock.move subset)
-    |
-    |-- Stock Moves
-    |     |-- Raw Materials (move_raw_ids) .......... [components consumed]
-    |     '-- Finished Products (move_finished_ids) . [output received]
-    |
-    '-- Backorders (mrp.production) ................. [if partial production]
-```
+| `mrp_account` | Finished-product cost, labour entries, extra cost, analytic lines |
+| `sale_mrp` / `purchase_mrp` | Kits and MOs from sales; kit costs and purchases |
+| `mrp_subcontracting` | Subcontracting BoMs and receipts |
+| `mrp_product_expiry`, `mrp_landed_costs`, `mrp_repair`, `mrp_delivery` | Expiry dates in manufacturing, landed costs on MOs, repair integration, carrier handling of kits |
+| `mrp_workorder` (enterprise) | Shop Floor, employees, quality steps, Gantt planning |
+| `quality_mrp`, `quality_mrp_workorder` (enterprise) | Quality checks and alerts |
+| `mrp_mps`, `mrp_plm` (enterprise) | MPS, engineering change orders |
+| `mrp_maintenance` (enterprise) | Maintenance of work centers (below) |
 
 ---
 
 ## Equipment & Maintenance
 
-> **Module:** `maintenance` (community) + `mrp_maintenance` (enterprise) + `hr_maintenance` + `stock_maintenance`
-> **Path:** [`addons/maintenance/`](../addons/maintenance/) | [`enterprise/mrp_maintenance/`](../enterprise/mrp_maintenance/)
+> **Modules:** `maintenance` (community, [`addons/maintenance/`](../addons/maintenance/)), `hr_maintenance`, `stock_maintenance`; enterprise `maintenance_enterprise` (Gantt views), `maintenance_worksheet`, `mrp_maintenance` ([`enterprise/mrp_maintenance/`](../enterprise/mrp_maintenance/))
 
-### What It Does
+Maintenance tracks machines and tools, the repair and service work on them, and how reliable they are. With `mrp_maintenance`, a maintenance request can block a work center so that no work order is planned during the maintenance.
 
-Tracks physical equipment (machines, tools, vehicles), schedules corrective and preventive maintenance, measures reliability (MTBF/MTTR), and integrates with MRP work centers to block scheduling during maintenance windows.
+### Equipment and categories
+- **Categories** ([`maintenance.equipment.category`](../addons/maintenance/models/maintenance.py#L23)) group equipment, name a **Responsible** technician and define **Equipment Properties** (custom fields for all equipment of the category).
+- **Equipment** ([`maintenance.equipment`](../addons/maintenance/models/maintenance.py#L113)): name, category, vendor, model, serial number, cost, warranty, effective date (start of the MTBF count), scrap date, owner, technician, maintenance team, properties. **Used By** ([`equipment_assign_to`](../addons/maintenance/models/maintenance.py#L152)) is *Other* in `maintenance`; `hr_maintenance` adds *Department* and *Employee* ([`equipment.py:14`](../addons/hr_maintenance/models/equipment.py#L14), `equipment_assign_to`). `stock_maintenance` adds the storage **Location** ([`location_id`](../addons/stock_maintenance/models/maintenance.py#L9)); `mrp_maintenance` links equipment to a work center.
+- Each equipment can define **Maintenance Request Properties** ([`equipment_req_properties_definition`](../addons/maintenance/models/maintenance.py#L156)), filled on its requests.
 
-### Equipment Categories
+### Maintenance requests
+[`maintenance.request`](../addons/maintenance/models/maintenance.py#L240):
 
-**Model:** `maintenance.equipment.category` | [maintenance.py:23](../addons/maintenance/models/maintenance.py#L23)
-
-Categories group equipment by type and assign a default technician. Each category can define **custom properties** (extra fields) that apply to all equipment in that category.
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `name` | Char | Category Name | e.g. "CNC Machines", "Forklifts", "Conveyor Belts" |
-| `technician_user_id` | Many2one | Responsible | Default technician -- auto-fills on equipment and requests |
-| `equipment_ids` | One2many | Equipment | All equipment in this category |
-| `equipment_count` | Integer | Equipment Count | Computed |
-| `maintenance_open_count` | Integer | Current Maintenance | Non-done, non-archived requests across all equipment |
-| `equipment_properties_definition` | PropertiesDefinition | Equipment Properties | Custom fields for equipment (e.g. "Max RPM", "Voltage") |
-| `fold` | Boolean | Folded in Pipe | Auto-folds if category has no equipment |
-
-**Where:** Maintenance > Configuration > Equipment Categories
-
-**Practical use:** Set up categories like "3D Printers", "Lathes", "Assembly Robots". Assign a technician per category. When any equipment in that category needs repair, the technician auto-assigns.
-
-### Equipment
-
-**Model:** `maintenance.equipment` | [maintenance.py:110](../addons/maintenance/models/maintenance.py#L110)
-
-Inherits: `mail.thread`, `mail.activity.mixin`, `maintenance.mixin`
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `name` | Char | Equipment Name | e.g. "CNC Mill #3" |
-| `category_id` | Many2one | Equipment Category | Groups equipment; brings default technician |
-| `serial_no` | Char | Serial Number | Unique constraint; copy=False |
-| `model` | Char | Model | Hardware model name |
-| `owner_user_id` | Many2one | Owner | Person responsible for the equipment |
-| `partner_id` | Many2one | Vendor | Supplier / service provider |
-| `partner_ref` | Char | Vendor Reference | |
-| `cost` | Float | Cost | Purchase cost |
-| `warranty_date` | Date | Warranty Expiration | |
-| `effective_date` | Date | Effective Date | When equipment became operational (MTBF baseline) |
-| `scrap_date` | Date | Scrap Date | Retirement date |
-| `equipment_properties` | Properties | Properties | Custom fields defined by category |
-
-**Extensions by module:**
-
-| Module | Field | Purpose |
-|---|---|---|
-| `hr_maintenance` | `employee_id` | Assigned employee |
-| `hr_maintenance` | `department_id` | Assigned department |
-| `hr_maintenance` | `equipment_assign_to` | Selection: employee / department / other |
-| `mrp_maintenance` | `workcenter_id` | Links equipment to MRP work center |
-| `stock_maintenance` | `location_id` | Internal stock location where equipment is stored |
-
-**Where:** Maintenance > Equipment > Machines & Tools
-
-### Maintenance Mixin (MTBF/MTTR)
-
-**Model:** `maintenance.mixin` (abstract) | [maintenance.py:69](../addons/maintenance/models/maintenance.py#L69)
-
-Mixed into both `maintenance.equipment` AND `mrp.workcenter`. Provides reliability metrics:
-
-| Field | Type | UI Label | How Computed |
-|---|---|---|---|
-| `expected_mtbf` | Integer | Expected MTBF (days) | Manual input -- expected days between failures |
-| `mtbf` | Integer | MTBF (days) | `(latest_failure - effective_date) / count_of_done_corrective_requests` |
-| `mttr` | Integer | MTTR (days) | Average `(close_date - request_date)` across done corrective requests |
-| `estimated_next_failure` | Date | Estimated Next Failure | `latest_failure_date + mtbf days` |
-| `latest_failure_date` | Date | Latest Failure | Most recent corrective request's `request_date` |
-
-**MTBF** = Mean Time Between Failure -- რამდენ ხანში ფუჭდება საშუალოდ
-**MTTR** = Mean Time To Repair -- რამდენი ხანი სჭირდება შეკეთებას საშუალოდ
-
-### Maintenance Request
-
-**Model:** `maintenance.request` | [maintenance.py:181](../addons/maintenance/models/maintenance.py#L181)
-
-Inherits: `mail.thread.cc`, `mail.activity.mixin`
-
-#### Core Fields
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `name` | Char | Subjects | Request title |
-| `equipment_id` | Many2one | Equipment | Which equipment needs maintenance |
-| `category_id` | Many2one | Category | Auto-filled from equipment |
-| `maintenance_type` | Selection | Maintenance Type | **corrective** (something broke) or **preventive** (scheduled) |
-| `user_id` | Many2one | Technician | Auto-computed from equipment/category technician |
-| `maintenance_team_id` | Many2one | Team | Required; defaults from equipment |
-| `stage_id` | Many2one | Stage | Kanban stage |
-| `priority` | Selection | Priority | 0=Very Low, 1=Low, 2=Normal, 3=High |
-| `schedule_date` | Datetime | Scheduled Date | When maintenance is planned |
-| `schedule_end` | Datetime | End Date | Computed: schedule_date + 1 hour (editable) |
-| `close_date` | Date | Close Date | Auto-set when stage.done=True |
-| `kanban_state` | Selection | Kanban State | normal / blocked / done |
-
-#### Recurring (Preventive Only)
-
-| Field | Type | UI Label | Purpose |
-|---|---|---|---|
-| `recurring_maintenance` | Boolean | Recurring | Only True when maintenance_type='preventive' |
-| `repeat_interval` | Integer | Repeat Every | Default 1 |
-| `repeat_unit` | Selection | Unit | day / week / month / year |
-| `repeat_type` | Selection | Until | forever / until specific date |
-| `repeat_until` | Date | End Date | Stop recurring after this date |
-
-#### Instructions
-
-| Field | Type | Purpose |
-|---|---|---|
-| `instruction_type` | Selection | pdf / google_slide / text |
-| `instruction_pdf` | Binary | Attach PDF instructions |
-| `instruction_google_slide` | Char | Google Slides URL |
-| `instruction_text` | Html | Rich text instructions |
-
-#### MRP Extension (`mrp_maintenance`)
-
-| Field | Type | Purpose |
-|---|---|---|
-| `maintenance_for` | Selection | **equipment** or **workcenter** |
-| `production_id` | Many2one | Link to mrp.production |
-| `workorder_id` | Many2one | Link to mrp.workorder |
-| `workcenter_id` | Many2one | Computed from equipment_id when maintenance_for='equipment' |
-| `block_workcenter` | Boolean | Creates resource.calendar.leaves to block WC scheduling |
-| `recurring_leaves_count` | Integer | Number of future slots to pre-block (preventive) |
-
-### Maintenance Stages
-
-Default stages (from [maintenance_data.xml](../addons/maintenance/data/maintenance_data.xml)):
-
-| Stage | Sequence | Done? | Fold? | Behavior |
-|---|---|---|---|---|
-| New Request | 1 | No | No | Initial state |
-| In Progress | 2 | No | No | Work started |
-| Repaired | 3 | Yes | Yes | Triggers close_date + recurring copy |
-| Scrap | 4 | Yes | Yes | Equipment retired |
-
-### Maintenance Teams
-
-**Model:** `maintenance.team` | [maintenance.py:406](../addons/maintenance/models/maintenance.py#L406)
-
-Teams group technicians and can receive requests via **email alias**. Dashboard shows:
-
-| Counter | What it counts |
+| Field | Behavior |
 |---|---|
-| `todo_request_count` | Non-done, non-archived requests |
-| `todo_request_count_date` | Requests with schedule_date set |
-| `todo_request_count_high_priority` | Priority = 3 (High) |
-| `todo_request_count_block` | Kanban state = blocked |
-| `todo_request_count_unscheduled` | No schedule_date + not done |
+| **Maintenance Type** | *Corrective* (something broke, გაფუჭდა) or *Preventive* (planned, დაგეგმილი) |
+| **Technicians** ([`user_ids`](../addons/maintenance/models/maintenance.py#L287)) | Several users; the equipment's (or category's) technician is added automatically ([`_compute_user_ids()`](../addons/maintenance/models/maintenance.py#L378)) |
+| **Team** | Required; taken from the equipment when set |
+| **Status** ([`state`](../addons/maintenance/models/maintenance.py#L294)) | In Progress, Changes Requested, Approved, Done, Cancelled. Moving the card to another stage resets Changes Requested / Approved to In Progress |
+| **Stage** | Kanban column only; stages can be limited to teams ([`maintenance_team_ids`](../addons/maintenance/models/maintenance.py#L20)); a new request takes the team's first stage ([`_compute_stage_id()`](../addons/maintenance/models/maintenance.py#L390)) |
+| **Planned Date** / **Scheduled End** | End defaults to start + 1 hour; duration in hours |
+| **Recurrent** | Preventive only: repeat every N days/weeks/months/years, forever or until a date |
+| Instructions, Properties | Rich-text instructions and the equipment's request properties |
 
-### Business Flows
+**Done and recurrence** ([`write()`](../addons/maintenance/models/maintenance.py#L450)): setting the status to *Done* fills **Close Date**. For a recurrent preventive request, it also copies the request to planned date + interval (same duration, first stage), unless the new date is past the end date. Leaving *Done* clears the close date. **Cancel** stops the recurrence; **Reopen Request** puts it back in the first stage ([`reset_equipment_request()`](../addons/maintenance/models/maintenance.py#L334)).
 
-#### Corrective Maintenance (რაღაც გაფუჭდა)
+Default stages: New Request, In Progress, Repaired (folded), Scrap (folded) ([`maintenance_data.xml`](../addons/maintenance/data/maintenance_data.xml#L6), `stage_0`). Stages carry no "done" flag; *Done* is the status.
 
-```
-Equipment breaks
-    -> Create request (maintenance_type='corrective')
-    -> Technician auto-assigned from equipment/category
-    -> Stage: New Request -> In Progress -> Repaired
-    -> close_date auto-set when stage.done=True
-    -> MTBF/MTTR metrics updated on equipment
-```
+### Reliability: MTBF and MTTR
+`maintenance.mixin` ([`maintenance.py:69`](../addons/maintenance/models/maintenance.py#L69), `maintenance.mixin`) is used by equipment and, with `mrp_maintenance`, by work centers. It counts **done corrective** requests; a failure date is the request's planned date, else its creation date ([`_compute_maintenance_request()`](../addons/maintenance/models/maintenance.py#L95)).
 
-#### Preventive Maintenance (დაგეგმილი)
-
-```
-Create request (maintenance_type='preventive', recurring=True)
-    -> Set repeat: every 2 weeks
-    -> Schedule first date
-    -> Complete (move to Repaired stage)
-    -> System AUTO-CREATES next request:
-         schedule_date = previous + 2 weeks
-         stage = New Request
-    -> Chain continues forever (or until repeat_until date)
-```
-
-#### Work Center Maintenance (MRP integration)
-
-```
-Create request for work center (maintenance_for='workcenter')
-    -> block_workcenter=True
-    -> System creates resource.calendar.leaves on workcenter
-    -> MRP scheduling avoids this workcenter during maintenance window
-    -> If preventive + recurring_leaves_count=3:
-         Pre-blocks next 3 future maintenance windows
-    -> Manufacturing orders cannot be scheduled during blocked periods
-```
-
-### Security
-
-| Model | Regular User (`base.group_user`) | Manager (`group_equipment_manager`) |
-|---|---|---|
-| Equipment | Read only | CRUD |
-| Equipment Category | Read only | CRUD |
-| Maintenance Request | CRUD | CRUD |
-| Stage | Read only | CRUD |
-| Team | Read only | CRUD |
-
-### UI Entry Points
-
-| Menu | What it shows |
+| Figure | Formula |
 |---|---|
-| Maintenance > Dashboard | Team kanban with request counters |
-| Maintenance > Maintenance > Maintenance Requests | Kanban/list/calendar of requests |
-| Maintenance > Equipment > Machines & Tools | Equipment kanban/list |
-| Maintenance > Configuration > Equipment Categories | Category management |
-| Maintenance > Configuration > Maintenance Teams | Team setup |
-| Maintenance > Configuration > Stages | Stage customization |
-| MRP Work Center form > Maintenance tab | MTBF/MTTR + linked requests (with `mrp_maintenance`) |
+| **MTBF** — Mean Time Between Failures (რამდენ ხანში ფუჭდება საშუალოდ) | (latest failure date − effective date) in days ÷ number of done corrective requests |
+| **MTTR** — Mean Time To Repair (რამდენი ხანი სჭირდება შეკეთებას საშუალოდ) | average of (close date − failure date) in days |
+| **Latest Failure Date** | latest failure date |
+| **Estimated time before next failure** | latest failure date + MTBF |
+| **Expected MTBF** | entered by hand, for comparison |
+
+### Teams
+[`maintenance.team`](../addons/maintenance/models/maintenance.py#L505) has members, equipment and an **email alias** that creates requests for the team. The dashboard counts open requests (not done or cancelled): total, scheduled, unscheduled, high priority, changes requested ([`_compute_todo_requests()`](../addons/maintenance/models/maintenance.py#L531)).
+
+### Work-center maintenance (`mrp_maintenance`)
+- A request is **For** *Equipment* or *Work Center* ([`maintenance_for`](../enterprise/mrp_maintenance/models/maintenance.py#L55)); for equipment, the work center comes from the equipment. Requests can be opened from an MO (Action menu → **Maintenance Request**) or from a work order on the Shop Floor ([`button_maintenance_req()`](../enterprise/mrp_maintenance/models/mrp_workorder.py#L9)); the MO and work order are filled in.
+- **Block Workcenter** ([`block_workcenter`](../enterprise/mrp_maintenance/models/maintenance.py#L63)) with a planned date creates `resource.calendar.leaves` of type **Absence** on the work center ([`_recreate_leaves()`](../enterprise/mrp_maintenance/models/maintenance.py#L122)). Work-order planning treats them as non-working time. **Additional Leaves to Plan Ahead** ([`recurring_leaves_count`](../enterprise/mrp_maintenance/models/maintenance.py#L64)) blocks that many future occurrences of a recurrent preventive request.
+- Leaves are only created while the request is not done or cancelled and its stage has **Request Confirmed** ticked ([`create_leaves`](../enterprise/mrp_maintenance/models/maintenance.py#L11)); they are rebuilt when dates, recurrence, stage or blocking change.
+- Maintenance can sit outside working hours but not over planned work orders: a new request on a busy slot is refused ("Manufacturing Orders are already scheduled for this time slot"), a recurring copy is moved to the next free slot with a warning activity ([`_get_first_flexible_available_slot()`](../enterprise/mrp_maintenance/models/mrp_workcenter.py#L119)).
+- Work centers get MTBF/MTTR and a maintenance tab; menus **Planning by Workcenter** and, from `maintenance_enterprise`, **Planning by Equipment** show requests in Gantt.
+
+`maintenance_worksheet` adds worksheet templates and their properties to requests ([`worksheet_template_id`](../enterprise/maintenance_worksheet/models/maintenance_request.py#L9)).
+
+### Access
+From [`ir.access.csv`](../addons/maintenance/security/ir.access.csv#L5) (`equipment_request_rule_user`):
+
+| Model | Internal user | Equipment Manager (`maintenance.group_equipment_manager`) |
+|---|---|---|
+| Equipment | Read | Full |
+| Categories, Stages, Teams | Read | Full |
+| Requests | Full, but only requests they created, follow or are assigned to | Full, all requests |
+
+Equipment, categories, requests and teams are restricted to the user's companies; records without company are shared.
+
+### Menus
+Maintenance → **Dashboard**; **Maintenance** → Maintenance Requests (+ Planning by Equipment / by Workcenter); **Equipment** → Machines & Tools (+ Work Centers with `mrp_maintenance`); **Reporting**; **Configuration** → Maintenance Teams, Equipment Categories, Maintenance Stages (debug mode).
+
+---
+
+## Gotchas & Non-Obvious Behavior
+
+- **No strict consumption.** The BoM has no flexible/warning/strict option; the warning always appears and anyone can confirm it. Code can skip it with the context key `skip_consumption`.
+- **Default capacity is the BoM quantity.** Without a capacity line, a BoM for 10 units counts every started 10 units as one cycle of the operation.
+- **Procurement MOs may stay draft.** With **Auto Confirm Production** off, procurement MOs stay draft and reserve nothing; reordering-rule MOs are draft until the scheduler run finishes.
+- **Merged demand.** Procurements add quantity to an existing unplanned MO without responsible. Planning an MO or setting a responsible stops this.
+- **Batch size rounds up.** Automatic MOs are always full batches.
+- **Plan starts now.** **Plan** moves the MO start to now; use **Plan at Date** to keep the date.
+- **Picked means frozen.** Once a component move is picked (typed quantity, finished work order, Shop Floor), changing the quantity producing leaves it unchanged.
+- **Standard-price products are not re-costed.** The computed MO cost only becomes the unit cost for FIFO/AVCO products.
+- **Set to In Progress rewrites history.** It reverts quants and removes journal entries of the done MO; restrict who is Administrator.
+- **Enterprise needs employees.** With `mrp_workorder`, starting a work order fails for users without an employee.
+- **Quality managers can bypass MO checks** but not open work-order checks: work orders still refuse Done while non-auto checks are open.
+- **Maintenance blocks need a confirmed stage.** A request in a stage without **Request Confirmed** does not block the work center.
 
 ---
 
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
-- [`inventory.md`](inventory.md) -- stock moves and reservations used by MRP
-- [`stock_valuation.md`](stock_valuation.md) -- costing of manufactured products
+- [`inventory.md`](inventory.md) — moves, reservations, routes, multi-step operations used by MOs
+- [`inventory_forecast_report.md`](inventory_forecast_report.md) — the forecast report that also shows MOs and component demand
+- [`stock_valuation.md`](stock_valuation.md) — valuation methods and accounts behind MO costing
+- [`resource_calendars.md`](resource_calendars.md) — calendars and leaves used by work-center planning

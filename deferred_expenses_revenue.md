@@ -1,255 +1,301 @@
-# Deferred Expenses and Revenue — Odoo 20
+# Deferred Expenses and Revenues
 
-> Reviewed against the local source on 2026-09-22. Generation is in [`account_accountant`](../enterprise/account_accountant/); reports and grouped generation are in [`account_reports`](../enterprise/account_reports/).
-> This documents software behavior and illustrative entries. Earlier database-specific examples and statements about statutory tax treatment have not been treated as evidence of current behavior.
-> For a customer-invoice walkthrough, see [Deferred Revenue](deferred_revenue.md).
+> **Module:** `account_accountant` (+ `account_reports`) | **Path:** [`enterprise/account_accountant/`](../enterprise/account_accountant/), [`enterprise/account_reports/`](../enterprise/account_reports/)
+> Verified against Odoo 20 source on 2026-09-24.
 
-## What Deferral Does
+## What It Does & Why It Exists
 
-Deferral moves an expense or revenue from the invoice's accounting date into configured recognition periods. It operates on **journal-item balances**, not payment receipts. A bill can be deferred before it is paid, and a customer invoice can be deferred before cash is collected.
+A company pays 1,200 GEL on 1 January for a one-year software license. Without deferral, January shows a 1,200 expense and February to December nothing. With deferral, each month shows 100, and the balance sheet shows how much of the prepayment is still unused. Revenue works the same way: a 3,600 GEL annual service invoiced in April is recognized 300 per month.
 
-Example: a 1,200 GEL annual subscription bill uses an expense account. With monthly recognition for January 1–December 31, Odoo can reverse the initial expense into a holding asset and recognize 100 GEL expense each month.
+Deferral works on **journal-item balances**, not on payments. A bill can be deferred before it is paid, an invoice before it is collected. Accountants use it for prepaid licenses, insurance, rent, support contracts and subscriptions billed in advance. For the customer-invoice walkthrough see [deferred_revenue.md](deferred_revenue.md).
 
-| Step | Expense deferral | Revenue deferral |
+---
+
+## The Big Picture — How It Works
+
+| Entry | Expense deferral | Revenue deferral |
 |---|---|---|
-| Original invoice/bill | DR Expense / CR Payable | DR Receivable / CR Revenue |
-| Initial reclassification | DR Holding asset / CR Expense | DR Revenue / CR Holding liability |
-| Recognition | **DR Expense / CR Holding asset** | **DR Holding liability / CR Revenue** |
+| Original bill / invoice | DR Expense / CR Payable | DR Receivable / CR Revenue |
+| Initial reclassification (bill date) | DR Holding asset / CR Expense | DR Revenue / CR Holding liability |
+| Each recognition (period end) | **DR Expense / CR Holding asset** | **DR Holding liability / CR Revenue** |
 
-The monthly expense recognition direction above corrects the reversed debit/credit explanation in the former revenue guide. Tax and payment entries are separate from this simplified example.
+```
+Bill line with deferred dates ──► Post
+   ├── On bill validation:  reclassification (bill date) + one recognition per period,
+   │                        future ones scheduled and posted by the daily cron
+   └── Manually & Grouped:  nothing at posting; at month end the Deferred Expenses report
+                            "Generate entry" posts one grouped adjustment + its reversal next day
+```
 
-## Configuration: Five Settings Per Side
+### Key decision points
 
-Sources: [`res_company.py`](../enterprise/account_accountant/models/res_company.py), [`settings view`](../enterprise/account_accountant/views/res_config_settings_views.xml).
+- **Generation mode:** one schedule per line at posting, or one grouped month-end adjustment.
+- **Computation:** by months (30-day months), by days, or by full months.
+- **Periodicity:** monthly or yearly recognition entries (on-validation mode).
+- **Holding account type:** Current Assets or Prepayments for expenses. It decides how analytic budgets see the cost (see Analytics and Budgets).
 
-| Purpose | Expense field | Revenue field |
-|---|---|---|
-| Journal | `deferred_expense_journal_id` | `deferred_revenue_journal_id` |
-| Company default holding account | `deferred_expense_account_id` | `deferred_revenue_account_id` |
-| Generation mode | `generate_deferred_expense_entries_method` | `generate_deferred_revenue_entries_method` |
-| Amount calculation | `deferred_expense_amount_computation_method` | `deferred_revenue_amount_computation_method` |
-| **Periodicity** | `deferred_expense_periodicity` | `deferred_revenue_periodicity` |
+---
 
-Generation defaults to `on_validation`; the alternative is `manual` (**Manually & Grouped**). Computation defaults to `month`; alternatives are `day` and `full_months`. Periodicity defaults to `month` and also supports `year`. It is displayed for on-validation mode.
+## When to Use It (and When Not To)
 
-The Settings UI selects active general journals, asset-current/prepayment holding accounts for expenses, and current-liability holding accounts for revenue. These are UI domains; the company fields themselves do not contain a universal Python constraint enforcing those exact account types.
+### Use it for:
 
-### Per-Account Deferral Settings
-
-[`account.account`](../enterprise/account_accountant/models/account_account.py) adds:
-
-- `is_deferred`: **Deferred** flag. The invoice-line view makes the deferred start field required when this is enabled.
-- `deferred_account_id`: an account-specific holding account, preferred over the company's default during both individual and grouped generation.
-
-The account form exposes these fields for `expense`, `expense_other`, `income` and `income_other`; its holding-account domain depends on the source account type. This UI visibility is narrower than every account the generation engine can process. See [`account_account_views.xml`](../enterprise/account_accountant/views/account_account_views.xml).
-
-## Eligible Source Lines and Dates
-
-[`_has_deferred_compatible_account()`](../enterprise/account_accountant/models/account_move.py) accepts:
-
-| Source document | Financial-account internal group |
+| Situation | Example |
 |---|---|
-| Purchase invoice/refund/receipt | expense |
-| Sales invoice/refund/receipt | income |
-| Miscellaneous journal entry | expense or income |
+| Annual software license | 12-month subscription paid upfront |
+| Support or maintenance contract | Yearly IT maintenance |
+| Prepaid insurance | Property insurance for the year |
+| Prepaid rent | Six months of office rent |
+| Revenue billed in advance | Annual SaaS subscription, retainer, membership |
 
-`deferred_start_date` and `deferred_end_date` are inclusive. **The line's end date does not have to be month-end.** The constraint rejects a start without an end and a start later than the end. The abnormal-date warning catches some likely off-by-one ranges; it does not prohibit all partial months.
+### Do not use it for:
 
-Onchange behavior fills a missing opposite date with the date just entered and clears dates incompatible with the account/document. Separately, the stored start-date compute can fill an absent start from the invoice date when an end date exists. Consequently “enter an end date and the start always becomes invoice date” is not a reliable description of every UI/ORM path. Check both dates explicitly.
+- Monthly bills paid as you go — post them to expense directly.
+- Purchases consumed within the month.
+- Fixed assets — use the Assets module (`account_asset`).
 
-The invoice form's current XML presents deferred dates alongside account information and also defines optional/hidden fields; journal items use a **Deferred Date** date-range widget. Do not rely on the old instruction that two independently visible Start/End columns always appear by default. See [`account_move_views.xml`](../enterprise/account_accountant/views/account_move_views.xml).
+---
+
+## Configuration
+
+Accounting → Configuration → Settings → Deferred Expenses / Deferred Revenues ([res_config_settings_views.xml:48](../enterprise/account_accountant/views/res_config_settings_views.xml#L48)). Fields live on the company ([res_company.py:17](../enterprise/account_accountant/models/res_company.py#L17)); expense and revenue are set independently.
+
+| Setting | Values | What it changes |
+|---|---|---|
+| Journal | a Miscellaneous journal | Where deferral entries go. Required: "Please set the deferred journal in the accounting settings." |
+| Account | expense side: Current Assets or Prepayments; revenue side: Current Liabilities (selection filters) | Default holding account |
+| Generate Entries | On bill (invoice) validation (default), Manually & Grouped | When entries are created |
+| Periodicity | Monthly (default), Yearly; shown only for on-validation | One recognition entry per month or per fiscal year |
+| Computation | By Months (default), By Days, By Full Months | How the amount is split |
+
+When a chart does not set them, loading it picks the Miscellaneous journal and the chart's first Current Assets / Current Liabilities account ([account_chart_template.py:10](../enterprise/account_accountant/models/account_chart_template.py#L10)). The Georgian chart sets 170910 Other Prepaid Expenses (Current Assets) and 310610 Deferred Income (Advances Received) (Current Liabilities) ([template_ge.py:39](../addons/l10n_ge/models/template_ge.py#L39)).
+
+### Per account
+
+On an Expenses, Other Expenses, Income or Other Income account ([account_account_views.xml:27](../enterprise/account_accountant/views/account_account_views.xml#L27), [account_account.py:8](../enterprise/account_accountant/models/account_account.py#L8)):
+
+- **Deferred** — deferred dates become required on invoice and bill lines using this account.
+- **Deferred Account** — holding account for this account; it wins over the company default, in both generation modes.
+
+---
+
+## Which Lines Can Be Deferred
+
+[`_has_deferred_compatible_account()`](../enterprise/account_accountant/models/account_move.py#L759):
+
+| Document | Account internal group |
+|---|---|
+| Vendor bill, refund, receipt | Expense |
+| Customer invoice, credit note, receipt | Income |
+| Journal entry | Expense or Income |
+
+On any other account the dates are cleared. A journal entry mixing deferred expense and income lines is refused when the two sides use different generation modes: "Having different deferred entries generation methods for expenses and revenues is not supported on journal entries involving both expense and revenue accounts." ([account_move.py:141](../enterprise/account_accountant/models/account_move.py#L141)).
+
+### Entering the dates
+
+- **Invoice and bill lines:** a date range under the Account cell. It shows when the account is flagged Deferred, or when the optional **Deferred Date** column is switched on in the lines' column menu ([m2o_cell_with_extra_fields.js:9](../enterprise/account_accountant/static/src/components/m2o_cell_with_extra_fields/m2o_cell_with_extra_fields.js#L9)). It turns read-only once deferral entries exist.
+- **Journal Items tab:** an optional **Deferred Date** range column ([account_move_views.xml:61](../enterprise/account_accountant/views/account_move_views.xml#L61)).
+
+Both dates are **inclusive**; the end date need not be a month end. A start without an end, or a start after the end, is refused ([account_move.py:796](../enterprise/account_accountant/models/account_move.py#L796)). Setting one date copies it to the other if empty; an end date without a start takes the invoice date as start ([account_move.py:790](../enterprise/account_accountant/models/account_move.py#L790)). A range of N months plus one day (1 January – 1 January) is flagged with a warning color: use 31 December ([account_move.py:740](../enterprise/account_accountant/models/account_move.py#L740)).
+
+---
 
 ## Walkthrough: Annual Vendor Bill
 
-Assumptions: 1,200 GEL company-currency balance, dates January 1–December 31, `month` calculation, `month` periodicity, on-validation mode, no taxes in this illustration.
+1,200 GEL, 1 January – 31 December, By Months, Monthly, on validation, no tax.
 
-1. Configure the expense deferral journal and default/per-account holding account.
-2. Enter the bill on its normal expense account, with both deferred dates.
-3. Set analytic distribution if this cost needs analytic reporting.
-4. Post the bill and open its generated deferred entries.
-5. Review entry dates and amounts; due entries can post immediately and future entries remain scheduled.
+1. Set the expense journal and holding account in Settings.
+2. Enter the bill on its normal expense account with both dates; add the analytic distribution if needed.
+3. Confirm the bill. Open **Deferral Entries** (smart button) to see the schedule.
 
-| Entry | Date | Debit | Credit |
-|---|---|---|---|
-| Bill | January 1 | Expense 1,200 | Payable 1,200 |
-| Initial deferral | Bill accounting date | Holding asset 1,200 | Expense 1,200 |
-| First recognition | January 31 | Expense 100 | Holding asset 100 |
-| Later recognition | Each applicable period end | Expense 100 | Holding asset 100 |
+| Entry | Date | Debit | Credit | Amount |
+|---|---|---|---|---|
+| Bill | 1 Jan | Expense | Payable | 1,200 |
+| Reclassification | 1 Jan (bill accounting date) | Holding asset | Expense | 1,200 |
+| Recognition | 31 Jan | Expense | Holding asset | 100 |
+| Recognition | each month end to 31 Dec | Expense | Holding asset | 100 |
 
-After January's recognition, the holding asset is 1,100 and recognized expense is 100. At completion, the holding amount for this example is zero. The bill's payment status is independent.
+After January the holding account shows 1,100 and the P&L 100. At the end the holding balance is zero. Paying the bill changes none of this.
 
-## On-Validation Generation
+### Partial months
 
-Source: [`account_move.py`, `_post()` and `_generate_deferred_entries()`](../enterprise/account_accountant/models/account_move.py).
+33 GEL, 10 March – 11 July, bill accounting date 9 March, By Months:
 
-The override calls base posting, then requests generation for on-validation moves with deferred starts. `_generate_deferred_entries()` returns unless the source is actually **posted**, so a future invoice merely scheduled by soft posting does not immediately generate its deferrals.
+| Entry | Date | Amount |
+|---|---|---|
+| Reclassification | 9 March | 33.00 |
+| Recognition | 31 March | 5.68 |
+| Recognition | 30 April | 8.11 |
+| Recognition | 31 May | 8.11 |
+| Recognition | 30 June | 8.11 |
+| Recognition | 11 July | 2.99 |
 
-For each eligible source line it:
+The last period ends on the end date and takes the remainder, so the total is exactly 33.00.
 
-1. Resolves expense or revenue settings and requires a deferred journal.
-2. Builds the configured periods and skips unnecessary deferrals.
-3. Resolves `line.account_id.deferred_account_id` before the company fallback.
-4. Creates an initial reclassification at the source move's **accounting date**.
-5. Creates one recognition entry per retained period, dated at that period's end (clipped to the line end date).
-6. Links all generated moves through `deferred_original_move_ids`, adds their journal items after that relation exists, removes zero-total recognition moves and calls `_post(soft=True)`.
-
-Dates entirely within the same accounting month can be skipped because reversing and recognizing would cancel within that month. `_get_deferred_periods()` also skips a single period whose start month equals the source accounting month; this condition applies to yearly periodicity as well. Full-month calculation has additional short-period skip behavior. Do not assume every line with dates creates an initial reversal plus a fixed number of monthly entries.
-
-The line helper carries analytic distribution and product/category data; generation also supplies partner and product values. These statements refer to individual generation, not a guarantee that grouped entries preserve each original partner/product separately.
-
-### Periodicity Selection Caveat
-
-The local `_get_deferred_entries_periodicity()` uses `is_outbound()`, not the source account's income/expense group. Consequently it chooses:
-
-| Move type | Selected periodicity setting |
-|---|---|
-| Vendor bill / purchase receipt | Expense |
-| Customer invoice / sales receipt | Revenue |
-| Customer credit note (`out_refund`) | **Expense** |
-| Vendor refund (`in_refund`) | **Revenue** |
-| Miscellaneous entry | Revenue |
-
-This differs from generation-mode selection, which checks purchase/sales documents and the deferred account groups in miscellaneous entries. With mixed expense/income miscellaneous lines and different generation modes, Odoo raises an error and asks for separate entries. These are current source behaviors to verify when choosing different settings for the two sides.
+---
 
 ## Calculation Methods
 
-Sources: `_get_deferred_diff_dates()`, `_get_deferred_period_amount()`, `_get_deferred_periods()` in [`account_move.py`](../enterprise/account_accountant/models/account_move.py).
+Sources: [`_get_deferred_diff_dates()`](../enterprise/account_accountant/models/account_move.py#L182), [`_get_deferred_period_amount()`](../enterprise/account_accountant/models/account_move.py#L201).
 
-| Method | Calculation |
+| Method | How a period is weighted |
 |---|---|
-| `day` | Actual elapsed days divided by total covered days |
-| `month` | 30-day-month difference, with month-end normalization; full calendar months have equal weight |
-| `full_months` | Resets calculation boundaries to the first of their month, after converting inclusive ends to exclusive boundaries |
+| By Months | 30-day months: a month end counts as day 30, so February, March and April weigh the same |
+| By Days | Actual calendar days |
+| By Full Months | Boundaries moved to the first of their month: a started month counts in full, a short final month can get nothing |
 
-Full Months does **not** give every touched month an equal full share. A partial terminal month can receive zero; zero-total recognition moves are then deleted.
+900 GEL, 15 April – 14 June, monthly:
 
-### Verified Arithmetic Example
-
-For 900 GEL, April 15–June 14, with monthly periodicity:
-
-| Calculation | April | May | June |
+| Method | April | May | June |
 |---|---|---|---|
-| Months | 240 | 450 | 210 |
-| Full Months | 450 | 450 | 0 |
+| By Months | 240 | 450 | 210 |
+| By Full Months | 450 | 450 | 0 (entry deleted) |
 
-The 30-day calculation weights April as 16/30 and June as 14/30, so the old 225/450/225 example was inaccurate. These values were checked by executing the two pure calculation methods extracted from this checkout, without loading an Odoo database.
+900 GEL, 1 April – 30 June, By Days (91 days): 296.70, 306.59, 296.71.
 
-For 900 GEL, April 1–June 30, day-based calculation uses 91 days: April and June each have 30, May 31. Amounts are approximately 296.70, 306.59 and a final residual of 296.71 at two-decimal rounding.
+With By Full Months, when the span from the first day of the start month to the end date is under two months, Odoo moves the end date back one month before the same-month check ([account_move.py:315](../enterprise/account_accountant/models/account_move.py#L315)). So 100 GEL for 15 March – 14 April, posted in March, is **not deferred at all**; By Months gives 53.33 / 46.67.
 
-Individual generation forces the last amount to the remaining balance to absorb accumulated rounding. The implementation subtracts `line.currency_id.round(balance)` from that remaining balance even though the input is company-currency `line.balance`; inspect differing currency precisions when diagnosing a rounding edge case rather than assuming a universal precision rule.
+---
 
-### Yearly Periodicity
+## On Validation
 
-Yearly periods follow `company.compute_fiscalyear_dates()`, not necessarily January–December. The first/last periods are clipped to the deferral range. Amount-computation method and periodicity are independent: yearly entries can still use day, month or full-month allocation math.
+`_post()` generates the schedule for moves in this mode ([account_move.py:112](../enterprise/account_accountant/models/account_move.py#L112)). `_generate_deferred_entries()` returns unless the move is really posted, so a future-dated bill only scheduled for posting gets its schedule when the cron posts it ([account_move.py:280](../enterprise/account_accountant/models/account_move.py#L280)).
 
-## Manually and Grouped
+For each deferred line:
 
-Sources: [`account_deferred_reports.py`, `_get_moves_to_defer()` / `_generate_deferral_entry()`](../enterprise/account_reports/models/account_deferred_reports.py).
+1. Skips the line when start month, end month and the bill's accounting month are the same ([account_move.py:322](../enterprise/account_accountant/models/account_move.py#L322)), and when there is a single period starting in the accounting month ([account_move.py:830](../enterprise/account_accountant/models/account_move.py#L830)).
+2. Takes the account's Deferred Account, else the company default; neither raises "Please set a deferred account on the related account or in the accounting settings."
+3. Creates the reclassification at the bill's accounting date and one recognition per period, dated at the period end (the last one at the end date).
+4. Forces the last amount to the remaining balance; deletes zero-amount entries.
+5. Posts with `_post(soft=True)`: entries dated today or earlier post at once; later ones stay draft with Auto-post "At Date".
 
-In manual mode, posting does not create the individual recognition schedule. Open the relevant Deferred Expenses/Revenues report, review the selected period and use **Generate entry**.
+Each deferral line keeps the source line's analytic distribution, product and partner. Taxes are not recomputed on deferral entries, so a default tax on the expense account is not added ([account_move.py:878](../enterprise/account_accountant/models/account_move.py#L878)).
 
-The selected **report end must be the last day of a month**. This is the month-end restriction that the old documents incorrectly applied to every invoice line. Generation uses posted originals only and rejects a locked period.
+### Yearly periodicity
 
-It creates a grouped adjustment at report end to leave only the recognized-to-date amount on the original income/expense accounts, with the remainder on holding accounts. It then creates the opposite entry dated the next day. Both are passed to `_post(soft=True)`; due entries may already be posted when the action returns. “Generate, then manually post both” is not the actual unconditional workflow.
+Periods follow the company's fiscal years (`compute_fiscalyear_dates`), clipped to the deferral dates. Computation and periodicity are independent: yearly entries can still be computed by months or days.
 
-For a 1,200 expense of which 100 should remain recognized at January end, the net grouped adjustment is DR Holding 1,100 / CR Expense 1,100, reversed February 1. At the next month-end, a new adjustment establishes the then-current deferred balance. This is a period-end adjustment/reversal process, not the same set of individual monthly entries as on-validation mode.
+### Which settings a document uses
 
-Original-account grouping defaults to account; holding lines group by resolved `deferred_account_id`. Analytic distributions are weighted from source balances. Grouped entries do not retain a distinct partner/product trace on every original amount; the source-move relation provides the audit path.
+| Document | Generation mode | Periodicity |
+|---|---|---|
+| Vendor bill, vendor refund | expense | bill: expense; **vendor refund: revenue** |
+| Customer invoice, credit note | revenue | invoice: revenue; **customer credit note: expense** |
+| Journal entry | by the deferred lines' accounts | revenue |
 
-**Local source discrepancy:** the report handler's `_get_deferred_lines()` passes the boolean `is_reverse` to `_get_deferred_amounts_by_line()` as `deferred_type`. That helper selects the expense calculation method only when this argument equals the string `"expense"`; a boolean therefore selects the **revenue** calculation method for grouped expenses too. Report display passes the proper expense/revenue string. Consequently, different expense and revenue calculation settings can make a grouped expense adjustment disagree with the displayed expense allocation. This follows from the source call chain; it has not been reproduced in a database. Individual generation passes the correct string.
+Periodicity follows the money direction (`is_outbound()`), not the account ([account_move.py:161](../enterprise/account_accountant/models/account_move.py#L161)). It matters only when the two periodicities differ.
 
-Already-generated filtering checks for linked entries at the report end that are posted or future scheduled (`auto_post = at_date`). The report distinguishes never-generated, partially generated and fully generated states. Existing entries do not imply that every newly added eligible original has been included.
+---
+
+## Manually & Grouped
+
+Nothing happens at posting. At month end, open Accounting → Review → Regularization Entries → **Deferred Expenses** (or Deferred Revenues), select the month and click **Generate entry** ([account_deferred_reports.py:514](../enterprise/account_reports/models/account_deferred_reports.py#L514)).
+
+- The selected period must **end on the last day of a month**: "You cannot generate entries for a period that does not end at the end of the month." This applies to the report period, not to invoice lines.
+- A locked period is refused: "You cannot generate entries for a period that is locked."
+- Only posted originals are included; originals already covered by an entry at that date (posted, or scheduled for the future) are skipped.
+
+It creates two entries: at the period end, a grouped adjustment that leaves on the expense accounts only what is recognized so far and moves the rest to the holding accounts; the next day, its exact reversal ("Reversal of Grouped Deferral Entry of ..."). Both go through `_post(soft=True)`. The reversal clears the snapshot, so next month's generation builds a fresh one.
+
+Example: 1,200 of which 100 is recognized at 31 January: DR Holding 1,100 / CR Expense 1,100 on 31 January, reversed on 1 February.
+
+Lines are grouped by original account and by holding account. Analytic distribution is weighted by each source line's balance. The link to every original bill is written directly in SQL, so a grouped entry keeps no partner or product per bill; open it through the original.
+
+**Source defect:** the grouped generation passes a boolean where the expense/revenue type is expected, so grouped **expense** entries are computed with the **revenue** computation method ([account_deferred_reports.py:511](../enterprise/account_reports/models/account_deferred_reports.py#L511), [account_deferred_reports.py:588](../enterprise/account_reports/models/account_deferred_reports.py#L588)). The report columns use the right method. Keep both computation methods equal when you use Manually & Grouped for expenses.
+
+---
 
 ## Deferred Reports
 
-The report handlers are `account.deferred.expense.report.handler` and `account.deferred.revenue.report.handler`. Menu actions live under Accounting's Review/Regularization Entries hierarchy. Sources: [`handler`](../enterprise/account_reports/models/account_deferred_reports.py), [`menus`](../enterprise/account_reports/data/menuitems.xml).
+Accounting → Review → Regularization Entries → Deferred Expenses / Deferred Revenues ([menuitems.xml:31](../enterprise/account_reports/data/menuitems.xml#L31)).
 
 | Column | Meaning |
 |---|---|
-| Total | Full amount in the selected eligible source population |
-| Not Started | Deferral starts after the viewed end |
-| Before | Calculated allocation before the first viewed period |
-| Selected period columns | Allocation within each viewed period |
-| Recognized | Calculated cumulative allocation through viewed end |
-| **≤ 12 Months** | Future portion within the next 12 months |
-| **> 12 Months** | Remaining future portion beyond that boundary |
+| Total | Full amount of the lines shown |
+| Not Started | Deferrals starting after the selected period |
+| Before | Share of periods before the selected one |
+| (selected periods) | Share of each selected period |
+| Recognized | Share up to the end of the selected period |
+| ≤ 12 Months | Still to recognize within 12 months after the period |
+| > 12 Months | Still to recognize after that |
 
-The previous single “Later” column is now split. Report allocations are calculated from original line dates/balances; a recognized column is not by itself proof that every scheduled recognition move posted successfully.
+Sources: [account_deferred_reports.py:197](../enterprise/account_reports/models/account_deferred_reports.py#L197). Amounts are computed from the source lines' dates and balances; they are not a sum of posted deferral entries. **Group by** switches between Account, Product Category and Product. Click an amount to see the journal items.
 
-The report excludes a line as fully inside the selected period only when **both deferral endpoints and the original move's accounting date** are inside it. A full-year report can therefore hide a deferral entirely contained and booked in that year; selecting a narrower period is useful, but is not a universal cure for an empty report.
+Which lines appear ([account_deferred_reports.py:39](../enterprise/account_reports/models/account_deferred_reports.py#L39)):
 
-### Generation Versus Report Account Filters
+- Expense report: account types `expense`, `expense_depreciation`, `expense_direct_cost`. Revenue report: `income`, `income_other`. An **Other Expenses** line can be deferred but does not appear in the expense report.
+- A line whose start date, end date **and** bill date all fall inside the selected period is hidden ([account_deferred_reports.py:26](../enterprise/account_reports/models/account_deferred_reports.py#L26)). A deferral fully inside one year disappears from a full-year view: select a month.
 
-Generation accepts expense/income internal groups. The expense report explicitly lists `expense`, `expense_depreciation`, `expense_direct_cost`; the revenue report lists `income`, `income_other`. Thus **`expense_other` can be generated but is absent from the expense report's explicit filter**, even though the account form exposes deferral settings for it. This is a source discrepancy, not a claim that such a line cannot generate entries.
+In manual mode a banner says whether entries were never, partly or fully generated for the period ([account_deferred_reports.py:382](../enterprise/account_reports/models/account_deferred_reports.py#L382)).
 
-The handler caches fetched original lines within the transaction. Report grouping and displayed allocations should not be described as a direct sum of all posted deferral entries.
+---
 
-## Taxes, Currency and Analytics
+## Taxes, Currency, Analytics and Budgets
 
-### Tax Dates Are Conditional
+### Taxes
 
-[`account_tax.py`](../enterprise/account_accountant/models/account_tax.py) carries deferred dates into tax grouping only for compatible source lines with both dates and a repartition line where **`use_in_tax_closing` is false**. Tax-closing repartition lines do not inherit those dates through that path. Non-deductible/expense allocations can therefore participate in deferral when otherwise eligible.
+Deferral moves only income and expense lines. A normal VAT line sits on a tax account and stays in the bill's period. Tax amounts posted to the expense or income account itself (tax distribution lines not used in the tax closing, such as non-deductible VAT) take the line's dates and are deferred with it ([account_tax.py:28](../enterprise/account_accountant/models/account_tax.py#L28)).
 
-Generated deferral moves suppress automatic recomputation of account default taxes through `_get_computed_taxes()`. This explains software behavior; it does not establish the legal VAT reporting/deductibility date for every jurisdiction or cash-basis configuration. The blanket “VAT is never deferred and always reported on invoice date” statement is too broad.
+For a 1,180 bill (1,000 net + 180 VAT): 180 goes to the VAT account on the bill date; the 1,000 is spread.
 
 ### Currency
 
-Recognition uses the source journal item's `balance`, in company currency. It does not revalue the source invoice at each recognition date. Payment-related exchange differences remain a separate process. See [Currency Exchange and Transit](currency_exchange_transit.md).
+Recognition uses the source line's company-currency balance: the rate of the bill date stays, there is no monthly revaluation. The amounts are rounded with the document currency's precision ([account_move.py:375](../enterprise/account_accountant/models/account_move.py#L375)). Payment exchange differences are separate: [currency_exchange_transit.md](currency_exchange_transit.md).
 
-### Analytic Distribution and Odoo 20 Budgets
+### Analytics and budgets
 
-Individual deferral journal items carry the original distribution, including both the expense/revenue and holding sides. Posting creates analytic amounts with the usual **`amount = -balance`** sign. The old guide reversed those analytic signs and omitted holding-side effects.
+Both lines of every deferral entry carry the source distribution, so analytic items follow the usual `amount = -balance` rule on both sides. What an **expense budget** sees depends on the holding account type ([analytic_budget.md](analytic_budget.md)):
 
-For a 1,200 expense and 100 recognition, with matching dates/companies/analytic dimensions:
+| Posting | Analytic amount | Budget, holding = Current Assets | Budget, holding = Prepayments |
+|---|---|---|---|
+| Bill, expense debit 1,200 | −1,200 | +1,200 | +1,200 |
+| Reclassification, expense credit | +1,200 | −1,200 | −1,200 |
+| Reclassification, holding debit | −1,200 | +1,200 | not counted |
+| Recognition, expense debit 100 | −100 | +100 | +100 |
+| Recognition, holding credit 100 | +100 | −100 | not counted |
+| **Net at bill date / per month** | | **1,200 / 0** | **0 / 100** |
 
-| Posting | Analytic amount | Expense-budget contribution if holding is `asset_current` |
-|---|---|---|
-| Bill expense debit | -1,200 | +1,200 |
-| Initial expense credit | +1,200 | -1,200 |
-| Initial holding debit | -1,200 | +1,200 |
-| Recognition expense debit | -100 | +100 |
-| Recognition holding credit | +100 | -100 |
+Current Assets accounts count for budgets and Prepayments accounts do not. With the Georgian default (170910, Current Assets) the expense budget takes the full bill on the bill date. Revenue holding accounts (Current Liabilities) never count, so a revenue budget follows the monthly recognition.
 
-Odoo 20 budgets include `asset_current`, so the initial net consumption in this example is **1,200**, and the later two-sided recognition has net zero contribution. Deferral does not automatically spread expense-budget consumption in the same way as the P&L.
-
-If the holding account is **`asset_prepayments`**, it is not among the budget report's explicit eligible asset types. With that account type, the expense-only contributions can cancel at initial deferral and appear gradually on recognition. Revenue holding liabilities are also excluded, so the usual revenue-budget effect follows the income side. Account type and actual matches determine the result. See [Analytic Budget](analytic_budget.md) and [`budget_report.py`](../enterprise/account_budget/reports/budget_report.py).
+---
 
 ## Resetting, Editing and Credit Notes
 
-Source: [`account_move.py`, `button_draft()`, `unlink()`, line `write()` / `copy_data()`](../enterprise/account_accountant/models/account_move.py).
+- **Reset to draft** ([account_move.py:120](../enterprise/account_accountant/models/account_move.py#L120)) is refused when a deferral entry covers more than one original (grouped mode): "You cannot reset to draft an invoice that is grouped in deferral entry. You can create a credit note instead." Otherwise each deferral entry is:
+  - deleted if it was never posted;
+  - deleted if posted in an open period (canceled instead when the company keeps a restrictive audit trail);
+  - reversed if it is in a locked period or hashed; the reversal is dated in the first open period ([account_move.py:5920](../addons/account/models/account_move.py#L5920)).
+- **Changing the account** of a deferred line with entries is refused ([account_move.py:664](../enterprise/account_accountant/models/account_move.py#L664)). Changing the dates on a posted bill does not rebuild the schedule: reset to draft, fix, confirm again.
+- **Credit notes:** Duplicate does not copy the dates, but a credit note made by reversal does ([account_move.py:656](../enterprise/account_accountant/models/account_move.py#L656)). The credit note gets its own opposite schedule for the same dates. For an early termination, change its dates before confirming.
 
-- Reset is blocked when **any generated deferral is linked to more than one original move**. The check is relational, not simply “all manual mode invoices are blocked.”
-- Otherwise generated moves are processed with `_unlink_or_reverse()`. Depending on whether deletion is allowed and audit-trail protection applies, they can be deleted, canceled or reversed. Posted does not automatically mean reversed. Reversal accounting dates can be adjusted.
-- Changing the account of an already-deferred line with both dates is blocked. Inspect/reset the linked deferrals before editing; changing dates alone should not be assumed to rebuild a posted schedule automatically.
-- Deferred date fields are `copy=False`, but reversal copying explicitly preserves them when `move_reverse_cancel` is in context. Standard credit-note behavior depends on that reversal path and the actual copied dates/amounts.
-- Refunds reverse the economic signs. They do not inherently know a contract's termination date or choose the correct remaining recognition period; review the credit note and its generated schedule, especially the periodicity selection caveat above.
+---
 
-## Automatic Posting and Failures
+## Automatic Posting
 
-The daily [`service_cron.xml`](../addons/account/data/service_cron.xml) calls [`_autopost_draft_entries()`](../addons/account/models/account_move.py). It selects draft moves dated through today with `auto_post != no`. The shipped next-call expression initializes a 02:00 timestamp; the installed schedule/server timezone determines actual execution, not a guaranteed 02:00 local posting in every database.
+The daily cron "Account: Post draft entries with auto_post enabled and accounting date up to today" posts draft entries dated today or earlier with Auto-post set ([service_cron.xml:3](../addons/account/data/service_cron.xml#L3), [account_move.py:7155](../addons/account/models/account_move.py#L7155)). A missed day is caught up on the next run. When an entry fails (a lock date, for example), the cron posts the error in its chatter and sets Auto-post to **No**: it will not be retried by itself. Fix the cause, then post it by hand.
 
-Future deferrals use `auto_post = at_date`. Due entries are normally posted by the cron, and missed runs can catch up later. After a batch `UserError`, the cron retries individually; for a failing move it posts the error message and sets **`auto_post = no`**. Fixing configuration later does not by itself re-enable its automatic attempts. Review the chatter and explicitly resolve/re-enable or post the affected entry within normal accounting restrictions.
+---
 
 ## Troubleshooting
 
-| Symptom | Check |
-|---|---|
-| No generated entries | Actual source state, generation mode, both dates, account compatibility and same-period skip rules |
-| No holding account configured | Per-account override first, then company fallback |
-| Report empty despite generated entries | Account filter (including `expense_other` mismatch), selected dates, original accounting date and company/options |
-| Recognition dates are yearly | Side-specific periodicity; refunds/misc use the method's outbound-based selection |
-| Partial last month receives zero | Full Months normalization and removal of zero-total recognition moves |
-| Cannot reset grouped original | A linked generated move has multiple originals |
-| Deferred entry remains draft after a failure | Chatter, `auto_post`, due date and accounting restrictions |
-| Budget consumes the full bill immediately | Holding-account type may be included by the Odoo 20 budget filter |
+| What went wrong | Why | Fix |
+|---|---|---|
+| No deferral entries | Manual mode; line not deferrable; start, end and bill date in one month; Full Months short range | Check the mode, the account type and the dates |
+| Report is empty | Period contains the whole deferral and the bill date; account type not in the report filter (Other Expenses) | Select a month; use an Expenses account |
+| Odd split amounts | End date = first day of the next month | Use the last day of the period |
+| Last partial month gets 0 | By Full Months | Expected; the zero entry is deleted |
+| Recognition is yearly | Periodicity Yearly for that side (refunds use the other side's) | Check both periodicities |
+| Cannot reset a grouped bill | A deferral entry covers several bills | Use a credit note |
+| Entry stays draft after its date | Cron error; Auto-post was set to No | Read the chatter, fix, post by hand |
+| Budget takes the whole bill at once | Holding account is Current Assets | Use a Prepayments holding account if the budget must follow recognition |
+| Entries net to zero | Holding account = the expense account | Use a separate holding account |
 
-## Source Verification
-
-Reviewed the implementation and relevant existing [`generation tests`](../enterprise/account_accountant/tests/test_deferred_management.py) and [`report tests`](../enterprise/account_reports/tests/test_deferred_reports.py). Only the isolated proration arithmetic above was executed during this documentation update; the database-dependent test suites were not run.
+---
 
 ## Related Docs
 
-- [Deferred Revenue](deferred_revenue.md)
-- [Analytic Accounting](analytic_accounting.md)
-- [Analytic Budget](analytic_budget.md)
-- [Documentation index](INDEX.md)
+- [`INDEX.md`](INDEX.md)
+- [`deferred_revenue.md`](deferred_revenue.md) — customer-invoice walkthrough
+- [`analytic_budget.md`](analytic_budget.md) — what budgets count
+- [`analytic_accounting.md`](analytic_accounting.md) — analytic items from deferral entries
+- [`currency_exchange_transit.md`](currency_exchange_transit.md) — foreign-currency bills

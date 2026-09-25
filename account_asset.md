@@ -1,29 +1,7 @@
 # account_asset — Fixed Assets & Depreciation
 
 > **Module:** `account_asset` (enterprise, `auto_install: True`) | **Path:** [`enterprise/account_asset/`](../enterprise/account_asset/)
-> Verified against Odoo **20.0** source — 2026-09-22
-> **This module was heavily restructured in 20.0.** Read [What Changed in 20.0](#what-changed-in-200) before trusting any 19.0 habit.
-
----
-
-## What Changed in 20.0
-
-If you know this module from 19.0, these are the structural breaks. Everything else in this doc assumes them.
-
-| 19.0 | 20.0 |
-|---|---|
-| One `account.asset` record held everything: values **and** depreciation config **and** the board | Split in two: `account.asset` is the **thing you own**; [`account.asset.variant`](../enterprise/account_asset/models/account_asset_variant.py) holds the **depreciation config, state and board**. An asset has 1..n variants |
-| Templates were assets with `state = 'model'`, created via a **Save as Model** button | Templates are their own model, [`account.depreciation.model`](../enterprise/account_asset/models/account_depreciation_model.py). `state` no longer has a `model` value; the button is gone |
-| Account config: `create_asset` (`no`/`draft`/`validate`), `multiple_assets_per_line`, `asset_model_ids` | All three **removed**. Now: `depreciation_model_id` (single), `ledger_depreciation_model_ids`, `asset_depreciation_account_id`, `asset_expense_account_id` on [`account.account`](../enterprise/account_asset/models/account.py) |
-| Auto-creation from a bill could stop at Draft | Auto-creation is **always create + confirm**. No draft option |
-| `account.move.asset_id` | `account.move.asset_variant_id` |
-| Depreciation/expense accounts were editable per asset | They come from the **fixed asset account** (or the depreciation model, for ledger variants). Not on the asset form |
-| 3 methods: linear / degressive / degressive_then_linear | 4: adds **`no_depreciation`**. Plus `method_mode` = `duration` or `rate`, and a `method_rate` input |
-| `salvage_value_pct` | `salvage_value_percent`, and it lives on the depreciation model |
-| `method_number` Integer | `method_number` **Float** (so 4.5 years, or `1/rate`) |
-| One depreciation schedule per asset | **Multi-ledger**: one schedule per ledger (`account.journal.group`), via ledger variants that post only the *difference* against the main schedule |
-| Wizard actions: dispose / sell / re-evaluate / pause / resume | Adds **`activate_depreciation`** (move a non-depreciating asset onto a depreciating account) |
-| `security/ir.model.access.csv` + `ir.rule` records | Single [`security/ir.access.csv`](../enterprise/account_asset/security/ir.access.csv) with `operation` + `domain` columns |
+> Verified against Odoo 20 source on 2026-09-24.
 
 ---
 
@@ -175,7 +153,7 @@ STEP 3: Paused  Closed      Closed
 | Closed | `close` | Fully depreciated, sold, or disposed |
 | Cancelled | `cancelled` | Posted entries reversed/cancelled, drafts deleted, `asset_paused_days` reset |
 
-`state` is defined on the variant ([account_asset_variant.py:59](../enterprise/account_asset/models/account_asset_variant.py#L59)) — **there is no `model` state any more**. The asset-level `state` is a computed mirror of the selected variant ([account_asset.py:108](../enterprise/account_asset/models/account_asset.py#L108)); `main_variant_state` ([:94](../enterprise/account_asset/models/account_asset.py#L94)) is what the list view colors on.
+`state` is defined on the variant ([account_asset_variant.py:59](../enterprise/account_asset/models/account_asset_variant.py#L59)): `draft` / `open` / `paused` / `close` / `cancelled` — templates never appear as a `state` value, since they are separate `account.depreciation.model` records. The asset-level `state` is a computed mirror of the selected variant ([account_asset.py:108](../enterprise/account_asset/models/account_asset.py#L108)); `main_variant_state` ([:94](../enterprise/account_asset/models/account_asset.py#L94)) is what the list view colors on.
 
 ### Confirm cascades across variants
 
@@ -255,7 +233,7 @@ Enforced by `_check_depreciations` ([account_asset_variant.py:332](../enterprise
 
 ### What Happens Every Night (Auto-Posting)
 
-`compute_depreciation_board()` ([account_asset_variant.py:463](../enterprise/account_asset/models/account_asset_variant.py#L463)) creates the moves and calls `_post()` on all of them for `open` variants. `account.move._post(soft=True)` posts anything dated up to today and, for future-dated moves, sets `auto_post = 'at_date'` instead of posting ([account_move.py:6239-6245](../addons/account/models/account_move.py#L6239)).
+`compute_depreciation_board()` ([account_asset_variant.py:463](../enterprise/account_asset/models/account_asset_variant.py#L463)) creates the moves and calls `_post()` on all of them for `open` variants. `account.move._post(soft=True)` posts anything dated up to today and, for future-dated moves, sets `auto_post = 'at_date'` instead of posting ([account_move.py:6244-6250](../addons/account/models/account_move.py#L6244)).
 
 The nightly job is **`account.ir_cron_auto_post_draft_entry`** ([service_cron.xml:3](../addons/account/data/service_cron.xml#L3)), scheduled daily at 02:00, running `model._autopost_draft_entries()`. `account_asset` ships **no cron of its own**.
 
@@ -354,7 +332,7 @@ delta = start_prorata × 30
 
 If your company runs more than one book — local GAAP plus IFRS, or a separate tax book — you can depreciate the same asset differently in each without duplicating the asset.
 
-A **ledger** in 20.0 is an `account.journal.group`, set on a journal via `journal_id.journal_group_id` (labelled **Ledger**, [account_journal.py:258](../addons/account/models/account_journal.py#L258)). `company.has_ledger` is True as soon as any journal group exists ([company.py:592](../addons/account/models/company.py#L592)); that's what drives `asset.is_multi_ledger_company`.
+A **ledger** in 20.0 is an `account.journal.group`, set on a journal via `journal_id.journal_group_id` (labelled **Ledger**, [account_journal.py:257](../addons/account/models/account_journal.py#L257)). `company.has_ledger` is True as soon as any journal group exists ([company.py:592](../addons/account/models/company.py#L592)); that's what drives `asset.is_multi_ledger_company`.
 
 ### How it works
 
@@ -381,7 +359,7 @@ A ledger sub-variant **cannot be disposed of on its own** — *"A ledger sub-ass
 
 ## Depreciation Models (Templates)
 
-`account.depreciation.model` ([account_depreciation_model.py:13](../enterprise/account_asset/models/account_depreciation_model.py#L13)) replaces the 19.0 "asset model". It inherits `mail.thread`, and `company_id` is **optional** — leave it empty and the model is available to every company.
+`account.depreciation.model` ([account_depreciation_model.py:13](../enterprise/account_asset/models/account_depreciation_model.py#L13)) is the template record — the depreciation configuration that one or many assets point to via `model_id`. It inherits `mail.thread`, and `company_id` is **optional** — leave it empty and the model is available to every company.
 
 **Menu:** Accounting → Configuration → **Accounting** → Depreciation Models ([account_depreciation_model_views.xml:189](../enterprise/account_asset/views/account_depreciation_model_views.xml#L189)).
 
@@ -433,7 +411,7 @@ Chart of Accounts → edit the account ([account.py:9](../enterprise/account_ass
 | `asset_expense_account_id` | Depreciation Expense account. Same requirement |
 | `ledger_depreciation_model_ids` | Extra models, one per ledger — each creates an additional ledger variant on every auto-created asset |
 | `asset_properties_definition` | `PropertiesDefinition`; the per-asset custom fields shown as `asset_properties` |
-| `can_create_asset` | Computed. **True only for `account_type == 'asset_fixed'`** — `asset_non_current` no longer qualifies |
+| `can_create_asset` | Computed. **True only for `account_type == 'asset_fixed'`** (not `asset_non_current`) |
 
 `_check_unique_ledger_depreciation` ([account.py:59](../enterprise/account_asset/models/account.py#L59)) rejects `ledger_depreciation_model_ids` entries whose journal has no ledger, and rejects two models pointing at the same ledger.
 
@@ -624,7 +602,7 @@ For creation-time imports there are two write-only helpers on `account.asset`, `
 
 `account.asset.group` ([account_asset_group.py:4](../enterprise/account_asset/models/account_asset_group.py#L4)) — a name, an optional company, and the assets pointing at it. Purely organizational; no effect on depreciation.
 
-> **20.0 note:** there is **no menu and no `ir.actions.act_window`** for asset groups in this module. You reach them only through the `asset_group_id` field on the asset form (quick-create from the dropdown), or via the group's own `action_open_linked_assets()`. The 19.0 "Accounting → Configuration → Asset Groups" path no longer exists.
+> **Note:** there is **no menu and no `ir.actions.act_window`** for asset groups in this module. You reach them only through the `asset_group_id` field on the asset form (quick-create from the dropdown), or via the group's own `action_open_linked_assets()`.
 
 `asset_group_id` is tracked and indexed ([account_asset.py:37](../enterprise/account_asset/models/account_asset.py#L37)), and it works as a groupby/filter in the asset list.
 
@@ -683,7 +661,7 @@ For creation-time imports there are two write-only helpers on `account.asset`, `
 → Only `draft` / `cancelled` assets with no posted entries can be deleted. Note that plain `unlink()` on an `account.asset` actually deletes the **selected variant** unless you pass `context = {'delete_asset': True}` ([account_asset.py:374](../enterprise/account_asset/models/account_asset.py#L374)).
 
 **"I changed the accumulated depreciation account and the board didn't follow"**
-→ 20.0 no longer propagates account or journal changes to draft entries. Only `analytic_distribution` propagates ([account_asset_variant.py:370](../enterprise/account_asset/models/account_asset_variant.py#L370)). The accounts come from the fixed-asset account, not from the asset.
+→ Only `analytic_distribution` propagates to draft entries ([account_asset_variant.py:370](../enterprise/account_asset/models/account_asset_variant.py#L370)); account or journal changes do not. The accounts come from the fixed-asset account, not from the asset.
 
 ---
 
@@ -788,7 +766,7 @@ Every asset move carries `asset_move_type` ([account_move.py:33](../enterprise/a
 
 | Field | Purpose |
 |---|---|
-| `asset_variant_id` | **Renamed from `asset_id` in 20.0.** `ondelete='cascade'` |
+| `asset_variant_id` | `account.move.asset_id` does not exist in 20.0; this is its replacement. `ondelete='cascade'` |
 | `depreciation_value` | Expense for this period; computed + inversable |
 | `asset_depreciated_value` / `asset_remaining_value` | Non-stored cumulative columns, computed together |
 | `asset_depreciation_beginning_date` | Start of the period this entry covers |

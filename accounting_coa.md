@@ -2,26 +2,7 @@
 
 > **Module:** `account` | **Path:** [`addons/account/`](../addons/account/)
 > **Odoo Apps category:** Accounting / Invoicing
-> **Verified against Odoo 20 source (2026-09-22).**
-
----
-
-## What changed in Odoo 20
-
-Two structural changes invalidate most 19.0 notes about the COA. Read this before anything else.
-
-| Area | Odoo 19 | Odoo 20 |
-|---|---|---|
-| **Hierarchy** | Separate `account.group` model, matched to accounts by **code prefix range** (`code_prefix_start` / `code_prefix_end`), with `group_id` computed on each account | **`account.group` is deleted.** Accounts are their own tree: `parent_id` / `parent_path` / `parent_ids` on `account.account`, with `_parent_store = True`. `group_id` and `_adapt_parent_account_group` are gone |
-| Why | — | Code ranges force the use of codes, can't be used as a postable intermediary account, and hide the real CoA shape. Commit [`c3313b336b9`](https://github.com/odoo/odoo/commit/c3313b336b9) "Replace account groups with account parent" |
-| Ordering | `code` | `_order = "code_path, account_type, name_path"` — new computed `code_path` / `name_path` fields concatenate the ancestor chain |
-| COA list | flat list + `account.root` search panel | indented hierarchy list (`js_class="account_hierarchy_list"`, [account_account_views.xml:100](../addons/account/views/account_account_views.xml#L100)); `account.root` search panel still exists |
-| **Inventory closing** | `account_stock_variation_id` / `account_stock_expense_id` and the whole closing flow lived in **`stock_account`** | Moved into **core `account`**: fields at [account_account.py:156](../addons/account/models/account_account.py#L156), company settings at [company.py:337](../addons/account/models/company.py#L337), closing action at [company.py:1278](../addons/account/models/company.py#L1278). `stock_account/models/account_account.py` no longer exists |
-| Account model | plain model | now inherits `mail.thread` + `mail.activity.mixin` — accounts are chatter-tracked |
-| New fields | — | `description` (shown in the account dropdown), `used`, `code_mapping_ids` (per-company code editor), `related_taxes_amount` |
-| Product accounts | `categ_id.property_account_*` checked on the **direct category only** | [`_get_category_account`](../addons/account/models/product.py#L150) walks the **whole category parent chain** before falling back to the company default, and the result is cached per transaction |
-
-**Migration note:** localizations carry the new shape in their CSVs — **37 `l10n_*` modules** (41 chart files) now ship a `parent_id` column in `account.account-*.csv`, including `l10n_ge`. `generic_coa` does **not** define any parents, so a generic US chart is flat until you build the tree yourself.
+> Verified against Odoo 20 source on 2026-09-24.
 
 ---
 
@@ -212,9 +193,8 @@ When you select a chart template (or Odoo auto-selects one for your country), th
    Post-processing hook: opening move, journal defaults, demo, translations.
 ```
 
-> There is no group-hierarchy pass any more. In Odoo 19, `_adapt_parent_account_group()` ran at the end to
-> rebuild `account.group.parent_id` from code prefixes. In Odoo 20 the parent links come straight from the
-> template's `parent_id` column (where the localization defines one) and are never recomputed.
+> The parent links come straight from the template's `parent_id` column (where the localization defines
+> one) and are never recomputed after loading — there is no group-hierarchy rebuild pass.
 
 ### 3. Currency
 
@@ -287,7 +267,10 @@ The model inherits `mail.thread` and `mail.activity.mixin` in Odoo 20 — most c
 | `opening_debit` | `Monetary` (computed/inverse) | "Opening Debit" | Balance from the company opening journal entry |
 | `opening_credit` | `Monetary` (computed/inverse) | "Opening Credit" | Balance from the company opening journal entry |
 | `current_balance` | `Float` (computed) | — | Sum of posted `account.move.line.balance` for the active company |
-| `account_stock_variation_id` / `account_stock_expense_id` | `Many2one` `account.account` | "Variation Account" / "Expense Account" | **Moved into core `account` in 20** (was `stock_account`). See [Inventory Variation](#inventory-variation-account-account_stock_variation_id) |
+| `account_stock_variation_id` / `account_stock_expense_id` | `Many2one` `account.account` | "Variation Account" / "Expense Account" | Lives in core `account`. See [Inventory Variation](#inventory-variation-account-account_stock_variation_id) |
+| `related_taxes_amount` | `Integer` (computed) | — | Count of taxes with a repartition line on this account; drives a smart-button badge on the account form ([account_account.py:148](../addons/account/models/account_account.py#L148)) |
+
+`code`, `placeholder_code`, `code_path`, `name_path`, `used`, `internal_group`, `root_id` and `company_currency_id` are non-stored but declare `compute_sql=`, which gives the ORM a SQL expression for the field — so they stay filterable, groupable and sortable (`_order = "code_path, account_type, name_path"` relies on this) without being stored columns ([account_account.py:44-132](../addons/account/models/account_account.py#L44-L132)).
 
 ---
 
@@ -524,7 +507,7 @@ Source: [`_compute_placeholder_code()`](../addons/account/models/account_account
 
 ## Account Hierarchy — Two Layers
 
-> **This replaces the three-layer `account.group` model of Odoo 19.** `account.group` no longer exists.
+> `account.group` does not exist in 20.0 — accounts form their own tree instead.
 
 ```
 LAYER 1: account.root (virtual, no DB table)
@@ -571,7 +554,7 @@ Accounts form their own tree. `_parent_store = True` on the model gives the usua
 | `code_path` | `Char` (computed) | Ancestor chain joined by **code**. Drives `_order` so the list view comes out in tree order |
 | `name_path` | `Char` (computed) | Ancestor chain joined by **name**. Used in `display_name` and in search |
 
-Source: [account_account.py:133](../addons/account/models/account_account.py#L133) (`parent_id`), [:141](../addons/account/models/account_account.py#L141)-[142](../addons/account/models/account_account.py#L142) (`parent_path` / `parent_ids`), [:49](../addons/account/models/account_account.py#L49)-[64](../addons/account/models/account_account.py#L64) (`code_path` / `name_path`)
+Source: [account_account.py:133](../addons/account/models/account_account.py#L133) (`parent_id`), [:141](../addons/account/models/account_account.py#L141)-[142](../addons/account/models/account_account.py#L142) (`parent_path` / `parent_ids`), [:49](../addons/account/models/account_account.py#L49)-[63](../addons/account/models/account_account.py#L63) (`code_path` / `name_path`)
 
 ### Where it shows up
 
@@ -593,7 +576,7 @@ There is no automatic resolution. You have three options:
 ### Constraints
 
 - A cycle is refused by the `parent_id` domain plus the standard `_parent_store` check.
-- `ondelete='restrict'`: deleting a parent with children raises. There is no re-parenting-on-delete behaviour (Odoo 19's `account.group.unlink()` re-parented orphans; that code is gone with the model).
+- `ondelete='restrict'`: deleting a parent with children raises. There is no re-parenting-on-delete behaviour: deleting a parent does not move its children elsewhere.
 - `check_company=True`: parent and child must be compatible company-wise.
 
 ---
@@ -884,13 +867,7 @@ def _get_category_account(self, field_name, company_field=None):
     return (self.company_id or self.env.company)[company_field] if company_field else ...
 ```
 
-Three differences from Odoo 19:
-
-| | Odoo 19 | Odoo 20 |
-|---|---|---|
-| Category lookup | direct category only | walks `categ.parent_id` to the root |
-| Result | recomputed on every call | cached per transaction in `env.cr.cache['account_product_accounts']` |
-| Keys returned | `income`, `expense` | `income`, `expense`, `stock_valuation`, `stock_variation` (+ `stock_journal` from `get_product_accounts()`) |
+The category lookup walks `categ.parent_id` up to the root before falling back to the company default, and the result is cached per transaction (`env.cr.cache['account_product_accounts']`). `_get_product_accounts()` returns `income`, `expense`, `stock_valuation` and `stock_variation`; `get_product_accounts()` adds `stock_journal`.
 
 ### Override hierarchy — when to use each level
 
@@ -950,7 +927,7 @@ All set criteria must match. Positions are evaluated in `sequence` order.
 
 If your company registers for VAT in another country (e.g., you're a UK company registered for French VAT), set `foreign_vat` on the fiscal position. This links the position to a second tax registration. Odoo can then load that country's taxes via `action_create_foreign_taxes()`.
 
-Source: [`partner.py:66`](../addons/account/models/partner.py#L73)
+Source: [`partner.py:73`](../addons/account/models/partner.py#L73)
 
 ### Where to configure
 
@@ -1073,11 +1050,9 @@ Source: [`_check_journal_consistency()`](../addons/account/models/account_accoun
 
 **What you tried:** Deleted the "Property, Plant & Equipment" header account while "Land" and "Construction" still pointed at it.
 
-**Why Odoo blocks it:** `parent_id` is declared `ondelete='restrict'`. Odoo 19's `account.group` re-parented orphans automatically when you deleted a group; account parents do not. Move the children first (clear or repoint their `parent_id`), then delete.
+**Why Odoo blocks it:** `parent_id` is declared `ondelete='restrict'` and account parents are never re-parented automatically. Move the children first (clear or repoint their `parent_id`), then delete.
 
 Source: [`parent_id`](../addons/account/models/account_account.py#L133)
-
-> The Odoo 19 mistake this replaces — overlapping `account.group` prefix ranges — no longer exists. There are no prefix ranges.
 
 ---
 
@@ -1132,7 +1107,7 @@ User posts opening entry -> accounting is live
 
 ## Inventory Variation Account (`account_stock_variation_id`)
 
-> **Moved into core `account` in Odoo 20.** In 19 these fields and the whole closing flow lived in `stock_account`; `stock_account/models/account_account.py` has been deleted. Core now owns the base implementation and `stock_account` only *overrides* it to use real stock valuation instead of a `qty_available × standard_price` approximation.
+> These fields and the whole closing flow live in core `account`. `stock_account` only *overrides* the base implementation to use real stock valuation instead of a `qty_available × standard_price` approximation.
 > Fields defined at: [`account/models/account_account.py:156`](../addons/account/models/account_account.py#L156)
 
 ### What it is
@@ -1319,16 +1294,11 @@ The cron `_cron_post_stock_valuation()` selects companies where `inventory_valua
 - `inventory_period = 'daily'` — runs every day
 - `inventory_period = 'monthly'` — added to the selection only on the last day of the month
 
-(Odoo 19 applied the `real_time` exclusion to the daily branch only; in 20 it applies to both.)
 It calls `action_close_stock_valuation(auto_post=True, raise_error_if_closed=False)`, which creates AND posts the closing entry automatically, skipping companies with nothing to close.
 
 ### In the generic COA
 
-| What | Odoo 19 | Odoo 20 |
-|---|---|---|
-| Account record | `6100 - Stock Variation`, type `expense` | **`110200 - Inventory Variation`, type `asset_current`** ([generic_coa.csv:33](../addons/account/data/template/account.account-generic_coa.csv#L33)) |
-| Valuation account | `1400` style | `1101 - Inventory Valuation`, type `asset_current` |
-| Wiring | company field | `@template('generic_coa', 'account.account')` sets `stock_valuation.account_stock_variation_id = stock_variation` ([template_generic_coa.py:65](../addons/account/models/template_generic_coa.py#L65)); the company's fallback is `account_stock_valuation_id = 'stock_valuation'` ([template_generic_coa.py:51](../addons/account/models/template_generic_coa.py#L51)) |
+The stock variation account is [`110200 - Inventory Variation`](../addons/account/data/template/account.account-generic_coa.csv#L33), type `asset_current`; the valuation account is `1101 - Inventory Valuation`, also `asset_current`. `@template('generic_coa', 'account.account')` wires `stock_valuation.account_stock_variation_id = stock_variation` ([template_generic_coa.py:65](../addons/account/models/template_generic_coa.py#L65)); the company's fallback is `account_stock_valuation_id = 'stock_valuation'` ([template_generic_coa.py:51](../addons/account/models/template_generic_coa.py#L51)).
 
 ### How the balance calculation works in code
 

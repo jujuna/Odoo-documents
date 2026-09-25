@@ -1,1851 +1,695 @@
-# Inventory (Stock)
+# Inventory (Stock) and Sales Deliveries
 
 > **Module:** `stock` + `sale_stock` | **Path:** [`addons/stock/`](../addons/stock/) + [`addons/sale_stock/`](../addons/sale_stock/)
-> **Odoo Apps category:** Inventory
+> Verified against Odoo 20 source on 2026-09-24.
 
-## What It Does
+## What It Does & Why It Exists
 
-Manages physical stock movement between locations. Tracks quantities per location using quants, reserves stock for demand, and validates transfers that physically move goods. Integrates with Sales to generate deliveries automatically when a sale order is confirmed.
+Inventory records where physical goods are (locations inside warehouses), how many are there (quants) and how they move (transfers made of stock moves). Demand never creates a transfer directly. A confirmed sale, a reordering rule or a manufacturing need becomes a **procurement** ("10 units of X are needed at location Y"), and configurable **routes and rules** decide which document answers it: a transfer, a purchase order or a manufacturing order. Warehouse workers then reserve, pick, pack and validate; validation is the only step that changes on-hand quantities. `sale_stock` connects Sales: confirming a sale order launches the procurements that create the delivery, and delivered quantities flow back to the order lines for invoicing and delivery status. Warehouse managers configure steps, routes and operation types; salespeople see availability and delivery progress. Accounting for stock (valuation, COGS) is covered in [`stock_valuation.md`](stock_valuation.md).
 
 ---
 
-## Dependencies
+## The Big Picture — How It Works
 
-### Requires
-| Module | Why |
-|---|---|
-| `stock` | Core inventory engine — locations, pickings, moves, quants, rules |
-| `sale` | Sale orders that trigger stock demand |
-| `sale_stock` | Bridges `sale.order` → `stock.picking` via procurement rules |
+```
+Demand                        Procurement engine                     Transfer life                         Result
+SO confirmed ─────┐
+Reordering rule ──┼─► stock.rule.run(procurement) ─► rule found ─► stock.move ─► transfer ─► Reserve ─► Validate ─► quants move
+MTO chain, MO, ───┘   routes + location lookup        │              (Waiting / Ready)                  │
+Replenish button                                      ├─ Buy ──────► purchase order line                ├─► push rule: next step
+                                                      └─ Manufacture ► manufacturing order              └─► backorder for the rest
+```
 
-### Optional Integrations
-| Module | What it enables |
-|---|---|
-| `stock_account` | Creates COGS journal entries when deliveries are validated |
-| `purchase_stock` | Receipts from purchase orders |
-| `mrp` | Consumption moves for production orders |
+1. **A need appears.** Confirming a sale order builds one procurement per goods line ([`sale_order_line.py:375`](../addons/sale_stock/models/sale_order_line.py#L375)). Reordering rules, the Replenish wizard, MTO chains and manufacturing create procurements the same way.
+2. **Odoo finds a rule.** [`run()`](../addons/stock/models/stock_rule.py#L426) looks for a rule that delivers to the procurement's location, checking route sources in priority order and walking up the location tree. No rule means an error: "No rule has been found to replenish ...".
+3. **The rule's action creates the document.** A pull rule creates a stock move (always as superuser, because the salesperson who confirms may have no stock rights, [`stock_rule.py:262`](../addons/stock/models/stock_rule.py#L262)). A Buy rule adds a purchase order line; a Manufacture rule creates a manufacturing order.
+4. **Moves are grouped into transfers** (`stock.picking`) by reference (the sale order), locations, operation type and priority ([`stock_move.py:1592`](../addons/stock/models/stock_move.py#L1592)).
+5. **Reservation** ties on-hand quants to the move and writes move lines that say which lot, package and shelf to take ([`stock_move.py:2135`](../addons/stock/models/stock_move.py#L2135)).
+6. **Validation** moves the quantities between quants ([`stock_move.py:2350`](../addons/stock/models/stock_move.py#L2350)), applies push rules for the next step, reserves waiting downstream moves and creates a backorder for what was not processed.
+7. **Sales feedback.** `sale_stock` recomputes delivered quantities and the delivery status from done moves.
 
-### Provides To
-| Consumer | What they use |
-|---|---|
-| `account_move` | `stock.move` for COGS and inventory valuation |
-| `sale.order.line` | `qty_delivered` computed from done moves |
+### Key Decision Points
+
+- **Steps per warehouse:** receive in 1, 2 or 3 steps; deliver in 1, 2 or 3 steps. More steps means more transfers per order and staging locations.
+- **Supply method per rule:** take from stock, trigger another rule (make to order), or take from stock and trigger another rule only for the shortfall.
+- **Reservation method per operation type:** at confirmation, manually, or a number of days before the scheduled date.
+- **Shipping policy:** ship as soon as possible with backorders, or only when everything is ready.
+- **Backorder policy per operation type:** ask, always, or never (cancel the rest).
+- **Tracking per product:** none, by quantity, by lots, by serial numbers.
+- **Removal strategy** per product category or location: FIFO, LIFO, FEFO, closest location, least packages.
+
+---
+
+## When to Use It (and When Not To)
+
+### This module is for:
+- Companies that hold physical goods and need on-hand, reserved and forecasted quantities per location.
+- Sales teams that must promise dates and see delivery progress on the order.
+- Warehouses with staging areas (input, quality control, packing, output) or several warehouses resupplying each other.
+- Traceability requirements: lots, serial numbers, expiration dates, product recalls.
+
+### Use something else when:
+- You sell only services: `sale` alone delivers and invoices services; nothing here applies.
+- You need accounting entries for stock: that is `stock_account` / `account`, see [`stock_valuation.md`](stock_valuation.md).
+- You need production planning: `mrp` builds on these moves, see [`mrp.md`](mrp.md).
+- You only need a forecast explanation for one product: see [`inventory_forecast_report.md`](inventory_forecast_report.md).
+
+---
+
+## Real-World Scenarios
+
+### Scenario 1: Small shop, partial stock
+**Situation:** A one-step warehouse sells 10 chairs; 6 are on the shelf.
+**What they do:** The salesperson confirms the order. The Delivery Orders operation reserves at confirmation, so WH/OUT is Ready with 6 reserved. The worker validates and answers "Create Backorder?" with Create Backorder.
+**What happens:** 6 chairs leave WH/Stock; the order shows Partially Delivered; a backorder WH/OUT for 4 waits. When the next receipt is validated, Odoo reserves the backorder automatically.
+
+### Scenario 2: Distributor with staging areas
+**Situation:** A distributor receives in 3 steps (unload, quality check, store) and delivers in 2 (pick, ship).
+**What they do:** Warehouse → Warehouse Configuration: Incoming Shipments = 3 steps, Outgoing Shipments = 2 steps (needs Multi-Step Routes).
+**What happens:** A purchase creates only WH/IN. Validating WH/IN creates WH/QC; validating WH/QC creates WH/STOR. A sale creates only WH/PICK; validating WH/PICK creates WH/OUT. Each later step is created by a push rule when the previous one is done.
+
+### Scenario 3: Buy exactly what was sold
+**Situation:** Custom sofas are never stocked; each sale must trigger a purchase.
+**What they do:** Enable Replenish on Order (MTO), tick Replenish on Order (MTO) on the product, set a vendor on its Purchase tab.
+**What happens:** Confirming the sale creates a delivery in Waiting Another Operation and an RFQ for the vendor. With the vendor's default Group RFQ = On Order, each sale order gets its own RFQ; Daily, Weekly or Always group needs into shared RFQs. Receiving that purchase reserves the delivery at once.
+
+### Scenario 4: Customer sends goods back
+**Situation:** A customer returns 2 of 5 delivered items.
+**What they do:** Open the done delivery → Return. The return transfer opens in draft with quantity 0 on every line; enter 2 (or click Return All for everything), then validate.
+**What happens:** 2 units come back to stock; the sale order line's delivered quantity drops by 2, so a credit note can be issued. With Allow Spontaneous Returns, the customer can also request the return and print a return label from the portal; the warehouse then creates the return transfer when the parcel arrives.
 
 ---
 
 ## Core Concepts
 
-### Locations
+### Locations and warehouses
 
-Every unit of stock lives in a `stock.location`. Source: [`addons/stock/models/stock_location.py:32`](../addons/stock/models/stock_location.py#L32)
+Every quantity lives in a `stock.location` ([`stock_location.py:33`](../addons/stock/models/stock_location.py#L33)):
 
-| Usage | Meaning | Examples |
+| Type (`usage`) | UI label | Used for |
 |---|---|---|
-| `internal` | Physical location inside warehouse | WH/Stock, WH/Output, WH/Input |
-| `customer` | Virtual destination for outgoing | Customers (virtual) |
-| `supplier` | Virtual source for incoming | Vendors (virtual) |
-| `view` | Container node, no products stored | WH/ (root view) |
-| `transit` | Inter-company/inter-warehouse buffer | Transit location |
-| `inventory` | Counterpart for inventory adjustments | Inventory Adjustments |
-| `production` | Counterpart for manufacturing consumption | Production |
+| `internal` | Internal | Physical storage: WH/Stock, shelves, WH/Input, WH/Output |
+| `view` | Virtual | Folder in the tree (the warehouse root); cannot hold stock |
+| `supplier` | Vendor | Virtual source of receipts |
+| `customer` | Customer | Virtual destination of deliveries |
+| `inventory` | Inventory Loss | Counterpart of inventory adjustments and scraps |
+| `production` | Production | Counterpart of manufacturing consumption and output |
+| `transit` | Transit | Goods travelling between warehouses or companies |
 
-Every warehouse has its own sub-tree of locations under a `view` root: `WH/`, `WH/Stock`, `WH/Input`, `WH/Quality Control`, `WH/Output`, `WH/Packing Zone`.
+Moves from Vendor, Customer, Inventory Loss or Production locations skip reservation, which is why receipts are Ready as soon as they are confirmed ([`stock_location.py:407`](../addons/stock/models/stock_location.py#L407)).
 
-### Quants — The Source of Truth for Stock
+Creating a warehouse ([`stock_warehouse.py:114`](../addons/stock/models/stock_warehouse.py#L114)) builds:
 
-`stock.quant` is the table that stores actual on-hand quantities. Source: [`addons/stock/models/stock_quant.py:19`](../addons/stock/models/stock_quant.py#L19)
+- a view location named after the short code, with **Stock**, **Input**, **Quality Control**, **Output** and **Packing Zone**; the last four stay archived until the chosen steps need them ([`stock_warehouse.py:610`](../addons/stock/models/stock_warehouse.py#L610));
+- eight operation types: Receipts (WH/IN), Delivery Orders (WH/OUT), Pick (WH/PICK), Pack (WH/PACK), Quality Control (WH/QC), Storage (WH/STOR), Internal Transfers (WH/INT), Cross Dock (WH/XD), activated or archived to match the steps ([`stock_warehouse.py:960`](../addons/stock/models/stock_warehouse.py#L960));
+- the receipt and delivery routes and the warehouse's MTO rule.
 
-One quant row = one unique combination of `(product, location, lot, package, owner)`.
+Each company has its own Inventory adjustment, Production and inter-warehouse transit locations ([`res_company.py:178`](../addons/stock/models/res_company.py#L178)); see Scrap for the scrap location. A second active warehouse in a company switches on Storage Locations and multi-warehouse mode for all users ([`stock_warehouse.py:308`](../addons/stock/models/stock_warehouse.py#L308)); there is no separate multi-warehouse setting.
 
-| Field | Meaning |
-|---|---|
-| `quantity` | Physical units on hand (read-only, updated by move validation) |
-| `reserved_quantity` | Units committed to pending outgoing moves |
-| `available_quantity` | `quantity - reserved_quantity` — what can still be promised |
+### Products: what gets tracked
 
-**Key rule:** `available_quantity` going negative is allowed in some configurations but signals a stock problem.
+- Only **goods** (`type = 'consu'`) create stock moves; services never do ([`stock_rule.py:422`](../addons/stock/models/stock_rule.py#L422)).
+- **Track Inventory** (`is_storable`, defined on `product.template` in the `product` module, [`product_template.py:127`](../addons/product/models/product_template.py#L127)) decides whether quants exist. Goods without it still get delivery moves, but those moves skip reservation and the product has no on-hand quantity ([`stock_move.py:2047`](../addons/stock/models/stock_move.py#L2047)).
+- The **Tracking** selector on the product form (`store_by`: None / By Quantity / By Lots / By Unique Serial Number, [`product.py:842`](../addons/stock/models/product.py#L842)) writes both `is_storable` and `tracking` ([`product.py:1054`](../addons/stock/models/product.py#L1054)). `tracking` itself holds only `lot`, `serial` or empty ([`product.py:835`](../addons/stock/models/product.py#L835)).
 
-Quants are **never created manually** by users. They are created/updated automatically when `stock.move` records are validated.
+### Quants
 
----
+A `stock.quant` is one row per (product, location, lot, package, owner). `quantity` is on hand, `reserved_quantity` is promised to transfers, `available_quantity` is the difference ([`stock_quant.py:80`](../addons/stock/models/stock_quant.py#L80)). Only done moves change `quantity`. The Physical Inventory screen stores a counted quantity on the quant, and Apply creates the adjustment move ([`stock_quant.py:1028`](../addons/stock/models/stock_quant.py#L1028)). Negative quants are allowed: validating more than is on hand drives the source quant below zero, and no setting blocks it.
 
-## Warehouse Configuration
+Product-level quantities ([`product.py:156`](../addons/stock/models/product.py#L156)):
 
-Source: [`addons/stock/models/stock_warehouse.py`](../addons/stock/models/stock_warehouse.py)
-
-### What Gets Created With a Warehouse
-
-When a warehouse is created ([`stock_warehouse.py:113`](../addons/stock/models/stock_warehouse.py#L113)):
-1. A `view` location tree is built under `WH/`
-2. Picking types (operation types) are created: Receipts, Delivery Orders, Internal Transfers, Pick, Pack
-3. Routes are created with stock rules defining how products flow
-
-### Delivery Steps (Outgoing Shipments)
-
-Field: `delivery_steps` on `stock.warehouse`. UI label: **"Outgoing Shipments"** (radio buttons).
-Source: [`addons/stock/models/stock_warehouse.py:62`](../addons/stock/models/stock_warehouse.py#L62)
-
-> **Visibility:** The "Warehouse Configuration" tab appears when either **Storage Locations** (`stock.group_adv_location`) or **Multi-Warehouses** (`stock.group_stock_multi_warehouses`) is enabled. However, the `reception_steps` and `delivery_steps` fields themselves are inside a `groups="stock.group_adv_location"` sub-group — they only appear when **Storage Locations** is enabled. Source: [`stock_warehouse_views.xml:35`](../addons/stock/views/stock_warehouse_views.xml#L35), [`stock_warehouse_views.xml:38`](../addons/stock/views/stock_warehouse_views.xml#L38)
-
----
-
-#### `ship_only` — Ship only (1 step) — **default**
-
-**When to use:** Small warehouse. One person picks from shelf and loads the truck at the same time. No intermediate staging area needed.
-
-**What Odoo creates:** A single **Delivery Order** (operation type: "Delivery Orders", sequence prefix `WH/OUT`).
-
-**Flow:**
-```
-Customer orders product A
-→ SO confirmed
-→ 1 picking created: WH/OUT/00001  (WH/Stock → Customers)
-→ Warehouse worker picks product from shelf and marks done
-→ Picking validated → product leaves stock
-```
-
-**Active operation types:** Delivery Orders (`out_type_id`) only. Pick and Pack types are archived. Source: [`stock_warehouse.py:969`](../addons/stock/models/stock_warehouse.py#L969)
-
----
-
-#### `pick_ship` — Pick + Ship (2 steps)
-
-**When to use:** Medium/large warehouse. Picking team is separate from shipping team. Pickers collect goods from shelves to an Output staging zone; a different person (or team) then loads and ships from that zone.
-
-**What Odoo creates:** Two pickings created in stages (not simultaneously):
-1. **Pick** order (type: "Pick", prefix `WH/PICK`): WH/Stock → WH/Output — created at SO confirmation via pull rule
-2. **Delivery Order** (type: "Delivery Orders", prefix `WH/OUT`): WH/Output → Customers — created when PICK is validated, via push rule
-
-Source: [`test_sale_stock.py:1085`](../addons/sale_stock/tests/test_sale_stock.py#L1085)
-
-**Flow:**
-```
-SO confirmed
-→ 1 picking created:
-    WH/PICK/00001  (state=assigned if stock available)
-→ Picker validates WH/PICK: products move to WH/Output
-→ push rule fires (_push_apply in _action_done): WH/OUT/00001 created (state=assigned)
-→ Shipper validates WH/OUT: products leave for customer
-```
-
-**Active operation types:** Pick (`pick_type_id`) + Delivery Orders (`out_type_id`). Pack type is archived. Source: [`stock_warehouse.py:969`](../addons/stock/models/stock_warehouse.py#L969)
-
----
-
-#### `pick_pack_ship` — Pick + Pack + Ship (3 steps)
-
-**When to use:** E-commerce or B2C warehouse. Orders contain multiple products that need to be assembled into a box before shipping. Three distinct roles: picker, packer, shipper.
-
-**What Odoo creates:** Three pickings created in stages (one per validated step):
-1. **Pick** order (type: "Pick", prefix `WH/PICK`): WH/Stock → WH/Packing Zone — created at SO confirmation via pull rule
-2. **Pack** order (type: "Pack", prefix `WH/PACK`): WH/Packing Zone → WH/Output — created when PICK is validated, via push rule
-3. **Delivery Order** (type: "Delivery Orders", prefix `WH/OUT`): WH/Output → Customers — created when PACK is validated, via push rule
-
-Source: [`test_sale_stock.py:1840`](../addons/sale_stock/tests/test_sale_stock.py#L1840)
-
-**Flow:**
-```
-SO confirmed
-→ 1 picking created:
-    WH/PICK/00001  (state=assigned)
-→ Picker validates WH/PICK: products move to Packing Zone
-→ push rule fires: WH/PACK/00001 created (state=assigned)
-→ Packer boxes the products, validates WH/PACK: products move to Output
-→ push rule fires: WH/OUT/00001 created (state=assigned)
-→ Shipper validates WH/OUT: products dispatched to customer
-```
-
-**Active operation types:** Pick + Pack + Delivery Orders. All three are active. Source: [`stock_warehouse.py:974`](../addons/stock/models/stock_warehouse.py#L974)
-
----
-
-**Route rules generated per step** ([`stock_warehouse.py:779`](../addons/stock/models/stock_warehouse.py#L779)):
-```
-ship_only:      [Stock → Customer   (pull, Delivery Orders)]
-pick_ship:      [Stock → Output     (pull, Pick)]
-                [Output → Customer  (push, Delivery Orders)]
-pick_pack_ship: [Stock → Packing    (pull, Pick)]
-                [Packing → Output   (push, Pack)]
-                [Output → Customer  (push, Delivery Orders)]
-```
-
----
-
-#### Cross-Docking (`xdock_type_id`)
-
-Every warehouse has a `xdock_type_id` picking type (Cross Dock Type). Cross-docking bypasses the stock storage location entirely — goods flow directly from receiving to outbound staging without being put away.
-
-Source: [`stock_warehouse.py:80`](../addons/stock/models/stock_warehouse.py#L80)
-
-```
-Traditional flow:    Vendor → WH/Input → WH/Stock → WH/Output → Customer
-Cross-dock flow:     Vendor → WH/Input → WH/Output → Customer
-```
-
-The cross-dock route uses a pull rule from Input to Output (with `xdock_type_id` as operation type) that fires when an outgoing demand is already waiting. Products with the cross-dock route assigned bypass storage entirely. Common for: perishable goods, high-turnover items, or drop-ship variants.
-
----
-
-### Reception Steps (Incoming Shipments)
-
-Field: `reception_steps` on `stock.warehouse`. UI label: **"Incoming Shipments"** (radio buttons).
-Same visibility requirement as Delivery Steps.
-Source: [`addons/stock/models/stock_warehouse.py:56`](../addons/stock/models/stock_warehouse.py#L56)
-
----
-
-#### `one_step` — Receive and store (1 step) — **default**
-
-**When to use:** Small warehouse. Goods arrive and go straight to stock shelf immediately.
-
-**What Odoo creates:** A single **Receipt** (operation type: "Receipts", prefix `WH/IN`).
-
-**Flow:**
-```
-Purchase order confirmed (or receipt created manually)
-→ 1 picking created: WH/IN/00001  (Vendors → WH/Stock)
-→ Worker receives goods, fills done quantities
-→ Receipt validated → quants created/updated in WH/Stock
-```
-
-**Active operation types:** Receipts (`in_type_id`) only. Quality Control and Storage types are archived. Source: [`stock_warehouse.py:983`](../addons/stock/models/stock_warehouse.py#L983)
-
----
-
-#### `two_steps` — Receive then store (2 steps)
-
-**When to use:** You need to count and verify goods before putting them in their final bin. Goods land in an Input area first; a separate step moves them to the actual stock location.
-
-**What Odoo creates:** Two pickings created in stages:
-1. **Receipt** (type: "Receipts", prefix `WH/IN`): Vendors → WH/Input — created at PO confirmation via pull rule
-2. **Storage** (type: "Storage", prefix `WH/STOR`): WH/Input → WH/Stock — created when Receipt is validated, via push rule
-
-**Flow:**
-```
-PO confirmed
-→ 1 picking created:
-    WH/IN/00001   (Vendors → WH/Input)
-→ Worker receives truck, validates WH/IN: products land in WH/Input
-→ push rule fires (_push_apply in _action_done): WH/STOR/00001 created (state=assigned)
-→ Worker moves goods to correct shelf, validates WH/STOR: products enter WH/Stock
-```
-
-**Active operation types:** Receipts (`in_type_id`) + Storage (`store_type_id`). QC type archived. Source: [`stock_warehouse.py:983`](../addons/stock/models/stock_warehouse.py#L983)
-
----
-
-#### `three_steps` — Receive, quality control, then store (3 steps)
-
-**When to use:** Industries where incoming goods must pass a quality check before entering sellable stock (food, pharma, electronics). A QC team inspects goods in an isolated zone before approving them.
-
-**What Odoo creates:** Three chained pickings:
-1. **Receipt** (type: "Receipts", prefix `WH/IN`): Vendors → WH/Input
-2. **Quality Control** (type: "Quality Control", prefix `WH/QC`): WH/Input → WH/Quality Control
-3. **Storage** (type: "Storage", prefix `WH/STOR`): WH/Quality Control → WH/Stock
-
-**Flow:**
-```
-PO confirmed
-→ 3 pickings created:
-    WH/IN/00001  (Vendors → WH/Input)
-    WH/QC/00001  (WH/Input → WH/QC zone, state=waiting)
-    WH/STOR/00001 (WH/QC → WH/Stock, state=waiting)
-→ Receiving team validates WH/IN
-→ WH/QC becomes assigned; QC team inspects goods
-→ QC team validates WH/QC (or triggers scrap if goods fail)
-→ WH/STOR becomes assigned; warehouse worker puts goods on shelf
-→ WH/STOR validated: goods are now in WH/Stock and available
-```
-
-**Active operation types:** Receipts + Quality Control (`qc_type_id`) + Storage. All three active. Source: [`stock_warehouse.py:979`](../addons/stock/models/stock_warehouse.py#L979)
-
----
-
-### Putaway Rules
-
-Source: [`stock_location.py:296`](../addons/stock/models/stock_location.py#L296) (`_get_putaway_strategy`)
-
-Putaway rules tell Odoo **where inside a destination location** to put incoming goods. They fire when a move line's destination is set (e.g., on receipt validation). If no rule matches, goods land at the root destination location.
-
-#### Rule matching
-
-A rule is eligible if ALL of the following match (or the field is empty = "any"):
-- `product_id` matches the incoming product
-- `category_id` matches the product's category (or any parent category)
-- `package_type_ids` contains the package type on the incoming package/packaging
-
-#### Rule priority sort (highest wins)
-
-When multiple rules match, the most specific wins:
-
-```python
-putaway_rules.sorted(lambda rule: (
-    bool(rule.package_type_ids),              # 1st: package-specific rules
-    bool(rule.product_id),                    # 2nd: product-specific rules
-    bool(rule.category_id == categs[:1]),     # 3rd: exact category match (not parent)
-    bool(rule.category_id),                   # 4th: parent category match
-), reverse=True)
-```
-
-Source: [`stock_location.py:323`](../addons/stock/models/stock_location.py#L323)
-
-**Example:** iPhone 15 arriving on a pallet — if a product-specific rule exists (iPhone 15 → High-Security), it wins over a package-specific rule (Pallet → Bulk), because `bool(product_id)` ranks higher.
-
-### Routes & Rules
-
-Source: [`addons/stock/models/stock_rule.py`](../addons/stock/models/stock_rule.py) | [`addons/stock/models/stock_location.py:516`](../addons/stock/models/stock_location.py#L516)
-
-#### Purpose — Why Routes and Rules Exist
-
-When Odoo needs to fulfil a demand — a sale order line, a reorder rule, an MTO trigger — it has no hardcoded knowledge of what to do. It doesn't know whether to create a delivery, trigger a purchase, start manufacturing, or transfer from another warehouse. **Routes and rules are the answer to that question.**
-
-A **route** is a named policy: "here is how a product travels from origin to destination."
-A **rule** is one step in that policy: "if product X is needed at location B, create a move from location A using operation type Z."
-
-Together they decouple business logic from code. You configure routes and rules; Odoo evaluates them at runtime.
-
----
-
-**The core question routes answer:**
-
-> "A demand exists for product X at location Y. What do I do?"
-
-The answer depends on which routes are configured on the product, its category, or the warehouse. Examples:
-
-| Situation | Route | What fires |
+| Field | UI | Meaning |
 |---|---|---|
-| Normal sale, goods in stock | WH: Deliver in 1 step (default) | Pull rule → Delivery Order from WH/Stock → Customers |
-| Sale, 2-step warehouse | WH: Deliver in 2 steps | Pull rule → Pick (Stock→Output) + chained Delivery Order |
-| Product to be bought, ordered per demand | Buy + Replenish on Order (MTO) | MTO pull rule (make_to_order) fires delivery move → second run() for WH/Stock → Buy rule (`action=buy`) → `_run_buy()` → PO created |
-| Product to be bought, replenished via min/max rule | Buy (+ orderpoint) | Orderpoint calls run() for WH/Stock → Buy rule → `_run_buy()` → PO created |
-| Product not stocked, ordered per demand | Replenish on Order (MTO) | `make_to_order` rule → upstream procurement before delivery (needs Buy or Manufacture route to complete the chain) |
-| Product made in-house | Manufacture | Pull rule → Production Order (via `_run_manufacture()`) |
-| WH needs stock from WH2 | WH: Supply from WH2 | Pull rules → Transfer WH2/Stock → Transit → WH/Stock |
+| `qty_available` | On Hand | Sum of quants in the context locations |
+| `free_qty` | Free | On hand minus reserved |
+| `incoming_qty` / `outgoing_qty` | Incoming / Outgoing | Open moves into / out of the context locations |
+| `virtual_available` | Forecasted | On hand + incoming − outgoing |
 
----
+With Expiration Dates, Free and Forecasted exclude unreserved quantities whose removal date has passed; On Hand still counts them ([`product_product.py:11`](../addons/product_expiry/models/product_product.py#L11)).
 
-**When to assign routes:**
+### Operation types
 
-| Where | Effect |
-|---|---|
-| Product → Inventory tab → Routes | Only this product follows this route |
-| Product Category → Routes | All products in the category follow this route |
-| Warehouse → Route checkbox | Default route for all products through that warehouse |
-| SO/PO line → Route (via `values['route_ids']`) | Override for one specific document line |
+An operation type (`stock.picking.type`) is the template every transfer follows. The fields that change behaviour:
 
-If no route is assigned, Odoo falls back to warehouse routes. If nothing matches even after walking up the location hierarchy, procurement fails with "No rule found".
-
----
-
-**When rules are created:**
-
-Rules are almost never created manually by users. They are created automatically:
-- When a warehouse is created → delivery/reception route rules are created automatically
-- When `delivery_steps` or `reception_steps` changes → old rules archived, new ones created
-- When `resupply_wh_ids` is ticked → inter-warehouse route rules created
-- When `buy_to_resupply` is enabled → buy rule created on the "Buy" route
-
-The only cases where you create rules manually are custom routing logic not covered by warehouse configuration.
-
----
-
-A `stock.route` is a named path (e.g., "WH: Deliver in 2 steps"). A `stock.rule` is one hop in that path.
-
----
-
-#### `stock.route` — Named Path
-> [`addons/stock/models/stock_location.py:516`](../addons/stock/models/stock_location.py#L516)
-
-| Field | Meaning |
-|---|---|
-| `rule_ids` | Ordered list of `stock.rule` records that make up this route |
-| `sequence` | Priority order — lower sequence = higher priority |
-| `product_selectable` | Can be set on a product's Inventory tab |
-| `product_categ_selectable` | Can be set on a product category |
-| `warehouse_selectable` | Used as the default route for a warehouse |
-| `package_type_selectable` | Can be set on a package type |
-| `supplied_wh_id` | For inter-warehouse routes: the destination warehouse |
-| `supplier_wh_id` | For inter-warehouse routes: the source warehouse |
-
-> **Routes section visibility on product form:** The "Operations" group (containing `route_ids`) is controlled by the computed field `has_available_route_ids` on `product.template`. It returns `True` only when `stock.route.search_count([('product_selectable', '=', True)]) > 0`. If no route has `product_selectable=True`, the Routes section is completely hidden — even if routes exist and Multi-Step Routes is enabled. Source: [`product.py:907`](../addons/stock/models/product.py#L907), [`product_views.xml:208`](../addons/stock/views/product_views.xml#L208)
-
-> **`stock_route_product` uses template ID:** The relation table stores `product_template.id`, not `product.product.id`. When querying route assignments by product variant, join via `product_template` — querying `WHERE product_id = <variant_id>` will return no rows even if the route is correctly assigned.
-
-When a route is archived, all its rules are also archived. Source: [`stock_location.py:569`](../addons/stock/models/stock_location.py#L569)
-
-#### Route resolution priority in `_search_rule_for_warehouses()`
-
-When looking up rules for a procurement, Odoo collects valid route IDs in this priority order:
-
-1. **`route_ids` from the procurement** (e.g., from the SO line's explicit route override)
-2. **`packaging_uom_id.package_type_id.route_ids`** — routes on the packaging's package type (often overlooked)
-3. **Product routes** (`product.route_ids`) + **product category routes** (`categ_id.total_route_ids`)
-4. **Warehouse routes** (filtered by `warehouse_id` in domain)
-
-Source: [`stock_rule.py:506`](../addons/stock/models/stock_rule.py#L506)
-
-Package type routes (step 2) allow pallets, refrigerated packages, or hazmat packages to automatically follow a different route than the product's default — without any SO line configuration.
-
----
-
-#### `stock.rule` — One Hop in a Route
-> [`addons/stock/models/stock_rule.py:42`](../addons/stock/models/stock_rule.py#L42)
-
-| Field | Type | Meaning |
+| Field (UI) | Values | Effect |
 |---|---|---|
-| `action` | Selection | `pull`, `push`, `pull_push` — controls when the rule fires |
-| `procure_method` | Selection | `make_to_stock`, `make_to_order`, `mts_else_mto` |
-| `auto` | Selection | `manual` (creates new move) or `transparent` (rewrites destination on existing move) |
-| `location_src_id` | Many2one | Where to take stock from |
-| `location_dest_id` | Many2one | Where to deliver stock |
-| `location_dest_from_rule` | Boolean | If True, move destination = rule's `location_dest_id`; if False, destination comes from the picking type |
-| `picking_type_id` | Many2one | Which operation type the created move uses |
-| `warehouse_id` | Many2one | Warehouse scope for this rule |
-| `delay` | Integer | Days subtracted from planned date when creating the move |
-| `propagate_cancel` | Boolean | If True, cancelling this move cancels the next move in chain |
-| `propagate_carrier` | Boolean | Propagates shipping carrier down the chain |
-| `push_domain` | Char | Optional domain filter — push rule only fires if the move matches |
-| `route_id` | Many2one | Parent route (cascade delete) |
-| `sequence` | Integer | Within a route, lower = evaluated first |
+| Type of Operation (`code`) | Receipt / Delivery / Internal Transfer | Dashboard grouping; validating a Receipt or Internal Transfer re-reserves waiting moves |
+| Reservation Method | At Confirmation / Manually / Before scheduled date | When stock is reserved ([`stock_picking_type.py:98`](../addons/stock/models/stock_picking_type.py#L98)) |
+| Create Backorder | Ask / Always / Never | What happens to unprocessed quantities ([`stock_picking_type.py:193`](../addons/stock/models/stock_picking_type.py#L193)) |
+| Shipping Policy (`move_type`) | As soon as possible, with back orders / When all products are ready | Ready when anything vs everything is reserved; default comes from the company ([`stock_picking_type.py:218`](../addons/stock/models/stock_picking_type.py#L218)) |
+| Create New / Use Existing Lots/Serial Numbers | booleans | How lots are entered on this operation ([`stock_picking_type.py:87`](../addons/stock/models/stock_picking_type.py#L87)) |
+| Operation Type for Returns | operation type | Type used by the Return button ([`stock_picking_type.py:77`](../addons/stock/models/stock_picking_type.py#L77)) |
+| Location for allocation / Show Allocation | location / boolean | Where allocated receipts go; open the allocation report on validation ([`stock_picking_type.py:68`](../addons/stock/models/stock_picking_type.py#L68)) |
+| Automatic Batches + grouping options | booleans | Auto-batching and waving (see Batch, Wave and Cluster Transfers) |
+| Move Entire Packages | boolean | Barcode shows packages instead of their content |
+
+### Transfers, moves and move lines
+
+- **Transfer** (`stock.picking`): one document per operation. States Draft, Waiting Another Operation, Waiting, Ready, Done, Cancelled, computed from its moves ([`stock_picking.py:55`](../addons/stock/models/stock_picking.py#L55), [`:331`](../addons/stock/models/stock_picking.py#L331)). With "As soon as possible", one reserved move is enough for Ready.
+- **Move** (`stock.move`): one product line. Demand (`product_uom_qty`) in `uom_id`, `quantity` (reserved or processed) and `picked`. States New, Waiting Another Move, Waiting, Partially Available, Available, Done, Cancelled ([`stock_move.py:107`](../addons/stock/models/stock_move.py#L107)). Chains use `move_orig_ids` / `move_dest_ids`.
+- **Forecasted location** (`forecasted_location_id`, [`stock_move.py:86`](../addons/stock/models/stock_move.py#L86)): where the chain ends, e.g. Customers for a pick move whose own destination is WH/Output. A move's destination comes from its transfer, from the rule when "Destination location origin from rule" is set, or from the operation type; it is replaced by the forecasted location when that location lies under it ([`stock_move.py:233`](../addons/stock/models/stock_move.py#L233)).
+- **Move line** (`stock.move.line`): the detailed operation (lot, package, sub-location, `quantity`, `picked`).
+- **Reference** (`stock.reference`, [`stock_reference.py:4`](../addons/stock/models/stock_reference.py#L4)): a named tag (e.g. the sale order number) put on every move of a document chain; it links transfers, purchases and sales that serve the same need.
+
+For developers: `stock.move.product_uom` and `stock.move.line.product_uom_id` do not exist in 20.0; both are `uom_id`. `location_final_id` does not exist; use `forecasted_location_id`.
 
 ---
 
-#### `action` field — Full Value Set and Trigger Chains
+## Routes and Rules — How Demand Becomes Documents
 
-The `action` field on `stock.rule` is a Selection extended by multiple modules. The full set of values in a standard Odoo installation with Purchase and Manufacturing:
+A **route** is a named policy ("WH: Deliver in 2 steps", "Buy", "Replenish on Order (MTO)"). A **rule** is one step: "when goods are needed at *Destination*, do *Action* from *Source* with *Operation Type*". Warehouses create and update their routes automatically when the steps change; custom routes are only needed for flows the warehouse settings do not cover. Routes and rules live under Inventory → Configuration → Warehouse Management and need Multi-Step Routes.
 
-| Value | Module | What it creates | UI label |
+### Rule fields that change behaviour
+
+| Field (UI) | Values | Effect |
+|---|---|---|
+| Action | Pull From / Push To / Pull & Push; + Buy (`purchase_stock`), Manufacture (`mrp`) | Pull answers procurements, push reacts to goods arriving, Pull & Push does both ([`stock_rule.py:64`](../addons/stock/models/stock_rule.py#L64)) |
+| Supply Method (`procure_method`) | Take From Stock / Trigger Another Rule / Take From Stock, if unavailable, Trigger Another Rule | See Supply methods below ([`stock_rule.py:79`](../addons/stock/models/stock_rule.py#L79)) |
+| Automatic Move (`auto`) | Manual Operation / Automatic No Step Added | Push only: create a new move, or rewrite the destination of the arriving move lines ([`stock_rule.py:105`](../addons/stock/models/stock_rule.py#L105)) |
+| Destination location origin from rule | boolean | Move destination = rule destination instead of the operation type default ([`stock_rule.py:73`](../addons/stock/models/stock_rule.py#L73)) |
+| Lead Time (`delay`) | days | Pull: scheduled date = needed date − delay; push: next move date = done date + delay |
+| Cancel Next Move (`propagate_cancel`) | boolean | Cancelling the move cancels the next one once all its other origins are cancelled. Without it, the next move is detached and becomes Take From Stock once its other origins are done or cancelled ([`stock_move.py:2273`](../addons/stock/models/stock_move.py#L2273)) |
+| Push Applicability (`push_domain`) | domain | A push rule only applies to moves matching it ([`stock_rule.py:650`](../addons/stock/models/stock_rule.py#L650)) |
+| Partner Address | contact | Forces the partner of the created moves |
+
+### Where Odoo looks for a rule
+
+[`_get_rule()`](../addons/stock/models/stock_rule.py#L546) takes the procurement location and all its parents. Starting with the most specific location, it tries these route sources in order and stops at the first rule whose destination is that location (push rules are excluded, [`stock_rule.py:631`](../addons/stock/models/stock_rule.py#L631)):
+
+1. Routes on the procurement: sale order line Routes, the reordering rule's Route, the Replenish wizard's route. Warehouse-selectable Buy/Manufacture routes that are linked to no warehouse of the current company are added here, so they apply to every warehouse ([`stock_location.py:585`](../addons/stock/models/stock_location.py#L585)).
+2. Routes of the packaging's package type.
+3. Product routes, then product category routes (including parent categories).
+4. Warehouse routes: receipt and delivery routes, Buy/Manufacture when "Buy/Manufacture to Resupply" is on, resupply routes.
+
+Only then does it move to the parent location. Within one source, product routes win, then the lowest route Sequence, then the lowest rule Sequence. Rules of another warehouse are ignored; rules without a warehouse apply everywhere ([`stock_rule.py:482`](../addons/stock/models/stock_rule.py#L482)). Warehouse routes holding a Buy rule are skipped for products without a vendor or a confirmed purchase ([`stock_rule.py:165`](../addons/purchase_stock/models/stock_rule.py#L165)), and routes holding a Manufacture rule are skipped for products without a regular BoM ([`stock_rule.py:75`](../addons/mrp/models/stock_rule.py#L75)). When nothing matches, the error blocks the sale order confirmation; scheduler runs log an activity on the product instead ([`stock_orderpoint.py:748`](../addons/stock/models/stock_orderpoint.py#L748)).
+
+### Supply methods
+
+| Supply Method | Move after confirmation | Upstream procurement |
+|---|---|---|
+| Take From Stock (`make_to_stock`) | Waiting, then reserved from the source location | None |
+| Trigger Another Rule (`make_to_order`) | Waiting Another Move (its transfer: Waiting Another Operation) | Full quantity at the rule's source location; the upstream document is linked to this move, and finishing it reserves this move |
+| Take From Stock, if unavailable, Trigger Another Rule (`mts_else_mto`) | Created as Take From Stock, confirmed and reserved from what is there | Only the shortfall: demand minus the Free quantity at the source location and its children; the upstream move is not linked |
+
+Sources: the move is created as Take From Stock for the mixed method ([`stock_rule.py:262`](../addons/stock/models/stock_rule.py#L262)); confirmation raises the procurement ([`stock_move.py:1770`](../addons/stock/models/stock_move.py#L1770)); the shortfall uses `free_qty` and accounts for other lines confirmed in the same batch ([`stock_move.py:1869`](../addons/stock/models/stock_move.py#L1869)). In the rules a warehouse generates, the first rule of a chain takes from stock and the following ones trigger another rule ([`stock_warehouse.py:826`](../addons/stock/models/stock_warehouse.py#L826)).
+
+### Pull, push and the other actions
+
+- **Pull**: `run()` groups procurements by action and calls `_run_pull`, `_run_buy` or `_run_manufacture`; Pull & Push behaves as pull there ([`stock_rule.py:426`](../addons/stock/models/stock_rule.py#L426)).
+- **Push**: never called by `run()`. It fires after validation (and for negative moves at confirmation) through [`_push_apply()`](../addons/stock/models/stock_move.py#L1270). Rules are matched per group of move lines, by each group's actual destination and result package: goods put away on WH/Input/Shelf 2 still find a rule whose source is WH/Input because the search walks up the parents ([`stock_rule.py:650`](../addons/stock/models/stock_rule.py#L650)), and the routes of the packages' types are added. The next move's quantity is the sum of those lines. Automatic No Step Added rewrites the lines' destination (with putaway) instead of creating a move. No push happens for inventory adjustments or when the move already feeds a downstream move from its destination ([`stock_move.py:2335`](../addons/stock/models/stock_move.py#L2335)).
+- **Buy** ([`stock_rule.py:59`](../addons/purchase_stock/models/stock_rule.py#L59)): picks the vendor from the product's vendor list and adds a line to a draft RFQ with the same vendor, operation type, company, buyer and currency, or creates one ([`stock_rule.py:325`](../addons/purchase_stock/models/stock_rule.py#L325)). The vendor's **Group RFQ** decides how far RFQs are shared: On Order (default) keeps needs with a reference, such as an MTO sale, on an RFQ of their own; Daily and Weekly group by expected arrival; Always groups everything. RFQs are created as superuser, or as the current user for manual replenishment. Without a vendor: from a reordering rule it is an error (activity on the product); otherwise the waiting move is cancelled or turned into Take From Stock and the product's responsible is notified.
+- **Manufacture**: creates or enlarges a manufacturing order; details in [`mrp.md`](mrp.md). Kits (phantom BoMs) are exploded into component procurements before any rule is searched ([`stock_rule.py:43`](../addons/mrp/models/stock_rule.py#L43)).
+
+### Buy and Manufacture are warehouse routes
+
+The Buy route (`purchase_stock`) and the Manufacture route (`mrp`) cannot be ticked on a product. They are warehouse routes, linked to every warehouse whose Buy to Resupply / Manufacture to Resupply is on (the default) ([`purchase_stock_data.xml:10`](../addons/purchase_stock/data/purchase_stock_data.xml#L10), [`mrp_data.xml:10`](../addons/mrp/data/mrp_data.xml#L10), [`stock.py:77`](../addons/purchase_stock/models/stock.py#L77)). Their rules deliver to WH/Stock, so they answer procurements **at WH/Stock**: reordering rules, MTO chains, the Replenish wizard. They never answer a sale order's procurement, which is for the customer location. Manufacture has Sequence 5 and Buy 10, so with default sequences a product with both a vendor and a regular BoM gets a manufacturing order.
+
+### MTO chains
+
+**Replenish on Order (MTO)** is a global route, archived until the setting of the same name is enabled ([`stock_data.xml:42`](../addons/stock/data/stock_data.xml#L42), [`res_config_settings.py:46`](../addons/stock/models/res_config_settings.py#L46)). Each warehouse contributes one rule: WH/Stock → Customers with the first delivery step's operation type (Delivery Orders, or Pick for multi-step) and Trigger Another Rule ([`stock_warehouse.py:420`](../addons/stock/models/stock_warehouse.py#L420)).
+
+```
+SO confirmed ─► procurement at Customers ─► product's MTO rule ─► Move A (WH/Stock → Customers), Waiting Another Move
+                                                         └─► procurement at WH/Stock, linked to Move A
+                                                               ├─ vendor ─► Buy rule ─► RFQ line; receipt Move B feeds Move A
+                                                               ├─ BoM ────► Manufacture rule ─► MO; finished move feeds Move A
+                                                               └─ neither ─► "No rule has been found..." ─► SO not confirmed
+Receipt / MO done ─► Move A reserved directly (no scheduler needed)
+```
+
+When the upstream move is done, its destination moves are reserved at once ([`stock_move.py:2350`](../addons/stock/models/stock_move.py#L2350)). If the upstream move ended somewhere the downstream move does not start from, the link is broken and the downstream move becomes Take From Stock ([`stock_move.py:2904`](../addons/stock/models/stock_move.py#L2904)).
+
+### Which document do I get?
+
+| Product setup (with `purchase_stock` and `mrp`) | Sale order confirmation creates | Where the supply comes from |
+|---|---|---|
+| No routes on the product | Delivery (or Pick), Waiting until stock | Existing stock; purchases only via reordering rules or Replenish |
+| Vendor only | Delivery only | Same as above: Buy never answers a customer procurement |
+| Replenish on Order (MTO) + vendor | Delivery Waiting Another Operation + RFQ line | The linked receipt |
+| Replenish on Order (MTO) + regular BoM | Delivery Waiting Another Operation + MO | The linked MO; auto-confirmation rules in [`mrp.md`](mrp.md) |
+| Replenish on Order (MTO), no vendor, no BoM | Nothing: confirmation fails | Fix the product configuration |
+| Resupply route "WH2: Supply Product from WH1" only | Delivery from WH2 only | The route answers procurements at WH2/Stock: reordering rules, Replenish |
+| Resupply route + Replenish on Order (MTO), order in WH2 | WH2 delivery Waiting Another Operation + WH1 → transit transfer; WH2 receipt follows | See Inter-warehouse resupply |
+| Custom product route | Whatever its rules say | See the secondary-location pattern below |
+
+Manual transfers (created by hand) do not use pull rules; push rules still apply when they are validated.
+
+### Inter-warehouse resupply
+
+Ticking **Resupply From** on a warehouse creates a route "WH2: Supply Product from WH1", selectable on products, categories and warehouses ([`stock_warehouse.py:678`](../addons/stock/models/stock_warehouse.py#L678), [`:812`](../addons/stock/models/stock_warehouse.py#L812)):
+
+| Rule | Action | Operation type | Supply method |
 |---|---|---|---|
-| `pull` | `stock` | `stock.move` (internal transfer) | Pull From |
-| `push` | `stock` | `stock.move` (chained move on arrival) | Push To |
-| `pull_push` | `stock` | Acts as both depending on the caller | Pull & Push |
-| `buy` | `purchase_stock` | `purchase.order` + `purchase.order.line` | Buy |
-| `manufacture` | `mrp` | `mrp.production` (manufacturing order) | Manufacture |
+| WH1/Stock → transit | Pull | WH1 Delivery Orders (or Pick if WH1 is multi-step) | Take From Stock |
+| Transit → WH2/Stock | Pull & Push, push domain = WH2's address and WH1 as source | WH2 Receipts | Trigger Another Rule |
+| Transit → WH1 receipt destination | Push, for returns | WH1 Receipts | — |
 
-Source: [`purchase_stock/models/stock_rule.py:18`](../addons/purchase_stock/models/stock_rule.py#L18) | [`mrp/models/stock_rule.py:14`](../addons/mrp/models/stock_rule.py#L14)
-
-`pull`, `pull_push`, `buy`, and `manufacture` are dispatched by `run()` via dynamic `_run_<action>()`. **`push` rules are never dispatched through `run()`** — `_get_rule_domain()` explicitly excludes them (`action != 'push'`, see [`stock_rule.py:652`](../addons/stock/models/stock_rule.py#L652)). Push rules are triggered exclusively by `_push_apply()` in `stock.move._action_done()`. Source: [`stock_rule.py:493`](../addons/stock/models/stock_rule.py#L493)
+The transit location is the company's internal transit location, or the inter-company transit location when WH1 belongs to another company, so resupply also works between companies and branches. Warehouse addresses are mapped to transit: the warehouse partner's customer and vendor locations become the internal transit location for its own company and the inter-company transit location for every other company ([`stock_warehouse.py:937`](../addons/stock/models/stock_warehouse.py#L937)). A plain delivery from WH1 addressed to WH2's partner therefore lands in transit, and the push side of the transit → WH2 rule, matched by its push domain, creates WH2's receipt.
 
 ---
 
-##### `pull` — Demand-Driven Transfer
+## Multi-Step Receipts and Deliveries
 
-**SO confirmation never checks stock availability.** It always transitions the SO to `state = sale` and creates the delivery. The delivery sits in `confirmed` (or `waiting`) state until stock is available. Stock shortage does NOT block SO confirmation.
+Set on the warehouse, Warehouse Configuration tab, fields **Incoming Shipments** and **Outgoing Shipments** ([`stock_warehouse.py:56`](../addons/stock/models/stock_warehouse.py#L56), [`:62`](../addons/stock/models/stock_warehouse.py#L62)). The tab shows these fields only with Multi-Step Routes.
 
-**What triggers it — all `stock.rule.run()` call sites:**
-
-| Trigger | Source | Notes |
+| Incoming Shipments | Created at purchase / confirmation | Created by push when the previous step is validated |
 |---|---|---|
-| SO line confirmed | [`sale_stock/models/sale_order_line.py:404`](../addons/sale_stock/models/sale_order_line.py#L404) | Primary entry point for sales flow |
-| Move `_action_confirm` | [`stock/models/stock_move.py:1575`](../addons/stock/models/stock_move.py#L1575) | Only when `procure_method = make_to_order` or `mts_else_mto` |
-| Orderpoint scheduler | [`stock/models/stock_orderpoint.py:745`](../addons/stock/models/stock_orderpoint.py#L745) | Min/max reorder rules; cron runs `run_scheduler()` |
-| Replenish wizard | [`stock/wizard/product_replenish.py:93`](../addons/stock/wizard/product_replenish.py#L93) | User clicks "Replenish" on a product |
-| Return picking | [`stock/wizard/stock_picking_return.py:263`](../addons/stock/wizard/stock_picking_return.py#L263) | When a return is confirmed |
-| Scrap | [`stock/models/stock_scrap.py:168`](../addons/stock/models/stock_scrap.py#L168) | When a scrap order is validated |
-| MRP production | [`mrp/models/stock_move.py:340`](../addons/mrp/models/stock_move.py#L340) | Manufacturing order confirmation |
-| POS order | [`point_of_sale/models/pos_order.py:1739`](../addons/point_of_sale/models/pos_order.py#L1739) | POS order confirmed |
+| Receive and Store (1 step) | WH/IN Vendors → WH/Stock | — |
+| Receive then Store (2 steps) | WH/IN Vendors → WH/Input | WH/STOR Input → Stock |
+| Receive, Quality Control, then Store (3 steps) | WH/IN Vendors → WH/Input | WH/QC Input → Quality Control, then WH/STOR Quality Control → Stock |
 
-**What it creates:**
-- A `stock.move` from `location_src_id` → `location_dest_id`
-- Move is created as SUPERUSER (triggering user may have no stock rights)
-- `_action_confirm()` is called immediately on the new move
-
-**Real examples:**
-```
-SO confirmed, ship_only warehouse:
-  pull rule: WH/Stock → Customers  (picking_type=Delivery Orders)
-  → 1 stock.move created → 1 picking WH/OUT/00001
-
-SO confirmed, pick_ship warehouse:
-  pull rule: WH/Output → Customers  (picking_type=Delivery Orders, procure_method=make_to_order)
-  → move state=waiting → fires upstream run() for WH/Output
-  pull rule: WH/Stock → WH/Output  (picking_type=Pick, procure_method=make_to_stock)
-  → 2 moves created → 2 pickings: WH/PICK/00001 (assigned) + WH/OUT/00001 (waiting)
-```
-
----
-
-##### `push` — Event-Driven Transfer (Arrival-Based)
-
-**What triggers it:**
-- `stock.move._push_apply()` called from:
-  - `_action_confirm()` — for negative-qty (return) moves
-  - `_action_done()` — after a move is validated (line 2127)
-- Rule lookup: `_get_push_rule(product, move.location_dest_id, {route_ids, warehouse_id})` — walks up the location hierarchy looking for a push rule whose `location_src_id` matches where the goods just arrived
-
-**What it creates:**
-- A new `stock.move` starting from where the previous move ended
-- `auto = manual` → creates a new separate move (new picking)
-- `auto = transparent` → rewrites `location_dest_id` on the existing move (no new picking)
-
-**Real examples:**
-```
-2-step reception (two_steps):
-  Receipt validated: goods arrive at WH/Input
-  → _push_apply() fires after _action_done()
-  → push rule found: WH/Input → WH/Stock  (picking_type=Storage)
-  → new stock.move created → WH/STOR/00001 picking appears (state=assigned)
-
-Return of a delivery:
-  Return picking confirmed
-  → _push_apply() fires on _action_confirm() (negative-qty move)
-  → checks for push rules on the return destination
-```
-
-**Push does NOT fire on returns-of-returns** — guard built into `_push_apply()` to prevent infinite loops. Source: [`stock_move.py:1144`](../addons/stock/models/stock_move.py#L1144)
-
----
-
-##### `pull_push` — Dual Mode
-
-Acts as `pull` when reached from `run()`. Acts as `push` when reached from `_push_apply()`.
-
-```python
-# In run() — line 486
-action = 'pull' if rule.action == 'pull_push' else rule.action
-actions_to_run[action].append((procurement, rule))
-# → calls _run_pull()
-
-# In _get_push_rule() — line 671
-domain = Domain('action', 'in', ('push', 'pull_push'))
-# → both push and pull_push are found by push rule lookup
-```
-
-Used in routes that need to work both ways: once as a demand-triggered move, once as an arrival-triggered move. Less common in standard configuration.
-
----
-
-##### `buy` — Creates a Purchase Order (added by `purchase_stock`)
-> [`purchase_stock/models/stock_rule.py:59`](../addons/purchase_stock/models/stock_rule.py#L59)
-
-**What triggers it:**
-- Same `run()` call as `pull` — but `_get_rule()` finds a rule with `action='buy'` instead of `action='pull'`
-- Triggered by: SO confirmation (if product has "Buy" route), orderpoint replenishment, MTO chain pointing to a buy rule
-
-**What it creates:**
-1. Looks up matching vendor (supplier) via `_get_matching_supplier()` — uses `product.seller_ids`, checks min qty, currency, date validity
-2. If no supplier exists → error (from orderpoint context) or silently sets move to `make_to_stock` and notifies responsible user
-3. Calls `_make_po_get_domain()` to find an existing open PO for the same partner/company/currency/delivery address
-4. If open PO found → adds a new `purchase.order.line` to it (or merges into existing line)
-5. If no open PO found → creates `purchase.order` (as SUPERUSER) + new line
-6. PO line is linked back to the original `stock.move` via `move_dest_ids`
-
-**Key detail:** One PO can absorb multiple procurements for the same supplier — `_run_buy()` groups by `_make_po_get_domain()` key before creating/updating POs. Source: [`purchase_stock/models/stock_rule.py:93`](../addons/purchase_stock/models/stock_rule.py#L93)
-
-**Flow:**
-```
-SO confirmed, product has "Buy" route:
-  run() → _get_rule() finds buy rule on "Buy" route
-  → _run_buy():
-      supplier found on product.seller_ids
-      domain = (partner=vendor, company, currency, incoterm, ...)
-      existing open PO for this vendor? yes → add line
-                                         no  → create new PO (draft)
-  → PO line linked to stock.move via move_dest_ids
-  → When PO is confirmed → receipt (WH/IN/00001) created
-  → Receipt validated → stock.move done → SO delivery can proceed
-```
-
-**`buy` rule has no `location_src_id`** — makes sense: the source is the vendor, which is external. Source: [`purchase_stock/models/stock_rule.py:42`](../addons/purchase_stock/models/stock_rule.py#L42)
-
----
-
-##### `manufacture` — Creates a Manufacturing Order (added by `mrp`)
-> [`mrp/models/stock_rule.py:81`](../addons/mrp/models/stock_rule.py#L81)
-
-**What triggers it:**
-- Same `run()` dispatch as `pull` and `buy` — `_get_rule()` finds a rule with `action='manufacture'`
-- Triggered by: SO confirmation (MTO + Manufacture route), orderpoint for manufactured product, explicit MTO chain
-
-**What it creates:**
-- An `mrp.production` (manufacturing order) for the product and qty
-- Created as SUPERUSER (same reason as moves and POs — triggering user may have no MFG rights)
-- Auto-confirmed if: no work orders AND (triggered by orderpoint OR move's `procure_method = make_to_stock`)
-- Source: [`mrp/models/stock_rule.py:35`](../addons/mrp/models/stock_rule.py#L35)
-
-**Filter:** `manufacture` routes are only valid for a product if that product has a Bill of Materials with `type='normal'`. If no BOM exists, the route is filtered out during rule search. Source: [`mrp/models/stock_rule.py:74`](../addons/mrp/models/stock_rule.py#L74)
-
-**Flow:**
-```
-SO confirmed, product has "Manufacture" route + MTO:
-  run() → _get_rule() finds manufacture rule
-  → _run_manufacture():
-      mrp.production created (SUPERUSER)
-      auto-confirm: if no raw_ids → (no workorders AND (from orderpoint OR downstream make_to_stock)); if has raw_ids → not from orderpoint
-      production linked to stock.move via move_dest_ids
-  → MO confirmed → component reservation starts
-  → MO validated → finished product move done → delivery can proceed
-```
-
----
-
-##### Summary: Which `action` to use for which business need
-
-| Business need | action value | Document created | Triggered by |
-|---|---|---|---|
-| Move goods between internal locations | `pull` | `stock.move` | Demand (SO, orderpoint, MTO) |
-| Move goods automatically after arrival | `push` | `stock.move` | Validation of previous move |
-| Replenish by buying from vendor | `buy` | `purchase.order` | Demand (SO, orderpoint, MTO) |
-| Replenish by making in-house | `manufacture` | `mrp.production` | Demand (SO, orderpoint, MTO) |
-
----
-
-#### `procure_method` field — How to Source Stock
-
-| Value | UI Label | Behaviour |
+| Outgoing Shipments | Created at sale confirmation | Created by push when the previous step is validated |
 |---|---|---|
-| `make_to_stock` | Take From Stock | Reserve from stock at `location_src_id`. Move state → `confirmed`. |
-| `make_to_order` | Trigger Another Rule | Do NOT take from stock. Create an upstream procurement to bring goods to `location_src_id`. Move state → `waiting` until upstream move is done. |
-| `mts_else_mto` | Take From Stock, if unavailable, Trigger Another Rule | Try MTS first; if not enough stock, trigger another rule for the missing qty. Source: [`stock_rule.py:304`](../addons/stock/models/stock_rule.py#L304) |
+| Deliver (1 step) | WH/OUT Stock → Customers | — |
+| Pick then Deliver (2 steps) | WH/PICK Stock → Output | WH/OUT Output → Customers |
+| Pick, Pack, then Deliver (3 steps) | WH/PICK Stock → Packing Zone | WH/PACK Packing Zone → Output, then WH/OUT Output → Customers |
 
-In multi-step routes, the **first rule** in the chain uses `make_to_stock` (take from real stock). Subsequent rules use `make_to_order` (wait for upstream). Odoo sets this automatically in `_get_supply_pull_rules_values()`. Source: [`stock_warehouse.py:858`](../addons/stock/models/stock_warehouse.py#L858)
+How the rules are built ([`stock_warehouse.py:769`](../addons/stock/models/stock_warehouse.py#L769)): the first step is a pull rule whose destination is the final location (WH/Stock for receipts, Customers for deliveries). The move's own destination comes from the operation type (Input, Output or Packing Zone) while `forecasted_location_id` keeps the end of the chain. Every later step is a push rule. With `purchase_stock` installed, the receipt route has no pull rule: purchase orders create WH/IN themselves and the warehouse's Buy rule answers procurements ([`stock.py:135`](../addons/purchase_stock/models/stock.py#L135)).
 
----
-
-#### Custom Fallback Route Pattern (Secondary Location)
-
-Use case: deliver from `WH/Stock`; if stock is insufficient, pull automatically from `WH/Stock2`.
-
-**Rule setup (both rules on same route):**
-
-| Rule | Source | Destination | Operation Type | `procure_method` | Sequence |
-|---|---|---|---|---|---|
-| Delivery | WH/Stock | Customers | Delivery Orders | **`mts_else_mto`** | 20 |
-| Replenishment | WH/Stock2 | WH/Stock | Internal Transfers | `make_to_stock` | 21 |
-
-**Critical:** `mts_else_mto` must be on the **delivery rule** (Rule 1), not the replenishment rule. The delivery rule is the one confirmed during SO → it is the only rule whose `procure_method` is checked by `_action_confirm()` at [`stock_move.py:1554`](../addons/stock/models/stock_move.py#L1554). The replenishment rule is called as the upstream target — it just needs to reserve from Stock2 (`make_to_stock`).
-
-**Prerequisites:**
-1. Route must have `product_selectable = True` — otherwise Routes section is invisible on product form
-2. Route must be assigned to the product (product form → Inventory tab → Routes)
-3. **Multi-Step Routes** setting must be ON (`stock.group_adv_location`) for the Routes tab section to render
-
-**What happens at SO confirmation:**
-```
-SO confirmed
-  → _action_launch_stock_rule() → stock.rule.run()
-  → delivery move confirmed (mts_else_mto)
-  → tries to reserve from WH/Stock
-  → shortfall detected → fires upstream run() for WH/Stock
-  → finds replenishment rule (Stock2 → Stock)
-  → creates WH/INT/XXXXX internal transfer
-  → validate internal transfer first → then Check Availability on delivery works
-```
-
-**What does NOT work:**
-- `Check Availability` on an already-created picking does NOT trigger pull rules — it only reserves existing stock. Pull rules only fire during procurement (`_action_confirm` with `create_proc=True`).
-- Assigning the route to a product after the SO is confirmed has no retroactive effect on existing moves.
-
-Source: [`stock_move.py:1540-1575`](../addons/stock/models/stock_move.py#L1540)
+- A two-step sale shows one transfer until PICK is validated ([`test_sale_stock.py:1072`](../addons/sale_stock/tests/test_sale_stock.py#L1072)); a partial PICK and its backorder push into the same open WH/OUT, because moves with the same reference join it ([`test_sale_stock.py:1528`](../addons/sale_stock/tests/test_sale_stock.py#L1528)).
+- Receipt rules cancel the next step when a step is cancelled, except the last one; delivery rules propagate the carrier ([`stock_warehouse.py:502`](../addons/stock/models/stock_warehouse.py#L502), [`:826`](../addons/stock/models/stock_warehouse.py#L826)).
+- **Cross Dock** (WH/XD, Input → Output) is active only when both receipts and deliveries use several steps. No route uses it out of the box; build a route to send goods from Input straight to Output.
 
 ---
 
-#### `auto` field — How a Push Rule Creates the Next Move
+## Sale Order → Delivery (`sale_stock`)
 
-| Value | Behaviour |
+### What confirmation does
+
+1. `_action_confirm()` calls `_action_launch_stock_rule()` on the lines ([`sale_order.py:198`](../addons/sale_stock/models/sale_order.py#L198)).
+2. For each goods line of a confirmed, unlocked order, the quantity to procure is the ordered quantity minus what existing moves already cover ([`sale_order_line.py:304`](../addons/sale_stock/models/sale_order_line.py#L304)). A `stock.reference` named after the order is created once and put on every move ([`sale_order_line.py:375`](../addons/sale_stock/models/sale_order_line.py#L375)).
+3. Procurement values ([`sale_order_line.py:271`](../addons/sale_stock/models/sale_order_line.py#L271)):
+
+| Value | Taken from |
 |---|---|
-| `manual` | Creates a brand-new `stock.move` as the next step. The original move ends at `location_dest_id` and the new move starts there. |
-| `transparent` | Rewrites `location_dest_id` on the original move — no extra move is created. The system then calls `_push_apply()` again recursively to check for more rules. |
+| Location | Customer Location of the delivery address ([`sale_order_line.py:299`](../addons/sale_stock/models/sale_order_line.py#L299)) |
+| Warehouse | Order's Warehouse (default: `ir.default`, else the salesperson's Default Warehouse, else the company's first warehouse) |
+| Routes | Line Routes; only routes marked "Selectable on Sales Order Line" are offered |
+| Deadline | Commitment Date, else the expected date (order date + Delivery Time of the line) |
+| Scheduled date | Deadline minus Security Lead Time (company setting, days) |
+| Packaging | The line's unit |
 
-Source: [`stock_rule.py:233`](../addons/stock/models/stock_rule.py#L233)
+4. After `run()`, open transfers of the order are confirmed again, which fires reordering rules for products that go short ([`stock_picking.py:768`](../addons/stock/models/stock_picking.py#L768)).
 
----
+### How moves become transfers
 
-#### How `run()` Dispatches Procurements
-> [`stock_rule.py:450`](../addons/stock/models/stock_rule.py#L450)
+Moves join an existing transfer when they share references, source, destination, operation type and priority, and the transfer is not printed, not done and has the same partner ([`stock_move.py:1592`](../addons/stock/models/stock_move.py#L1592), [`:1599`](../addons/stock/models/stock_move.py#L1599)). Two sale orders never share a transfer. A transfer that was printed stops receiving new moves; the next ones go to a new transfer.
 
-```
-run(procurements)
-  for each procurement:
-    1. Skip if product type != 'consu' or qty == 0
-    2. _get_rule(product, location, values)  ← find the matching rule
-       if no rule found → raise UserError / ProcurementException
-    3. Group by action: actions_to_run['pull'] = [...], actions_to_run['push'] = [...]
-  for each action group:
-    call _run_<action>(procurements)  ← dynamic dispatch
-    e.g. _run_pull(), _run_push(), _run_buy() (purchase_stock), _run_manufacture() (mrp)
-```
+### Shipping policy and dates
 
----
+- The order's **Shipping Policy** defaults from the company setting ([`sale_order.py:19`](../addons/sale_stock/models/sale_order.py#L19)). Transfers of an order use "As soon as possible" if any linked order says so, otherwise "When all products are ready" ([`stock.py:275`](../addons/sale_stock/models/stock.py#L275)). With "all at once", the order's expected date is the latest line date.
+- Changing the **Commitment Date** rewrites the deadline of open outgoing moves ([`sale_order.py:158`](../addons/sale_stock/models/sale_order.py#L158)). Changing a line's Delivery Time does the same when no commitment date is set ([`sale_order_line.py:265`](../addons/sale_stock/models/sale_order_line.py#L265)). The product's Delivery Time (`sale_delay`) lives in `sale` and is company-dependent ([`product_template.py:66`](../addons/sale/models/product_template.py#L66)).
 
-#### How `_run_pull()` Creates Moves
-> [`stock_rule.py:288`](../addons/stock/models/stock_rule.py#L288)
+### Changing a confirmed order
 
-```
-for each (procurement, rule):
-    move_values = rule._get_stock_move_values(...)
-      → sets: product, qty, location_src_id, location_dest_id (from rule or picking type)
-      → sets: procure_method, picking_type_id, date (planned_date - delay), rule_id
-    moves = stock.move.sudo().create(moves_values)  ← always SUPERUSER
-    moves._action_confirm()
-```
-
-Key detail: moves are created as `SUPERUSER` because the triggering user (e.g., salesperson) may not have stock rights. Source: [`stock_rule.py:313`](../addons/stock/models/stock_rule.py#L313)
-
----
-
-#### How `_action_confirm()` Decides Move State
-> [`stock_move.py:1536`](../addons/stock/models/stock_move.py#L1536)
-
-For each move being confirmed:
-
-| Condition | Result |
+| Change | Effect |
 |---|---|
-| Has `move_orig_ids` (upstream move exists) | state = `waiting` |
-| `procure_method == make_to_order` AND `create_proc=True` | state = `waiting` + creates upstream procurement (triggers `run()` recursively) |
-| `procure_method == mts_else_mto` | state = `confirmed` + creates upstream procurement for any shortfall |
-| Otherwise | state = `confirmed` |
+| Increase a quantity | Extra procurement; the new demand merges into the open move |
+| Decrease a quantity | A negative procurement reduces the open move (a 2-step PICK goes from 50 to 30, [`test_sale_stock.py:1072`](../addons/sale_stock/tests/test_sale_stock.py#L1072)); a note is logged on the transfers. Below the delivered quantity is refused: "create a return" ([`sale_order_line.py:416`](../addons/sale_stock/models/sale_order_line.py#L416)) |
+| Add a line | Procurement right away ([`sale_order_line.py:240`](../addons/sale_stock/models/sale_order_line.py#L240)) |
+| Change the delivery address | Open transfers get the new partner, unless the same save also edits order lines ([`sale_order.py:146`](../addons/sale_stock/models/sale_order.py#L146)) |
+| Cancel the order | Every transfer that is not done is cancelled; activities are logged on affected documents ([`sale_order.py:238`](../addons/sale_stock/models/sale_order.py#L238)) |
 
-After state is set, `_assign_picking()` groups moves into a `stock.picking`.
+### Delivered quantity and delivery status
 
----
+- Goods lines compute Delivered from done outgoing moves minus done returns that keep "Update quantities on SO/PO" (`to_refund`, on by default, [`stock_move.py:27`](../addons/stock_account/models/stock_move.py#L27)) ([`sale_order_line.py:185`](../addons/sale_stock/models/sale_order_line.py#L185)).
+- **Delivery Status** is a `sale` field ([`sale_order.py:440`](../addons/sale/models/sale_order.py#L440)); `sale_stock` computes it from transfers ([`sale_order.py:77`](../addons/sale_stock/models/sale_order.py#L77)):
 
-#### How `_push_apply()` Fires Push Rules
-> [`stock_move.py:1113`](../addons/stock/models/stock_move.py#L1113)
-
-Called at two moments:
-1. Inside `_action_confirm()` — for negative-qty moves (returns)
-2. Inside `_action_done()` at line 2127 — after moves are validated, to create the next hop
-
-For each done/confirmed move:
-1. Find push rule via `_get_push_rule(product, move.location_dest_id, {route_ids, warehouse_id})`
-2. If rule has `push_domain` — evaluate domain against the move; skip rule if it doesn't match, look for next rule
-3. Do NOT fire if the move is a return of a return (guard against loops)
-4. Call `rule._run_push(move)` — creates next move (manual) or rewrites destination (transparent)
-5. New move is confirmed via `_action_confirm()`
-
----
-
-#### Route Resolution Priority
-> [`stock_rule.py:547`](../addons/stock/models/stock_rule.py#L547)
-
-When looking for a pull rule for a procurement, Odoo checks these route sources in order:
-
-1. Routes on the procurement itself (`values['route_ids']`) — e.g., from SO line
-2. Routes on the packaging UoM's package type
-3. Routes on the product (`product.route_ids`)
-4. Routes on the product category (`product.categ_id.total_route_ids`)
-5. Routes on the warehouse (`warehouse.route_ids`)
-
-Within each source, rules are sorted by `route_sequence` then `sequence` (ascending — lower = higher priority).
-
-If nothing is found at `location_dest_id`, Odoo walks **up the location hierarchy** (parent → grandparent → ...) and repeats the search. Source: [`stock_rule.py:573`](../addons/stock/models/stock_rule.py#L573)
-
----
-
-#### `propagate_cancel`
-> [`stock_rule.py:97`](../addons/stock/models/stock_rule.py#L97)
-
-When a move is cancelled and `propagate_cancel = True` on its rule, the **next** move in the chain (`move_dest_ids`) is also cancelled automatically.
-
-In a 3-step chain, only the first two rules have `propagate_cancel = True`; the last rule has it `False` to prevent cancelling the outgoing delivery when an upstream step is cancelled. Source: [`stock_warehouse.py:839`](../addons/stock/models/stock_warehouse.py#L839)
-
----
-
-**MTO (Make to Order):** The global route "Replenish on Order" contains one rule per warehouse with `procure_method = make_to_order`. When a product has this route, confirming a SO creates the move as `waiting` and immediately fires `run()` again to trigger an upstream procurement (purchase order, production order, etc.).
-
-> **The MTO route (`stock.route_warehouse0_mto`) is `active = False` by default.** It does not appear on the product's Inventory tab until enabled.
-> **How to enable:** Inventory → Configuration → Settings → **"Replenish on Order (MTO)"** → Save.
-> Internally this sets `route_warehouse0_mto.active = True`. Source: [`stock/models/res_config_settings.py:61`](../addons/stock/models/res_config_settings.py#L61)
-
----
-
-#### MTO Chain — How It Works
-
-The "chain" is the link between an outgoing delivery move and the upstream supply document (PO receipt move or MO output move). The two participants are linked via:
-
-- `move_orig_ids` on the delivery move → points to the upstream move (what supplies it)
-- `move_dest_ids` on the upstream move → points back to the delivery move (what it feeds)
-
-The delivery move stays in `waiting` state until the upstream move is `done`. Source: [`stock_move.py:1548`](../addons/stock/models/stock_move.py#L1548)
-
-**Exact trigger — inside `_action_confirm()`** ([stock_move.py:1550](../addons/stock/models/stock_move.py#L1550)):
-
-```python
-elif move.procure_method == 'make_to_order':
-    move_waiting.add(move.id)      # state → waiting
-    if create_proc:
-        move_create_proc.add(move.id)  # fires upstream run()
-```
-
-Then at line 1575:
-```python
-self.env['stock.rule'].run(procurement_requests, ...)
-```
-
-This is a **recursive `run()` call** — it fires a second procurement for `move.location_id` (WH/Stock), which then finds the Buy or Manufacture rule.
-
-**Full sequence (Buy + MTO):**
-
-```
-SO confirmed
-  → run([Procurement(product, qty, location=Customers)])
-  → MTO pull rule found (procure_method=make_to_order)
-  → _run_pull(): create Move A (WH/Stock → Customers, make_to_order)
-  → _action_confirm() on Move A:
-       state = waiting
-       fires run([Procurement(product, qty, location=WH/Stock)])  ← recursive
-         → Buy rule found
-         → _run_buy(): PO created (draft)
-           PO line → Move B (Vendor → WH/Stock)
-           Move B.move_dest_ids = [Move A]
-           Move A.move_orig_ids = [Move B]
-
-User confirms PO → WH/IN/00001 created
-User validates WH/IN/00001:
-  → Move B done → quant WH/Stock +qty
-  → _trigger_assign() fires on Move B
-  → Move A: waiting → assigned
-  → WH/OUT/00001 becomes Ready
-```
-
-**Why MTO alone (without Buy or Manufacture) fails:** The recursive `run()` fires for `WH/Stock`. If no rule matches that location, Odoo raises `UserError: No rule found`. MTO must always be combined with Buy or Manufacture.
-
-**`procure_method` comparison:**
-
-| Value | Move state after confirm | Upstream proc fired? | Takes from stock? |
-|---|---|---|---|
-| `make_to_stock` | `confirmed` | No | Yes — reserves from shelf |
-| `make_to_order` | `waiting` | Yes — always | No |
-| `mts_else_mto` | `confirmed` | Yes — only for shortfall qty | Partially |
-
-**`mts_else_mto` split logic** ([stock_move.py:1661](../addons/stock/models/stock_move.py#L1661)):
-
-```python
-free_qty = max(forecasted_qties_by_loc[move.location_id][move.product_id.id], 0)
-quantity = max(move.product_qty - free_qty, 0)  # upstream proc fires for this qty only
-```
-
-Example: SO for 100 units, 60 in stock → upstream `run()` fires for qty=40 only. The 60 are reserved normally from stock.
-
----
-
-#### `_get_mto_procurement_date()` — Customization Hook
-
-Source: [`stock_move.py:1714`](../addons/stock/models/stock_move.py#L1714)
-
-```python
-def _get_mto_procurement_date(self):
-    return self.date
-```
-
-Returns the date used when firing an upstream MTO procurement. Default is the move's scheduled date. Override this method in a custom module to add buffer days, seasonal adjustments, or vendor-specific lead times.
-
----
-
-#### `_break_mto_link()` — MTO Chain Cleanup on SO Modification
-
-Source: [`stock_move.py:2612`](../addons/stock/models/stock_move.py#L2612)
-
-```python
-def _break_mto_link(self, parent_move):
-    self.move_orig_ids = [Command.unlink(parent_move.id)]
-    self.procure_method = 'make_to_stock'
-    self._recompute_state()
-```
-
-Called when an MTO chain is modified (e.g., SO quantity reduced). Removes the upstream link from `move_orig_ids`, converts the move's `procure_method` back to `make_to_stock`, and recomputes state. Prevents orphaned MTO procurements when the originating demand shrinks.
-
----
-
-#### `_get_rule_domain()` — Inter-Company Location Trick
-
-Source: [`stock_rule.py:645`](../addons/stock/models/stock_rule.py#L645)
-
-When `_get_rule_domain()` is called with a transit location (inter-company location), it automatically appends the Customer location to the domain:
-
-```python
-if self._check_intercomp_location(locations):
-    location_ids.append(self.env.ref('stock.stock_location_customers').id)
-```
-
-This means a single rule that delivers to Customer also handles inter-company transit delivery — you do not need to duplicate rules for the inter-company case. `_check_intercomp_location()` returns True when the location has `usage = 'transit'` AND matches `stock.stock_location_inter_company`.
-
-**Multi-company filtering:** When called as superuser, the domain also restricts rules by company (regular users are filtered by record rules):
-
-```python
-domain_company = ['|', ('company_id', '=', False), ('company_id', 'child_of', list(company_ids))]
-```
-
-Rules with `company_id = False` are shared across all companies. Source: [`stock_rule.py:656`](../addons/stock/models/stock_rule.py#L656)
-
----
-
-#### `location_final_id` — The True End Destination
-> [`stock_move.py:85`](../addons/stock/models/stock_move.py#L85)
-
-In a multi-step route, each move only knows its **immediate** destination (`location_dest_id`). But the chain also carries `location_final_id` — the ultimate destination of the whole chain.
-
-`location_dest_id` is computed: it takes the picking type's default destination unless `location_final_id` is a sub-location of that default destination, in which case it uses `location_final_id` directly. Source: [`stock_move.py:235`](../addons/stock/models/stock_move.py#L235)
-
-This is what allows a 2-step delivery to correctly route products from WH/Stock all the way to the Customer location — Move 1 carries `location_final_id = Customers` even though its immediate `location_dest_id = WH/Output`.
-
----
-
-#### How Moves Are Grouped Into Pickings
-> [`stock_move.py:1400`](../addons/stock/models/stock_move.py#L1400)
-
-After `_action_confirm()` sets the move state, `_assign_picking()` groups confirmed moves into `stock.picking` records.
-
-**Grouping key** (`_key_assign_picking()`): `(reference_ids, location_id, location_dest_id, picking_type_id)`. If `partner_id` is set and no reference_ids, partner is added to the key. Source: [`stock_move.py:1375`](../addons/stock/models/stock_move.py#L1375)
-
-**Logic:**
-1. Search for an existing `not done / not cancel` picking matching the grouping key.
-2. If found → add move to that picking (merge `origin` field if different).
-3. If not found → create a new picking.
-
-For SO-confirmed moves, `reference_ids` is set to the SO's `stock_reference_ids` (see [`sale_order_line.py:289`](../addons/sale_stock/models/sale_order_line.py#L289)). Different SOs have different reference_ids, so they produce **separate** pickings even for the same customer. Merging into one picking only happens for moves with identical reference_ids (e.g. moves from the same SO, or moves with no references that share the same partner).
-
----
-
-#### Orderpoints (Reorder Rules) — Scheduler-Driven Procurement
-> [`addons/stock/models/stock_orderpoint.py`](../addons/stock/models/stock_orderpoint.py)
-
-`stock.warehouse.orderpoint` is the "min/max" replenishment rule. It is the second major source of procurements after SO confirmation.
-
-| Field | Meaning |
+| Status | Condition |
 |---|---|
-| `product_id` | Product to replenish |
-| `location_id` | Location to keep stocked |
-| `warehouse_id` | Warehouse |
-| `product_min_qty` | Minimum stock level — triggers a replenishment when forecast drops below this |
-| `product_max_qty` | Target level to replenish to |
-| `qty_to_order` | Computed: `max(min_qty, max_qty) - (forecast + in_progress)` |
-| `qty_to_order_computed` | Stored version recomputed by scheduler |
-| `route_id` | Route override for this orderpoint (optional; falls back to product/category/warehouse routes) |
-| `rule_ids` | Computed: rules found for this product+location+route combination (shown in UI as replenishment chain) |
-| `effective_route_id` | Computed: `route_id` if set, else `_get_default_route()` — the route that will actually fire |
-| `replenishment_uom_id` | Round up `qty_to_order` to a multiple of this UoM |
-| `trigger` | `auto` (scheduler fires it daily) / `manual` (user fires it via Replenish button) |
-| `deadline_date` | Computed: date before which you must order to avoid falling below `product_min_qty`. If `qty_on_hand < product_min_qty` → today. Otherwise: walks future moves to find when stock first drops below min. Source: [`stock_orderpoint.py:125`](../addons/stock/models/stock_orderpoint.py#L125) |
-| `lead_horizon_date` | Computed: `today + total_delay + horizon_time` — the date until which forecast is checked |
-| `lead_days` | Computed: total lead time from `rule_ids._get_lead_days()` |
-| `snoozed_until` | If set, this orderpoint is hidden/skipped until that date |
-| `show_supply_warning` | True when `rule_ids` is empty — no route/rule found for this product+location |
+| (empty) | No transfers, or all cancelled |
+| Not Delivered | Transfers exist, none done |
+| Started | A transfer is done but no line has a delivered quantity yet (e.g. only PICK is done) |
+| Partially Delivered | A transfer is done and some line has a delivered quantity |
+| Fully Delivered | Every transfer is done or cancelled |
 
-**Constraint:** One orderpoint per `(product, location, company)`. Source: [`stock_orderpoint.py:101`](../addons/stock/models/stock_orderpoint.py#L101)
+- **Effective Date** is the first done delivery to a customer; invoices use it as delivery date ([`sale_order.py:70`](../addons/sale_stock/models/sale_order.py#L70)).
+- Delivering a product that is not on the order adds a line with ordered quantity 0 and the delivered quantity; the price comes from an existing line for invoice-on-delivery products and is 0 for invoice-on-order products ([`stock.py:302`](../addons/sale_stock/models/stock.py#L302)).
+
+### Cross-company warehouses and late installation
+
+- The order's warehouse may belong to another allowed company. The procurement then runs in the warehouse's company, the origin gets the order company's name in brackets, and the delivery address is made visible to all companies ([`sale_order_line.py:366`](../addons/sale_stock/models/sale_order_line.py#L366), [`sale_order.py:255`](../addons/sale_stock/models/sale_order.py#L255)).
+- `sale` tracks delivered quantities without stock. Installing `sale_stock` later splits partially delivered lines into a delivered part and a remainder, then launches procurements for every open line, so each open order gets a delivery ([`__init__.py:12`](../addons/sale_stock/__init__.py#L12), [`:34`](../addons/sale_stock/__init__.py#L34)).
 
 ---
 
-##### How Routes Connect to an Orderpoint
+## Reservation
 
-When you create or open an orderpoint, `_compute_rules()` runs ([`stock_orderpoint.py:191`](../addons/stock/models/stock_orderpoint.py#L191)):
+### When stock is reserved
 
-```
-_compute_rules():
-  call product._get_rules_from_location(location_id, route_ids=orderpoint.route_id)
-  → same priority order as SO: product routes → category routes → warehouse routes
-  → if route_id is set: only rules on that route are considered
-  result stored in orderpoint.rule_ids
-```
+| Reservation Method | Behaviour |
+|---|---|
+| At Confirmation | Reserved when the transfer is confirmed; backorders are reserved immediately |
+| Manually | Only when someone clicks **Reserve**; the scheduler never reserves these moves |
+| Before scheduled date | Reservation date = scheduled date − Days (Days when starred for priority moves); the scheduler and incoming validations reserve from that date on ([`stock_move.py:756`](../addons/stock/models/stock_move.py#L756)) |
 
-**`rule_ids` determines three things:**
-1. Which rule fires when `run()` is called (`_get_default_rule()` preview)
-2. The `lead_days` (total delay from all rules in the chain)
-3. Whether the "No supply chain configured" warning is shown (`show_supply_warning = not rule_ids`)
+Returns are always reserved at confirmation ([`stock_move.py:2052`](../addons/stock/models/stock_move.py#L2052)).
 
-If `rule_ids` is empty — the orderpoint has no route/rule configured. It will fail when the scheduler tries to process it.
+### How it works
 
----
+[`_action_assign()`](../addons/stock/models/stock_move.py#L2135) processes moves that are Waiting, Partially Available or Waiting Another Move and not yet picked:
 
-##### Lead Days and `lead_horizon_date` — Why Forecast Isn't Checked for Today
+1. Moves that bypass reservation (vendor or other virtual source, goods without Track Inventory) get move lines without touching quants.
+2. Trigger Another Rule moves without an upstream move are skipped.
+3. Chained moves reserve only what their upstream moves brought.
+4. Other moves ask the quants for the missing quantity: quants are gathered in removal-strategy order and reserved one by one ([`stock_quant.py:866`](../addons/stock/models/stock_quant.py#L866)).
+5. Move lines are created per (location, lot, package, owner); the move becomes Available or Partially Available; putaway rules set the destination of the new lines.
 
-The threshold check (`qty_forecast < product_min_qty`) does NOT use today's stock. It uses `qty_forecast` at `lead_horizon_date`.
+**Reserve never procures.** It only reserves stock that already exists at the source. Pull rules fire at confirmation, from the scheduler or from the Replenish tools.
 
-Source: [`stock_orderpoint.py:180`](../addons/stock/models/stock_orderpoint.py#L180), [`stock_orderpoint.py:461`](../addons/stock/models/stock_orderpoint.py#L461)
+### Order, re-reservation and limits
 
-```
-_compute_lead_days():
-  rule_ids._get_lead_days(product) →
-    for each pull/pull_push rule: add rule.delay
-    for buy rule: add vendor.seller.delay + company.days_to_purchase
-    add company.horizon_days (global lookahead window)
-  → total_delay = rule delays summed
-  lead_horizon_date = today + total_delay + horizon_days
+- **Reserve** handles starred moves first, then earlier deadlines and dates ([`stock_picking.py:787`](../addons/stock/models/stock_picking.py#L787)); the scheduler sorts by reservation date, priority and date ([`stock_rule.py:681`](../addons/stock/models/stock_rule.py#L681)).
+- Validating a receipt or internal transfer, or applying an inventory adjustment, reserves waiting Take From Stock moves of the same products whose source contains the destination; moves sharing a reference go first ([`stock_move.py:2750`](../addons/stock/models/stock_move.py#L2750), [`stock_picking.py:996`](../addons/stock/models/stock_picking.py#L996)).
+- Processing stock that another transfer had reserved frees that reservation ([`stock_move_line.py:822`](../addons/stock/models/stock_move_line.py#L822)).
+- Product category **Reserve Packagings** = Reserve Only Full Packagings reserves whole packagings only ([`product.py:1302`](../addons/stock/models/product.py#L1302)).
+- With Expiration Dates, lots whose removal date falls before the move's scheduled date are not reserved ([`stock_move.py:87`](../addons/product_expiry/models/stock_move.py#L87)).
+- **Unreserve** (action menu) releases the quants. The nightly scheduler merges duplicate quants and repairs reserved quantities that do not match the move lines ([`stock_quant.py:1257`](../addons/stock/models/stock_quant.py#L1257), [`:1174`](../addons/stock/models/stock_quant.py#L1174)).
 
-qty_forecast = product.virtual_available  (computed at lead_horizon_date, NOT today)
-```
+### Removal strategies
 
-**What this means in practice:**
-- Vendor lead time = 30 days → `lead_horizon_date = today + 30`
-- `qty_forecast` = what stock will look like 30 days from now (accounting for existing POs, incoming moves, and outgoing moves)
-- If that future forecast < `product_min_qty` → order now so stock arrives before the minimum is breached
+The strategy decides which quants go first. Lookup: product category **Force Removal Strategy**, else the source location's strategy (walking up the parents), else FIFO ([`stock_quant.py:650`](../addons/stock/models/stock_quant.py#L650)).
 
-**If no vendor is found:** lead days defaults to **365 days**. This means the forecast is checked 365 days in the future — if negative, an order is triggered. Source: [`purchase_stock/models/stock_rule.py:221`](../addons/purchase_stock/models/stock_rule.py#L221)
+| Strategy | Order |
+|---|---|
+| FIFO | Oldest incoming date first ([`stock_quant.py:773`](../addons/stock/models/stock_quant.py#L773)) |
+| LIFO | Newest first |
+| Closest Location | Alphabetical full location name, as a proxy for the picking path |
+| Least Packages | A* search for the fewest packages covering the need; falls back to FIFO order if the search runs out of memory ([`stock_quant.py:662`](../addons/stock/models/stock_quant.py#L662)) |
+| FEFO (Expiration Dates) | Earliest removal date, then incoming date ([`stock_quant.py:25`](../addons/product_expiry/models/stock_quant.py#L25)) |
 
----
+Quants with a lot are taken before untracked quants of the same product ([`stock_quant.py:803`](../addons/stock/models/stock_quant.py#L803)).
 
-##### `qty_to_order` Computation
-> [`stock_orderpoint.py:461`](../addons/stock/models/stock_orderpoint.py#L461)
-
-```
-if qty_forecast < product_min_qty:  ← checked at lead_horizon_date, not today
-    qty_in_progress = open PO lines for this product+location (purchase_stock override)
-    qty_forecast_with_visibility = virtual_available(at lead_horizon_date) + qty_in_progress
-    qty_to_order = max(product_min_qty, product_max_qty) - qty_forecast_with_visibility
-    round up to replenishment_uom_id multiple
-```
-
-**Double-order prevention via `qty_in_progress`:**
-`purchase_stock` overrides `_quantity_in_progress()` ([`purchase_stock/models/stock.py:322`](../addons/purchase_stock/models/stock.py#L322)) to include quantities from open PO lines for this product at this location. This prevents creating a second PO if one is already in progress.
-
-Without `purchase_stock`: base implementation returns 0 (no in-progress tracking).
+**FEFO example.** Category "Dairy" uses FEFO. Stock: LOT-A (in Jan 1, removal Mar 15, 20 units), LOT-B (in Jan 10, removal Mar 5, 15 units), LOT-C (in Feb 1, removal Mar 25, 30 units). A delivery of 25 reserves all of LOT-B and 10 of LOT-A, in two move lines. Under FIFO it would take 20 of LOT-A and 5 of LOT-B, and LOT-B could expire on the shelf.
 
 ---
 
-##### `trigger` — Auto vs Manual
+## Validation, Backorders and Splitting
 
-| Value | When it runs | How to trigger |
-|---|---|---|
-| `auto` | Daily scheduler — `_run_scheduler_tasks()` picks up all `trigger='auto'` orderpoints | No user action needed |
-| `manual` | Only when user clicks "Replenish" or "Order Once" button | User action required |
-
-The scheduler domain: `[('trigger', '=', 'auto'), ('product_id.active', '=', True)]`. Source: [`stock_rule.py:742`](../addons/stock/models/stock_rule.py#L742)
-
-**Snoozed orderpoints** (`snoozed_until` field): temporarily hidden from the replenishment view and skipped by the scheduler until that date.
-
----
-
-##### Manual "Replenish" Button
-> [`stock_orderpoint.py:342`](../addons/stock/models/stock_orderpoint.py#L342)
-
-`action_replenish()` directly calls `_procure_orderpoint_confirm()` — same code path as scheduler, no waiting needed. Used for both `trigger='auto'` and `trigger='manual'` orderpoints. After replenishment, auto-deletes temporary `trigger='manual'` orderpoints that had `qty_to_order <= 0`.
+- **Picked.** A move or line is processed when it is Picked. If nothing on the transfer is marked picked, every line with a quantity is treated as picked ([`stock_picking.py:1272`](../addons/stock/models/stock_picking.py#L1272)). Reserve fills Quantity, so validating a Ready transfer without touching anything processes the reserved quantities.
+- **Validate** ([`stock_picking.py:1176`](../addons/stock/models/stock_picking.py#L1176)):
+  1. A draft transfer is confirmed first, and its moves without a quantity get their full demand.
+  2. Sanity checks: no empty transfer, not all quantities zero, a lot or serial on every tracked line when the operation type uses lots ([`stock_picking.py:1129`](../addons/stock/models/stock_picking.py#L1129)).
+  3. Backorder decision: with Create Backorder = Ask and something unprocessed, the "Create Backorder?" wizard opens ([`stock_picking.py:1353`](../addons/stock/models/stock_picking.py#L1353)); Always creates it silently; Never cancels the rest and posts a note listing what was not delivered ([`stock_picking.py:996`](../addons/stock/models/stock_picking.py#L996)).
+  4. Done moves update quants, record lot customers, apply push rules, reserve downstream moves and create the backorder ([`stock_move.py:2350`](../addons/stock/models/stock_move.py#L2350)).
+  5. Afterwards: re-reservation for receipts and internal transfers, the confirmation email for deliveries when enabled ([`stock_picking.py:1058`](../addons/stock/models/stock_picking.py#L1058)), and the operation type's auto-print reports.
+- **Backorder**: a copy of the transfer with "Back Order of" set; reserved at once when its operation type reserves at confirmation ([`stock_picking.py:1397`](../addons/stock/models/stock_picking.py#L1397)).
+- **Split** (action menu): keeps the quantities already filled in this transfer and moves the rest to a new backorder, without validating anything ([`stock_picking.py:1247`](../addons/stock/models/stock_picking.py#L1247)).
+- **Zero Demand Warning**: Mark as To Do or Validate on a transfer that has lines with zero demand opens a wizard with Remove lines / Keep lines ([`stock_picking.py:768`](../addons/stock/models/stock_picking.py#L768), [`stock_zero_demand_confirmation.py:4`](../addons/stock/wizard/stock_zero_demand_confirmation.py#L4)).
+- **Cancel**: done moves cannot be cancelled; return them instead ([`stock_move.py:2273`](../addons/stock/models/stock_move.py#L2273)).
+- **Lock / Unlock**: done transfers are locked; Inventory Administrators can unlock them to correct done quantities.
 
 ---
 
-##### Replenishment Report — Dynamic Orderpoints
+## Returns
 
-`_get_orderpoint_action()` ([`stock_orderpoint.py:492`](../addons/stock/models/stock_orderpoint.py#L492)) powers the **Inventory → Operations → Replenishment** view:
+`stock.return.picking` does not exist in 20.0; returns are ordinary transfers created by `stock.picking._create_return()`.
 
-1. Queries all internal locations for products with negative forecast (on_hand + incoming - outgoing < 0)
-2. Subtracts already-in-progress quantities (open POs, existing orderpoints)
-3. Auto-creates temporary `trigger='manual'` orderpoints (SUPERUSER) for items not already covered
-4. Auto-deletes these temporary orderpoints after they are fulfilled (`_unlink_processed_orderpoints`)
+- **Return** on a done transfer creates a draft transfer of the operation type's "Operation Type for Returns" (or the same type), starting where the original ended and going back to its source (to the return type's default destination when that type is a receipt), "Return of" set, each move linked to its original move and chained so that returning part of a PICK/PACK/OUT chain stays consistent ([`stock_picking.py:976`](../addons/stock/models/stock_picking.py#L976), [`:911`](../addons/stock/models/stock_picking.py#L911)).
+- **Every line starts at quantity 0** ([`stock_picking.py:939`](../addons/stock/models/stock_picking.py#L939)). Enter what comes back, or click **Return All** (original done quantity minus what earlier returns already took back) or **Clear** ([`stock_picking.py:823`](../addons/stock/models/stock_picking.py#L823)). Then confirm and validate like any transfer.
+- **Exchange** on a return that is Ready or Done creates a new transfer that sends the returned quantities again; it is not flagged as a return ([`stock_picking.py:843`](../addons/stock/models/stock_picking.py#L843)).
+- Returned moves keep the sale line link, so the order's delivered quantity decreases ([`stock.py:399`](../addons/sale_stock/models/stock.py#L399)). A return reason can be stored on the transfer ([`stock.py:264`](../addons/sale_stock/models/stock.py#L264)).
 
-These auto-created orderpoints are invisible to the user — they only appear in the replenishment report list and disappear once replenished.
+### Customer portal returns (`sale_stock`)
 
----
-
-**How it fires** ([`stock_orderpoint.py:707`](../addons/stock/models/stock_orderpoint.py#L707)):
-```
-_procure_orderpoint_confirm()
-  for each orderpoint in batches of 1000:
-    if qty_to_order > 0:
-      date = lead_horizon_date → adjusted by horizon_days if set
-      values = _prepare_procurement_values(date)
-        → includes: route_ids=orderpoint.route_id, date_planned, date_deadline, warehouse_id
-      Procurement(product, qty_to_order, uom, location, name, origin, company, values)
-      → stock.rule.run([procurement], from_orderpoint=True)
-         from_orderpoint=True: if no vendor → raise immediately (not silent fallback)
-         from_orderpoint=True: if no rule → ProcurementException (caught per-savepoint)
-
-  on ProcurementException per orderpoint:
-    → skip that orderpoint, continue others
-    → schedule mail.activity warning on product.product_tmpl_id for responsible user
-```
-
-**`from_orderpoint=True` changes behavior:**
-- Without: no vendor → silently sets move to `make_to_stock`, logs to responsible user (MTO chain behaviour)
-- With: no vendor → immediately raises error + warning activity on product template
-
-Runs inside a `savepoint` — if one orderpoint fails (no rule, no vendor), only that orderpoint is skipped; the rest continue. Source: [`stock_orderpoint.py:744`](../addons/stock/models/stock_orderpoint.py#L744)
+With **Allow Spontaneous Returns**, an order whose first delivery is less than **Return Validity Days** old (default 14) shows a return dialog on the customer portal ([`sale_order.py:265`](../addons/sale_stock/models/sale_order.py#L265)). The customer picks delivered goods lines (combo items excluded), quantities and a **return reason**, then downloads a PDF return label with the warehouse address; the request is logged on the order ([`return_order.py:17`](../addons/sale_stock/controllers/return_order.py#L17), [`:67`](../addons/sale_stock/controllers/return_order.py#L67)). No return transfer is created: the warehouse creates it when the parcel arrives. Five reasons are seeded (wrong item, damaged, not meeting expectations, incorrect specifications, ordered by mistake) and can be edited from the setting ([`return_reason.py:6`](../addons/sale_stock/models/return_reason.py#L6)).
 
 ---
 
-#### The Stock Scheduler — What Runs It All
-> [`stock_rule.py:690`](../addons/stock/models/stock_rule.py#L690)
+## Scrap
 
-`StockRule._run_scheduler_tasks()` is the core scheduled action (runs daily by default):
+`stock.scrap` does not exist in 20.0; a scrap is a `stock.move` with `is_scrap` ([`stock_move.py:139`](../addons/stock/models/stock_move.py#L139)).
 
-```
-_run_scheduler_tasks():
-  1. Fetch all trigger='auto' + product.active=True orderpoints
-     _compute_qty_to_order_computed()   ← recompute all qty_to_order stored values
-     _compute_deadline_date()           ← recompute deadline dates
-     _procure_orderpoint_confirm()      ← fire all auto orderpoints that need stock
-     commit every 1000 (if use_new_cursor=True)
-
-  2. _get_moves_to_assign_domain():
-       find all confirmed/partially_available moves where:
-         reservation_date <= today  OR  picking_type.reservation_method = at_confirm
-     stock.move._action_assign()        ← reserve stock for those moves
-     batches of 1000, each committed separately (if use_new_cursor=True)
-     sorted by: reservation_date, -priority, date, id
-
-  3. stock.quant._quant_tasks()         ← merge duplicate quants
-```
-
-**`run_scheduler()` vs `_run_scheduler_tasks()`:**
-- `run_scheduler()` is the public method called by the scheduled action (cron). Wraps `_run_scheduler_tasks()` in a try/except that logs and re-raises.
-- `_run_scheduler_tasks()` is the actual implementation, extensible by other modules.
-
-**`use_new_cursor=True`** (set by the cron job): each batch opens its own DB cursor and commits independently. Allows partial progress to be saved if the job is interrupted.
-
-This is the scheduled path that keeps stock reserved and POs/receipts created for min/max rules. Without the scheduler running, orderpoints accumulate but don't fire.
+- Inventory → Operations → Adjustments → **Scrap** lists scrap moves. The Scrap action on a transfer or on a lot opens the Scrap Products form ([`stock_picking.py:1717`](../addons/stock/models/stock_picking.py#L1717), [`stock_lot.py:387`](../addons/stock/models/stock_lot.py#L387)); from a done transfer it takes the goods from the transfer's destination.
+- The destination must be an Inventory Loss location; the default is the company's scrap location, which is the company's Inventory Loss location with the lowest id ([`res_company.py:61`](../addons/stock/models/res_company.py#L61), [`stock_move.py:233`](../addons/stock/models/stock_move.py#L233)).
+- Scrapping validates immediately with a number from the `stock.scrap` sequence; if the stock is not there, a warning wizard asks to confirm ([`stock_move.py:2961`](../addons/stock/models/stock_move.py#L2961), [`:2972`](../addons/stock/models/stock_move.py#L2972)).
+- **Scrap Reason** tags describe the cause ([`stock_move.py:203`](../addons/stock/models/stock_move.py#L203)); **Should Replenish** launches a procurement for the scrapped quantity at the scrap's source location ([`stock_move.py:2941`](../addons/stock/models/stock_move.py#L2941)).
+- A scrap can be undone from Moves History → Revert ([`stock_move_line.py:1223`](../addons/stock/models/stock_move_line.py#L1223)).
 
 ---
 
-#### `_clean_reservations()` — Quant Reservation Reconciliation
+## Lots and Serial Numbers
 
-Source: [`stock_quant.py:1131`](../addons/stock/models/stock_quant.py#L1131)
-
-Called as part of the scheduler's `_quant_tasks()`. Compares `reserved_quantity` on each quant against the sum of `quantity_product_uom` across all matching move lines in assigned/partially_available/waiting/confirmed states. If there is a discrepancy, updates the quant to match the move lines.
-
-Also removes reservations on bypass locations (`should_bypass_reservation() = True`) — those quants should never have a non-zero `reserved_quantity`.
-
-Fixes data integrity issues from: interrupted transactions, manual DB edits, or concurrency edge cases.
-
----
-
-### Routes & Rules — End-to-End Cases by Document Type
-
-#### Case 1: SO → Delivery, stock available (1-step, MTS)
-
-**Product routes:** none special (falls back to warehouse route "WH: Deliver in 1 step")
-**Warehouse:** `delivery_steps = ship_only`
-
-**Rule involved:**
-```
-Route: "WH: Deliver in 1 step"
-  Rule: action=pull, procure_method=make_to_stock
-        location_src_id = WH/Stock
-        location_dest_id = Customers
-        picking_type = Delivery Orders
-```
-
-**Flow:**
-```
-SO confirmed
-  → _action_launch_stock_rule()
-  → run([Procurement(product, qty, location=Customers)])
-  → _get_rule(product, Customers) → pull rule found
-  → _run_pull(): create stock.move (WH/Stock → Customers, make_to_stock)
-  → _action_confirm(): state = confirmed
-  → _assign_picking(): WH/OUT/00001 created
-
-Scheduler or manual Check Availability:
-  → _action_assign() → reserves quant in WH/Stock
-  → move state = assigned, WH/OUT/00001 state = assigned (Ready)
-
-Operator validates WH/OUT/00001:
-  → quant WH/Stock: quantity -10
-  → SO line qty_delivered = 10
-```
+- Enable **Lots & Serial Numbers**, then set the product's Tracking to By Lots or By Unique Serial Number. The setting cannot be switched off while any product is tracked ([`res_config_settings.py:103`](../addons/stock/models/res_config_settings.py#L103)).
+- Per operation type, **Create New Lots/Serial Numbers** lets workers type new numbers and **Use Existing** lets them pick existing ones ([`stock_picking_type.py:87`](../addons/stock/models/stock_picking_type.py#L87)). Validation refuses tracked lines without a number.
+- Numbering: each product can use its own sequence or prefix (**Custom Lot/Serial**, [`product.py:850`](../addons/stock/models/product.py#L850)).
+- **Lot customers**: delivering a lot adds the customer to the lot's Customers field, which stays editable ([`stock_move_line.py:704`](../addons/stock/models/stock_move_line.py#L704), [`stock_lot.py:59`](../addons/stock/models/stock_lot.py#L59)); the contact form lists the lots delivered to it ([`res_partner.py:21`](../addons/stock/models/res_partner.py#L21)).
+- **Product recall**: Moves History → select lines → Send email mass-mails the partner of each line's transfer with the "Product recall" template ([`stock_move_line.py:715`](../addons/stock/models/stock_move_line.py#L715)).
+- **Expiration Dates** (`product_expiry`): each lot carries expiration, best-before, removal and alert dates computed from the product's day offsets ([`production_lot.py:12`](../addons/product_expiry/models/production_lot.py#L12)). It adds FEFO, keeps expired lots out of reservation and out of Free/Forecasted quantities.
+- Optional: print GS1 barcodes, and show lots and serial numbers on delivery slips (settings).
 
 ---
 
-#### Case 2: SO → 2-step delivery (pick_ship), stock available
+## Packages, Putaway and Storage
 
-**Warehouse:** `delivery_steps = pick_ship`
+### Packages
+- Enable **Packages**. A package (`stock.package`) can sit inside another package (**Container**, [`stock_package.py:44`](../addons/stock/models/stock_package.py#L44)).
+- **Put in Pack** on a transfer or from Detailed Operations sets the result package. Validation refuses a package that would move twice in one transfer or end up split across locations ([`stock_move.py:2350`](../addons/stock/models/stock_move.py#L2350)).
+- **Package types** carry dimensions and weight limits; they can hold routes (routes marked Applicable on Package Type) and be targeted by putaway rules.
 
-**Rules involved:**
-```
-Route: "WH: Deliver in 2 steps"
-  Rule 1: action=pull
-          location_src_id = WH/Stock
-          location_dest_id = Customers  (stored), effective dest = WH/Output (via pick_type default)
-          picking_type = Pick
-
-  Rule 2: action=push
-          location_src_id = WH/Output
-          location_dest_id = Customers
-          picking_type = Delivery Orders
-          (fires via _push_apply() when PICK is validated — not at SO confirmation)
-```
-Source: [`stock_warehouse.py:780`](../addons/stock/models/stock_warehouse.py#L780)
-
-**Flow:**
-```
-SO confirmed
-  → run([Procurement(product, qty, location=Customers)])
-  → _get_rule(product, Customers) → Rule 1 found (pull, pick_type)
-  → _run_pull(): create Move A (WH/Stock → WH/Output via pick_type default, location_final=Customers)
-  → _action_confirm(): state = confirmed
-  → _assign_picking(): WH/PICK/00001 created
-
-Result at SO confirmation:
-  WH/PICK/00001 (Move A): state = assigned (stock in WH/Stock)
-  [no OUT picking yet — OUT is created by push rule when PICK is validated]
-
-Operator validates WH/PICK/00001:
-  → goods move WH/Stock → WH/Output
-  → _action_done() on Move A
-  → _push_apply() finds push rule: WH/Output → Customers (out_type)
-  → creates Move B → WH/OUT/00001 created (state=assigned if Output has stock)
-
-Operator validates WH/OUT/00001:
-  → SO line qty_delivered updated
-```
-Source: [`test_sale_stock.py:1085`](../addons/sale_stock/tests/test_sale_stock.py#L1085) (only 1 picking at SO confirm), [`test_sale_stock.py:1102`](../addons/sale_stock/tests/test_sale_stock.py#L1102) (2nd picking after done)
+### Putaway rules and storage categories
+A putaway rule says: goods arriving in *When product arrives in* go to *Store to sublocation*, for a product, a category or a package type ([`product_strategy.py:16`](../addons/stock/models/product_strategy.py#L16)). Rules are ranked package type first, then product, then exact category, then parent category ([`stock_location.py:293`](../addons/stock/models/stock_location.py#L293)). Sublocation = No, Last Used (where this product was last stored) or Closest Location (the first child that fits, with a storage category) ([`product_strategy.py:69`](../addons/stock/models/product_strategy.py#L69), [`:133`](../addons/stock/models/product_strategy.py#L133)). **Storage categories** limit weight, quantity per product or package type, and whether a location accepts new products when not empty ([`stock_location.py:414`](../addons/stock/models/stock_location.py#L414)). Without a matching rule, goods stay at the destination (for a view location, its first internal child). Putaway runs when reservation creates move lines and when push rules rewrite destinations.
 
 ---
 
-#### Case 3: SO → MTO → auto Purchase Order
+## Inventory Adjustments
 
-**Product routes:** "Buy" + "Replenish on Order (MTO)"
-**Warehouse:** `delivery_steps = ship_only`
-
-**Rules involved:**
-```
-Route: "Replenish on Order (MTO)"  [on product]
-  Rule: action=pull, procure_method=make_to_order
-        location_src_id = WH/Stock
-        location_dest_id = Customers
-        picking_type = Delivery Orders
-
-Route: "Buy"  [on product or warehouse]
-  Rule: action=buy
-        location_dest_id = WH/Stock
-        picking_type = Receipts
-```
-
-**Flow:**
-```
-SO confirmed
-  → run([Procurement(product, qty, location=Customers)])
-  → _get_rule(product, Customers)
-      product has MTO route → MTO pull rule found (procure_method=make_to_order)
-  → _run_pull(): create Move A (WH/Stock → Customers, make_to_order)
-  → _action_confirm():
-      make_to_order → state = waiting
-      fires run([Procurement(product, qty, location=WH/Stock)])
-
-  → _get_rule(product, WH/Stock)
-      product has Buy route → buy rule found
-  → _run_buy():
-      _get_matching_supplier() → Vendor A found on product.seller_ids
-      _make_po_get_domain() = (partner=Vendor A, company=MyCompany, ...)
-      existing open PO for Vendor A? no → create purchase.order (SUPERUSER, draft)
-      create purchase.order.line for product, qty=10
-      PO line linked to Move A via move_dest_ids
-
-Result:
-  WH/OUT/00001 (Move A): state = waiting
-  PO/00001 (draft): 1 line → product qty=10
-
-User confirms PO/00001:
-  → receipt WH/IN/00001 created (Vendor → WH/Stock)
-
-User validates WH/IN/00001:
-  → quant WH/Stock: +10
-  → _trigger_assign() fires on Move A
-  → Move A: waiting → assigned
-  → WH/OUT/00001 becomes Ready
-
-User validates WH/OUT/00001 → delivery done
-```
-
-**Key:** The SO never directly creates a PO. The MTO rule creates a `waiting` move which fires a second `run()` call to WH/Stock. The "Buy" rule answers that second call.
+- **Physical Inventory** (Operations → Adjustments) lists quants. Enter the Counted quantity and Apply: Odoo creates moves between the product's Inventory Adjustment location and the quant's location, updates the location's last and next count dates, and reserves waiting moves that the new stock can serve ([`stock_quant.py:1028`](../addons/stock/models/stock_quant.py#L1028)).
+- If stock moved since the count was entered, the "Conflict in Inventory Adjustment" wizard asks which quantity wins ([`stock_quant.py:465`](../addons/stock/models/stock_quant.py#L465)).
+- Counting schedule: company **Annual Inventory Date**, per-location Inventory Frequency, and a Scheduled date per quant.
+- **Revert** in Moves History creates the opposite moves for inventory adjustments and scraps ([`stock_move_line.py:1223`](../addons/stock/models/stock_move_line.py#L1223)).
+- Editing On Hand on the product form (Inventory Administrator) creates an adjustment in the company's first warehouse stock location ([`product.py:276`](../addons/stock/models/product.py#L276)).
+- **Inventory at Date**: Reporting → Stock has a date picker in the side panel that recomputes quantities at a past date ([`stock_report_search_panel.xml:9`](../addons/stock/static/src/views/search/stock_report_search_panel.xml#L9)).
 
 ---
 
-#### Case 4: SO → MTO → auto Manufacturing Order
+## Replenishment
 
-Same as Case 3 but product has "Manufacture" route instead of "Buy".
+### Reordering rules (`stock.warehouse.orderpoint`)
 
-**Rules involved:**
-```
-Route: "Replenish on Order (MTO)"  [on product]
-  Rule: action=pull, procure_method=make_to_order
-        location_src_id = WH/Stock
-        location_dest_id = Customers
+| Field (UI) | Effect |
+|---|---|
+| Trigger: Auto / Manual | Auto rules run from the scheduler and from immediate triggers; Manual rules only from the Replenishment screen ([`stock_orderpoint.py:32`](../addons/stock/models/stock_orderpoint.py#L32)) |
+| Min / Max | Forecast below Min at the lead-time horizon → order up to Max ([`stock_orderpoint.py:57`](../addons/stock/models/stock_orderpoint.py#L57)) |
+| Multiple | Round the quantity up to a unit or packaging; with Buy, vendor units are allowed ([`stock_orderpoint.py:89`](../addons/stock/models/stock_orderpoint.py#L89)) |
+| Route | Force a Buy, Manufacture or product route; empty = the rules found for the product and location ([`stock_orderpoint.py:101`](../addons/stock/models/stock_orderpoint.py#L101)) |
+| Daily Demand, Based on, % | Demand estimate used by Suggest Min-Max and the information popup ([`stock_orderpoint.py:68`](../addons/stock/models/stock_orderpoint.py#L68)) |
+| Snoozed | Hides a manual rule until a date |
 
-Route: "Manufacture"  [on product, requires BOM]
-  Rule: action=manufacture
-        location_dest_id = WH/Stock
-        picking_type = Manufacturing
-```
+One rule per product, location and company ([`stock_orderpoint.py:127`](../addons/stock/models/stock_orderpoint.py#L127)).
 
-**Flow difference at step 2 of Case 3:**
-```
-  → _get_rule(product, WH/Stock)
-      product has Manufacture route + BOM exists → manufacture rule found
-  → _run_manufacture():
-      mrp.production created (SUPERUSER)
-      auto-confirm logic (_should_auto_confirm_procurement_mo):
-        if no raw_ids: auto-confirm when (no workorders AND (from orderpoint OR downstream move.procure_method == make_to_stock))
-        if has raw_ids: auto-confirm when not from orderpoint
-      NOTE: MTO procurement has procure_method=make_to_order downstream → does NOT auto-confirm
-      Source: mrp/models/stock_rule.py:35
-      MO linked to Move A via move_dest_ids
+**How much is ordered.** If the forecast at the lead-time horizon is below Min, the quantity is Max − (forecast at that horizon + quantity in progress), rounded up to the Multiple ([`stock_orderpoint.py:498`](../addons/stock/models/stock_orderpoint.py#L498)). The horizon is today + lead days + the company **Replenishment Horizon** (default 365 days, [`res_company.py:48`](../addons/stock/models/res_company.py#L48)). Lead days add the rules' Lead Times ([`stock_rule.py:388`](../addons/stock/models/stock_rule.py#L388)) and, for Buy, the vendor lead time plus Days to Purchase, or 365 days when no vendor is found ([`stock_rule.py:180`](../addons/purchase_stock/models/stock_rule.py#L180)). Quantity in progress (with `purchase_stock`) is what already sits on unconfirmed RFQs for that location.
 
-Result:
-  WH/OUT/00001 (Move A): state = waiting
-  MO/00001: confirmed, component reservation started
+**Buttons.** **Order** orders the manually entered quantity, else enough to reach Max ([`stock_orderpoint.py:379`](../addons/stock/models/stock_orderpoint.py#L379), [`:469`](../addons/stock/models/stock_orderpoint.py#L469)); **Automate** switches the rule to Auto and orders; **Snooze** hides it. **Suggest Min-Max** recomputes Daily Demand from past deliveries to customers and production minus customer returns over the chosen period, multiplied by the % factor, and scales Min and Max keeping their current days of coverage ([`stock_orderpoint_suggest.py:29`](../addons/stock/wizard/stock_orderpoint_suggest.py#L29), [`stock_orderpoint.py:886`](../addons/stock/models/stock_orderpoint.py#L886)).
 
-MO validated (components consumed, finished product produced):
-  → finished product move done → WH/Stock +qty
-  → _trigger_assign() fires on Move A
-  → WH/OUT/00001 becomes Ready → operator validates → delivery done
-```
+### The Replenishment screen
 
-**Filter:** If the product has no BOM with `type='normal'`, the Manufacture route is filtered out by `_filter_warehouse_routes()` and the rule is never found. Source: [`mrp/models/stock_rule.py:74`](../addons/mrp/models/stock_rule.py#L74)
+Inventory → Operations → Procurement → Replenishment ([`stock_orderpoint.py:528`](../addons/stock/models/stock_orderpoint.py#L528)) looks for products with a negative forecast in each warehouse, subtracts what existing rules and RFQs already cover, and creates temporary Manual rules for the rest. Those temporary rules are deleted once nothing is left to order ([`stock_orderpoint.py:715`](../addons/stock/models/stock_orderpoint.py#L715)). The product-form **Replenish** button runs one procurement at the warehouse's stock location with the chosen route ([`product_replenish.py:89`](../addons/stock/wizard/product_replenish.py#L89)).
+
+### Scheduler and immediate triggers
+
+The daily cron **Procurement: run scheduler** ([`stock_sequence_data.xml:56`](../addons/stock/data/stock_sequence_data.xml#L56)) runs [`_run_scheduler_tasks()`](../addons/stock/models/stock_rule.py#L681):
+
+1. Auto reordering rules of active products: recompute and procure, in batches of 1000, each batch in a savepoint so a failing rule does not stop the others ([`stock_orderpoint.py:748`](../addons/stock/models/stock_orderpoint.py#L748)).
+2. Reserve Waiting / Partially Available moves whose reservation date has come or whose operation type reserves at confirmation.
+3. Quant housekeeping (merge duplicates, repair reservations, drop empty quants).
+
+Auto rules also fire immediately: confirming a transfer triggers the Auto rules of the source locations it takes from ([`stock_move.py:2726`](../addons/stock/models/stock_move.py#L2726)).
+
+### Allocation report
+
+On a receipt or batch, the allocation report lists the incoming products with their free and assigned quantities and the waiting outgoing demands of the same warehouse ([`stock_allocation_report.py:82`](../addons/stock/report/stock_allocation_report.py#L82)). Assigning links the incoming move to the chosen delivery (a make-to-order link) and shares references between the documents. When the operation type has a Location for allocation, the incoming goods are routed there, and the delivery takes them from there once the receipt is done ([`stock_allocation_report.py:419`](../addons/stock/report/stock_allocation_report.py#L419), [`stock_move.py:2718`](../addons/stock/models/stock_move.py#L2718)).
 
 ---
 
-#### Case 5: Manual PO → 1-step receipt (no rules involved)
+## Batch, Wave and Cluster Transfers
 
-Routes/rules play **no role** in manual PO creation. The user creates the PO directly.
+Batching is part of `stock` (setting **Batch, Wave & Cluster Transfers**, [`res_config_settings.py:19`](../addons/stock/models/res_config_settings.py#L19)); the separate `stock_picking_batch` module does not exist in 20.0.
 
-```
-User creates purchase.order (draft)
-  → adds order lines manually
-
-User confirms PO:
-  → stock.move created (Vendor → WH/Stock) for each line
-  → picking WH/IN/00001 created (no reservation needed for incoming)
-  → move state = assigned
-
-User validates WH/IN/00001:
-  → quant WH/Stock: +qty per line
-  → _trigger_assign() fires: any waiting outgoing moves for these products
-    may become assigned automatically
-```
+- A batch (`stock.picking.batch`, [`stock_picking_batch.py:12`](../addons/stock/models/stock_picking_batch.py#L12)) groups whole transfers for one worker (Operations → Jobs). A **wave** (`is_wave`) groups individual move lines taken out of several transfers, for example all lines of one aisle.
+- Per operation type, **Automatic Batches** puts transfers into batches as they are confirmed, grouped by contact, destination country, source or destination location, with maximum lines or transfers ([`stock_picking_type.py:227`](../addons/stock/models/stock_picking_type.py#L227), [`stock_picking.py:2052`](../addons/stock/models/stock_picking.py#L2052)). The wave options group reserved lines by product, category, location or date ([`stock_move_line.py:1455`](../addons/stock/models/stock_move_line.py#L1455)).
+- Validating one transfer of a batch removes it from the batch unless the whole batch is done; backorders are re-batched automatically.
+- Transport Management (`stock_fleet`) requires this setting.
 
 ---
 
-#### Case 6: Orderpoint (reorder rule) → auto PO
+## Pattern: Secondary-Location Fallback
 
-**Setup:** Orderpoint on product X: `min_qty=5`, `max_qty=20`, route=Buy
+**Verdict:** a custom configuration pattern, not core behaviour, and it works on 20.0. It uses only core features (a hand-made route with two pull rules and the core supply method "Take From Stock, if unavailable, Trigger Another Rule"); no core route ships it and no code is needed.
 
-```
-Daily scheduler: _run_scheduler_tasks()
-  → _procure_orderpoint_confirm():
+**Goal:** deliver from WH/Stock; when WH/Stock is short, move the missing quantity from a second storage location (WH/Stock2) first.
 
-      orderpoint checks: qty_forecast = 3 < product_min_qty = 5
-      qty_to_order = max(5, 20) - (3 + 0 in_progress) = 17
-
-      builds Procurement(product=X, qty=17, location=WH/Stock, route_ids=Buy)
-      → run([procurement], from_orderpoint=True)
-
-  → _get_rule(product=X, WH/Stock, route_ids=Buy)
-      Buy route rule found (action=buy)
-  → _run_buy():
-      _get_matching_supplier() → Vendor A
-      existing open PO for Vendor A today? yes → add line qty=17
-                                              no → create new PO (draft)
-
-  [savepoint per batch — if this orderpoint fails, others continue]
-
-User receives PO, confirms it → WH/IN/00001 created
-User validates receipt → WH/Stock +17
-```
-
-**from_orderpoint=True** makes `_run_buy()` raise an immediate error if no supplier exists, instead of silently failing. Without this flag (e.g. from MTO), it logs and continues.
-
----
-
-#### Case 7: Orderpoint → auto Manufacturing Order
-
-**Setup:** Orderpoint on manufactured product, route=Manufacture
-
-```
-Scheduler → _procure_orderpoint_confirm()
-  → run([Procurement(product, qty, location=WH/Stock, route_ids=Manufacture)])
-  → _get_rule() → manufacture rule found (BOM exists)
-  → _run_manufacture():
-      mrp.production created (SUPERUSER)
-      _should_auto_confirm_procurement_mo() = True
-        (from_orderpoint=True + no workorders)
-      → MO auto-confirmed immediately
-      → component reservation started automatically
-
-Components available → MO validated → WH/Stock +qty
-```
-
----
-
-#### Summary: What triggers what
-
-| Trigger | run() called? | Rule action found | Document created |
-|---|---|---|---|
-| SO confirmed (MTS) | YES | `pull` (make_to_stock) | stock.move + picking |
-| SO confirmed (MTO + Buy) | YES × 2 | `pull` → `buy` | stock.move + PO |
-| SO confirmed (MTO + Manufacture) | YES × 2 | `pull` → `manufacture` | stock.move + MO |
-| Orderpoint fires | YES | `pull` | stock.move + picking |
-| Orderpoint fires | YES | `buy` | PO (draft) |
-| Orderpoint fires | YES | `manufacture` | MO (auto-confirmed) |
-| MTO move confirmed | YES (recursive) | `buy` or `manufacture` | PO or MO |
-| Picking validated (multi-step) | NO | `push` fires | next stock.move in chain |
-| Manual PO confirmed | NO | — | receipt picking directly |
-| Manual MO confirmed | NO | — | component moves directly |
-
-**Pattern:** Routes/rules fire only when demand is created automatically (SO, orderpoints, MTO chains). Manual documents bypass the rule system and create stock movements directly.
-
----
-
-#### Route Combinations — Practical Cheat Sheet
-
-> **Why Buy alone never creates a PO on SO confirm:**
-> `_get_rule_domain()` filters by `location_dest_id IN [procurement.location + parents]`. SO calls `run()` for `Customers`. Buy rule has `location_dest_id = WH/Stock` — it never matches the Customers search. Only MTO + the second recursive `run()` for WH/Stock reaches the Buy rule.
-> Source: [`stock_rule.py:652`](../addons/stock/models/stock_rule.py#L652)
-
-| Routes checked on product | SO confirm result | Delivery state | Auto-PO/MO? | Notes |
+| Rule (same route) | Source | Destination | Operation type | Supply Method |
 |---|---|---|---|---|
-| None (default) | Delivery created | `confirmed` (waiting for stock) | No | Warehouse pull rule (make_to_stock) fires |
-| **Buy only** | Delivery created | `confirmed` (waiting for stock) | **No** | Buy rule targets WH/Stock — not reached from SO. PO only via orderpoint. |
-| **MTO only** | **Error** | — | — | Second run() for WH/Stock finds no rule → UserError. Never use MTO without Buy or Manufacture. |
-| **Buy + MTO** | Delivery + PO created | `waiting` (until PO receipt) | **YES — PO** | MTO rule fires first (Customers), then Buy rule fires (WH/Stock). PO is draft, must be confirmed by user. |
-| **Manufacture + MTO** | Delivery + MO created | `waiting` (until MO done) | **YES — MO** | Same chain as Buy+MTO but manufacture rule fires for WH/Stock. MO is auto-confirmed if no workorders. |
-| Manual delivery (any routes) | Raw picking only | `confirmed` | **No** | `run()` never called. `rule_id = NULL`. Routes completely bypassed. |
+| Delivery | WH/Stock | Customers | Delivery Orders | Take From Stock, if unavailable, Trigger Another Rule |
+| Replenishment | WH/Stock2 | WH/Stock | Internal Transfers | Take From Stock |
 
-**When a PO IS created on SO confirm:**
-1. Product has **Buy + MTO** checked
-2. Product has a **vendor** set on its Purchase tab (`product.seller_ids`)
-3. If no vendor → delivery move silently falls back to `make_to_stock` and responsible user is notified (no error, no PO)
+**Prerequisites**
+1. Multi-Step Routes, to create the route.
+2. WH/Stock2 must not be under WH/Stock. Stock in a child location already counts as free stock of WH/Stock and is reserved from there, so the pattern would never fire.
+3. The route is Applicable on Product (or Product Category) and set on the product.
 
-**When Buy route DOES trigger a PO (without MTO):**
-- Orderpoint (reorder rule) runs → calls `run()` directly for `WH/Stock` with Buy route → Buy rule found → PO created
-
----
-
-## Business Flow: Sale Order → Delivery
-
+**What happens at confirmation**
 ```
-SO Draft
-   ↓  Confirm (button)
-_action_confirm() [sale_stock/models/sale_order.py:213]
-   ↓
-_action_launch_stock_rule() [sale_stock/models/sale_order_line.py:374]
-   ↓  for each storable line with unmatched qty
-stock.rule.run(procurements) [stock/models/stock_rule.py:450]
-   ↓
-_run_pull() [stock/models/stock_rule.py:288]
-   ↓  creates stock.move records and groups them into stock.picking
-stock.move._action_confirm()
-   ↓
-stock.picking created (state=confirmed or waiting)
-   ↓  reservation trigger (depends on picking type reservation_method)
-action_assign() / _action_assign() [stock/models/stock_picking.py:1196]
-   ↓  reserves quants
-stock.picking state=assigned (Ready)
-   ↓  warehouse operator validates
-button_validate() [stock/models/stock_picking.py:1397]
-   ↓
-_action_done() [stock/models/stock_picking.py:1256]
-   ↓  moves state→done, quants updated
-sale.order.line.qty_delivered updated (via compute)
+SO confirmed ─► procurement at Customers ─► product route wins over the warehouse delivery route ─► Delivery rule
+  ─► delivery move created as Take From Stock, confirmed, reserves what WH/Stock has
+  ─► shortfall = demand − Free quantity of WH/Stock ─► procurement at WH/Stock ─► Replenishment rule
+  ─► internal transfer WH/Stock2 → WH/Stock (reserved from WH/Stock2 if its type reserves at confirmation)
+Internal transfer validated ─► automatic re-reservation reserves the delivery (no link between the two)
 ```
 
-### Step 1 — SO Confirmation
+Sources: [`stock_rule.py:262`](../addons/stock/models/stock_rule.py#L262), [`stock_move.py:1770`](../addons/stock/models/stock_move.py#L1770), [`stock_move.py:1869`](../addons/stock/models/stock_move.py#L1869), [`stock_move.py:2750`](../addons/stock/models/stock_move.py#L2750).
 
-When user clicks **Confirm** on a sale order:
-
-1. [`SaleOrder._action_confirm()`](../addons/sale_stock/models/sale_order.py#L213) calls `order_line._action_launch_stock_rule()`.
-2. For each storable line, a `Procurement` namedtuple is built with: product, qty, UoM, destination location (customer), origin (SO name), warehouse, partner, dates.
-3. `stock.rule.run(procurements)` finds the matching rule by route and location and calls `_run_pull()`.
-4. `_run_pull()` creates `stock.move` records (as SUPERUSER) and calls `_action_confirm()` on them.
-5. Moves are grouped into a `stock.picking` by `(picking_type, origin, partner, scheduled_date, company)`.
-
-### Step 2 — Picking State After Confirmation
-
-The picking state is computed from move states. Source: [`addons/stock/models/stock_picking.py:575`](../addons/stock/models/stock_picking.py#L575)
-
-| State | Meaning |
-|---|---|
-| `draft` | Not confirmed yet |
-| `waiting` | Waiting for another operation (chained moves) |
-| `confirmed` | Waiting for stock to become available |
-| `assigned` | All (or enough) moves are reserved — Ready |
-| `done` | Transfer validated |
-| `cancel` | Cancelled |
-
-### Step 3 — Reservation
-
-Reservation is how Odoo commits available stock to a specific transfer. It writes `reserved_quantity` on the matching `stock.quant` row and creates `stock.move.line` detail records.
-
-**Reservation methods** (set on `stock.picking.type`): Source: [`addons/stock/models/stock_picking.py:68`](../addons/stock/models/stock_picking.py#L68)
-
-| Method | Behavior |
-|---|---|
-| `at_confirm` | Reserves immediately when picking is confirmed |
-| `manual` | Operator must click "Check Availability" |
-| `by_date` | Reserves N days before scheduled date (scheduled action) |
-
-**What happens during reservation** ([`stock_move._action_assign()`](../addons/stock/models/stock_move.py#L1888)):
-
-1. For each move in `confirmed/waiting/partially_available` state:
-2. Compute `missing_reserved_qty = product_uom_qty - already_reserved`
-3. Call `_update_reserved_quantity()` on `stock.quant` — increments `reserved_quantity` and returns how much was actually taken
-4. Create `stock.move.line` records for each `(location, lot, package, owner)` combination
-5. If full qty reserved → move state = `assigned`
-6. If partial → move state = `partially_available`
-
-**Bypass reservation** — some moves skip reservation entirely. `stock.move._should_bypass_reservation()` returns True when:
-- The source location's `usage` is `supplier`, `customer`, `inventory`, or `production`
-- OR the product is not storable (`is_storable = False`)
-
-Source: [`stock_location.py:410`](../addons/stock/models/stock_location.py#L410), [`stock_move.py:1812`](../addons/stock/models/stock_move.py#L1812)
-
-Moves that bypass reservation are created directly in `assigned` state — no quant reservation needed. This is why incoming receipts (source = supplier location) never need a "Check Availability" step.
-
-**Unreserve** via `do_unreserve()` ([`stock_picking.py:1394`](../addons/stock/models/stock_picking.py#L1394)) → `move._do_unreserve()` → decrements `reserved_quantity` on quants, deletes move lines.
-
-### Step 4 — Validation (button_validate)
-
-Source: [`addons/stock/models/stock_picking.py:1397`](../addons/stock/models/stock_picking.py#L1397)
-
-1. **Sanity check** — verifies quantities are set, lots are filled if tracked.
-2. **Pre-action hook** — triggers backorder wizard if some lines are not fully done.
-3. **`_action_done()`** ([`stock_picking.py:1256`](../addons/stock/models/stock_picking.py#L1256)):
-   - Calls `stock.move._action_done()` for all moves
-   - Moves update `stock.quant.quantity` (decrements source, increments destination)
-   - `reserved_quantity` on quants returns to 0 for validated lines
-   - `date_done` is set on the picking
-   - If incoming/internal moves, triggers `_trigger_assign()` to auto-reserve other waiting moves that now have stock
-4. Sale order line `qty_delivered` is recomputed from done moves.
-
-### Backorder Logic
-
-If only part of the demand is fulfilled at validation time:
-- A **backorder** picking is created with the remaining quantities
-- `backorder_id` on the new picking points to the original
-- Controlled by `picking_type.create_backorder`: `ask` / `always` / `never`
+**Limits**
+- The mixed supply method belongs on the delivery rule. The replenishment rule only needs Take From Stock; setting the mixed method there would chain further upstream when WH/Stock2 is short.
+- The shortfall is computed once, from Free quantity (on hand minus reserved) at confirmation. Stock that reaches WH/Stock later does not cancel the internal transfer.
+- The delivery is not linked to the internal transfer. It shows Waiting (or Ready with a partial reservation), not Waiting Another Operation, and a manual-reservation delivery waits for its own Reserve click.
+- If the product also has other product routes with a rule to WH/Stock, the lowest route Sequence decides which one answers the WH/Stock procurement.
+- A Buy or Manufacture route linked to no warehouse applies everywhere and is checked before product routes, so a product with a vendor or BoM would then be bought or made instead of moved from WH/Stock2. With the default data, Buy and Manufacture are linked to each warehouse and do not interfere.
+- Reserve on an existing delivery never raises the procurement, and adding the route after confirmation does not affect existing moves.
 
 ---
 
-## Move States
+## Security
 
-Source: [`addons/stock/models/stock_move.py:107`](../addons/stock/models/stock_move.py#L107)
+Security is `ir.access` rows ([`ir.access.csv`](../addons/stock/security/ir.access.csv), [`sale_stock ir.access.csv`](../addons/sale_stock/security/ir.access.csv)).
 
-| State | Meaning |
+| Group | Can do |
 |---|---|
-| `draft` | Created but not confirmed |
-| `waiting` | Waiting for upstream move (chained, multi-step) |
-| `confirmed` | Confirmed but stock not yet reserved |
-| `partially_available` | Some stock reserved, not all |
-| `assigned` | Fully reserved, ready to process |
-| `done` | Validated, physical move recorded |
-| `cancel` | Cancelled |
+| Internal user (`base.group_user`) | Read warehouses, locations, operation types, routes, rules, quants, packages; full access to move lines ([`ir.access.csv:43`](../addons/stock/security/ir.access.csv#L43)) |
+| Inventory / User (`stock.group_stock_user`, [`stock_security.xml:9`](../addons/stock/security/stock_security.xml#L9)) | Full access to transfers, batches, lots and packages; create and edit quants and moves (no delete, [`ir.access.csv:20`](../addons/stock/security/ir.access.csv#L20)); read reordering rules ([`ir.access.csv:28`](../addons/stock/security/ir.access.csv#L28)); read and edit sale orders and lines |
+| Inventory / Administrator (`stock.group_stock_manager`, [`stock_security.xml:15`](../addons/stock/security/stock_security.xml#L15)) | Everything above plus configuration: warehouses, locations, operation types, routes, rules, putaway, storage categories, reordering rules, move deletion |
+| Sales / User (`sale_stock`) | Create and edit transfers and moves; read warehouses, locations, reordering rules, rules, lots, package types ([`ir.access.csv:2`](../addons/sale_stock/security/ir.access.csv#L2)) |
+| Sales / Administrator | Delete transfers and moves; manage rules |
+| Portal | Read transfers where they are the partner or the order customer ([`ir.access.csv:4`](../addons/sale_stock/security/ir.access.csv#L4)) |
+
+Company restrictions: warehouses, transfers, batches, operation types, moves, reordering rules and putaway rules require `company_id in company_ids` ([`ir.access.csv:4`](../addons/stock/security/ir.access.csv#L4)); locations, lots, quants, packages, rules, routes, move lines and storage categories also accept records without a company. The feature groups behind settings (Storage Locations, Multi-Step Routes, Packages, Lots, Consignment, ...) are implied for all internal users when enabled. Rules create moves as superuser, so a salesperson can confirm an order without stock rights.
 
 ---
 
-## Multi-Step Delivery: How Chaining Works
+## Configuration & Settings
 
-For `pick_ship` (2 steps), pickings are created in stages — **not all at SO confirmation**:
+### Inventory settings (Inventory → Configuration → Settings)
 
-**At SO confirmation:**
-- Pull rule fires → Move 1 (Pick): WH/Stock → WH/Output (effective), `picking_type=pick_type`
-- WH/PICK/00001 created, state = assigned (if stock available)
-- No OUT picking yet
+Source: [`res_config_settings.py`](../addons/stock/models/res_config_settings.py), view [`res_config_settings_views.xml`](../addons/stock/views/res_config_settings_views.xml).
 
-**When WH/PICK is validated:**
-- `_action_done()` calls `_push_apply()` on Move 1
-- Push rule found: WH/Output → Customer, `picking_type=out_type`
-- Move 2 (Ship) created → WH/OUT/00001 created (state=assigned)
+| Setting | What it changes |
+|---|---|
+| Packages | Packages, Put in Pack, package types, Least Packages removal |
+| Batch, Wave & Cluster Transfers | Jobs menu, batches and waves, automatic batching per operation type; turning it off also unticks Transport Management |
+| Partner-Specific Instructions | Shows the contact's stock instruction (`picking_warn_msg`) on transfers; it does not block anything |
+| Shipping Policy | Company default for new orders and operation types; saving rewrites the Shipping Policy of every operation type of the company ([`res_config_settings.py:103`](../addons/stock/models/res_config_settings.py#L103)) |
+| Quality / Quality Worksheet | Installs the enterprise quality modules |
+| Annual Inventory Date | Default next count date for quants in locations without a frequency |
+| Barcode Scanner / Stock Barcode Database | Installs `stock_barcode` (enterprise) / the barcode lookup database |
+| Delivery Methods | Installs `delivery`; buttons to configure methods and find providers |
+| Transport Management | Installs `stock_fleet` (docks, vehicles, consignment notes); needs batches |
+| Confirmation Email / Text Confirmation | Email (or SMS through `stock_sms`) to the customer when a delivery is done |
+| Signature | Sign button on delivery orders |
+| Variants / Units & Packagings | Product variants; several units and packagings |
+| Lots & Serial Numbers (+ Print GS1 Barcodes, Separator) | Lot/serial tracking; cannot be disabled while products are tracked |
+| Expiration Dates | Installs `product_expiry` (lot dates, FEFO, expired stock excluded) |
+| Display Lots & Serial Numbers on Delivery Slips | Prints them on the slip |
+| Consignment | Owner on quants and transfers (stock owned by a third party) |
+| Storage Locations | Sub-locations, Internal Transfers type, putaway rules; cannot be disabled with several warehouses in a company |
+| Multi-Step Routes | Warehouse steps, routes and rules menus; switches Storage Locations on |
+| Replenishment Horizon (days) | How far ahead reordering rules look; 0 = just in time |
+| Dropshipping | Installs `stock_dropshipping` (vendor ships to the customer) |
+| Replenish on Order (MTO) | Unarchives the global MTO route ([`res_config_settings.py:46`](../addons/stock/models/res_config_settings.py#L46)) |
 
-For `pick_pack_ship` (3 steps), each step's picking is created when the previous step is validated via push rule. At SO confirmation only the PICK picking exists.
+### Settings added by `sale_stock`
 
-Source: [`test_sale_stock.py:1085`](../addons/sale_stock/tests/test_sale_stock.py#L1085) (1 picking after confirm), [`test_sale_stock.py:1102`](../addons/sale_stock/tests/test_sale_stock.py#L1102) (2nd after done), [`stock_move.py:2127`](../addons/stock/models/stock_move.py#L2127) (_push_apply called in _action_done)
+Source: [`res_config_settings.py`](../addons/sale_stock/models/res_config_settings.py), [`res_company.py`](../addons/sale_stock/models/res_company.py).
+
+| Setting | What it changes |
+|---|---|
+| Security Lead Time for Sales (days) | Schedules deliveries that many days before the promised date ([`res_company.py:12`](../addons/sale_stock/models/res_company.py#L12)) |
+| Allow Spontaneous Returns + Return Validity Days + Manage Return Reasons | Portal return requests within N days of the first delivery; return reasons list ([`res_config_settings_views.xml:21`](../addons/sale_stock/views/res_config_settings_views.xml#L21)) |
+
+### Per-record configuration that matters
+- Warehouse: Incoming / Outgoing Shipments, Resupply From, Buy / Manufacture to Resupply.
+- Operation type: Reservation Method, Create Backorder, Shipping Policy, lot options, return type, allocation location, auto-batch, auto-print.
+- Product: Tracking, Routes (MTO, resupply, custom), Responsible, descriptions for receipts and deliveries.
+- Product category: Routes, Force Removal Strategy, Reserve Packagings.
+- Location: Removal Strategy, Storage Category, Inventory Frequency, Replenishments flag.
+- Sale order line: Routes (routes marked Selectable on Sales Order Line).
+
+### System parameters
+
+| Key | Effect when true |
+|---|---|
+| `stock.picking_no_auto_reserve` | No automatic re-reservation after receipts and internal transfers ([`stock_move.py:2750`](../addons/stock/models/stock_move.py#L2750)) |
+| `stock.no_auto_scheduler` | No immediate reordering-rule trigger at transfer confirmation ([`stock_move.py:2726`](../addons/stock/models/stock_move.py#L2726)) |
+| `stock.cancel_moves_origin` | Cancelling a move with Cancel Next Move also cancels its origin moves ([`stock_move.py:2273`](../addons/stock/models/stock_move.py#L2273)) |
+| `stock.intercompany_auto_unpack` | Packages sent to another company are unpacked on validation ([`stock_picking.py:1045`](../addons/stock/models/stock_picking.py#L1045)) |
 
 ---
 
-## Key Models
+## Dependencies
 
-### `stock.warehouse`
-> [`addons/stock/models/stock_warehouse.py`](../addons/stock/models/stock_warehouse.py)
-
-| Field | Type | Purpose |
-|---|---|---|
-| `lot_stock_id` | Many2one(stock.location) | Main storage location (WH/Stock) |
-| `delivery_steps` | Selection | `ship_only`, `pick_ship`, `pick_pack_ship` |
-| `reception_steps` | Selection | `one_step`, `two_steps`, `three_steps` |
-| `delivery_route_id` | Many2one(stock.route) | Route used for outgoing |
-| `reception_route_id` | Many2one(stock.route) | Route used for incoming |
-| `mto_pull_id` | Many2one(stock.rule) | MTO rule for this warehouse |
-| `out_type_id` | Many2one(stock.picking.type) | Delivery operation type |
-| `pick_type_id` | Many2one(stock.picking.type) | Pick operation type |
-| `in_type_id` | Many2one(stock.picking.type) | Receipt operation type |
-
-### `stock.picking.type`
-> [`addons/stock/models/stock_picking.py:20`](../addons/stock/models/stock_picking.py#L20)
-
-Operation type controls how a picking behaves.
-
-| Field | Type | Purpose |
-|---|---|---|
-| `code` | Selection | `incoming`, `outgoing`, `internal` |
-| `reservation_method` | Selection | When to reserve: `at_confirm`, `manual`, `by_date` |
-| `create_backorder` | Selection | `ask`, `always`, `never` |
-| `default_location_src_id` | Many2one | Default source location |
-| `default_location_dest_id` | Many2one | Default destination location |
-
-### `stock.picking`
-> [`addons/stock/models/stock_picking.py:538`](../addons/stock/models/stock_picking.py#L538)
-
-Groups multiple moves into one transfer document.
-
-| Field | Type | Purpose |
-|---|---|---|
-| `picking_type_id` | Many2one | Operation type |
-| `state` | Selection | Computed from move states |
-| `move_ids` | One2many(stock.move) | All moves in this transfer |
-| `move_line_ids` | One2many(stock.move.line) | Detail lines (per lot/location) |
-| `backorder_id` | Many2one(stock.picking) | Original picking if this is a backorder |
-| `scheduled_date` | Datetime | When this transfer should be processed |
-| `date_deadline` | Datetime | Deadline to deliver on-time to customer |
-| `move_type` | Selection | `direct` (partial OK) / `one` (all at once) |
-
-### `stock.move`
-> [`addons/stock/models/stock_move.py:18`](../addons/stock/models/stock_move.py#L18)
-
-One product line in a transfer. The granular unit of demand.
-
-| Field | Type | Purpose |
-|---|---|---|
-| `product_id` | Many2one | Product to move |
-| `product_uom_qty` | Float | Demanded quantity |
-| `quantity` | Float | Done quantity (filled at validation) |
-| `location_id` | Many2one(stock.location) | Source |
-| `location_dest_id` | Many2one(stock.location) | Destination |
-| `state` | Selection | See move states above |
-| `procure_method` | Selection | `make_to_stock` / `make_to_order` |
-| `move_dest_ids` | Many2many(stock.move) | Next move(s) in chain |
-| `move_orig_ids` | Many2many(stock.move) | Previous move(s) in chain |
-| `rule_id` | Many2one(stock.rule) | Rule that generated this move |
-| `sale_line_id` | Many2one(sale.order.line) | Source SO line (added by sale_stock) |
-
-### `stock.move.line`
-> [`addons/stock/models/stock_move_line.py`](../addons/stock/models/stock_move_line.py)
-
-Detail record for one move: specific lot, package, sub-location. Created during reservation.
-
-### `stock.quant`
-> [`addons/stock/models/stock_quant.py:19`](../addons/stock/models/stock_quant.py#L19)
-
-Physical stock ledger. One row per `(product, location, lot, package, owner)`.
-
-| Field | Meaning |
+| Requires | Why |
 |---|---|
-| `quantity` | On-hand (set by move validation) |
-| `reserved_quantity` | Committed to pending moves |
-| `available_quantity` | `quantity - reserved_quantity` |
+| `product` | Products, units, packagings; `is_storable` lives here ([`__manifest__.py`](../addons/stock/__manifest__.py)) |
+| `barcodes_gs1_nomenclature` | Barcode and GS1 parsing for locations, lots, packages |
+| `digest` | Inventory KPIs in the periodic digest email |
+| `sale` + `stock_account` (for `sale_stock`) | Sale orders; valuation of the delivery moves ([`__manifest__.py:20`](../addons/sale_stock/__manifest__.py#L20)); `sale_stock` auto-installs |
 
-### `stock.rule`
-> [`addons/stock/models/stock_rule.py:42`](../addons/stock/models/stock_rule.py#L42)
-
-Defines how a procurement is fulfilled: which picking type, source/dest locations, supply method.
+| Works With (optional) | What It Adds |
+|---|---|
+| `purchase_stock` | Buy route, RFQs from procurements, vendor lead times in reordering rules |
+| `mrp` | Manufacture route, kits, component and finished-product moves ([`mrp.md`](mrp.md)) |
+| `stock_account` | Valuation and COGS ([`stock_valuation.md`](stock_valuation.md)) |
+| `product_expiry` | Lot dates, FEFO, expired stock excluded from reservation |
+| `stock_dropshipping` | Dropship route and operation type |
+| `stock_delivery`, `stock_fleet`, `stock_sms` | Carriers and labels, transport management, SMS confirmation |
+| `stock_barcode`, `quality_control` (enterprise) | Barcode app; quality checks on transfers |
 
 ---
 
 ## Key Methods
 
-| Method | File:Line | Purpose |
-|---|---|---|
-| `SaleOrder._action_confirm()` | [`sale_stock/models/sale_order.py:213`](../addons/sale_stock/models/sale_order.py#L213) | Triggers stock rule on SO confirmation |
-| `SaleOrderLine._action_launch_stock_rule()` | [`sale_stock/models/sale_order_line.py:374`](../addons/sale_stock/models/sale_order_line.py#L374) | Builds procurements and calls `stock.rule.run()` |
-| `StockRule.run()` | [`stock/models/stock_rule.py:450`](../addons/stock/models/stock_rule.py#L450) | Finds matching rules and dispatches to `_run_pull()` |
-| `StockRule._run_pull()` | [`stock/models/stock_rule.py:288`](../addons/stock/models/stock_rule.py#L288) | Creates `stock.move` records and confirms them |
-| `StockPicking.action_assign()` | [`stock/models/stock_picking.py:1196`](../addons/stock/models/stock_picking.py#L1196) | Triggers reservation (Check Availability button) |
-| `StockMove._action_assign()` | [`stock/models/stock_move.py:1888`](../addons/stock/models/stock_move.py#L1888) | Reserves quants and creates move lines |
-| `StockQuant._update_reserved_quantity()` | [`stock/models/stock_quant.py:1098`](../addons/stock/models/stock_quant.py#L1098) | Increments/decrements `reserved_quantity` on quants |
-| `StockPicking.button_validate()` | [`stock/models/stock_picking.py:1397`](../addons/stock/models/stock_picking.py#L1397) | Validates the transfer (Validate button) |
-| `StockPicking._action_done()` | [`stock/models/stock_picking.py:1256`](../addons/stock/models/stock_picking.py#L1256) | Finalises moves, updates quants, triggers downstream assigns |
-| `StockPicking.do_unreserve()` | [`stock/models/stock_picking.py:1394`](../addons/stock/models/stock_picking.py#L1394) | Releases reserved quantities back to available |
-
----
-
-## Reservation Deep Dive
-
-### How `_action_assign()` Works
-
-Source: [`addons/stock/models/stock_move.py:1888`](../addons/stock/models/stock_move.py#L1888)
-
-For each move:
-
-1. Compute `missing_qty = product_uom_qty - already_reserved`.
-2. If `procure_method = make_to_order` and no upstream move → skip (no stock to reserve).
-3. If `move_orig_ids` exists (chained): look at what upstream move lines delivered to the intermediate location and reserve from there.
-4. Otherwise: call `_update_reserved_quantity(need, location_id)` on `stock.quant`.
-   - Quant selects available units respecting removal strategy (FIFO/FEFO/LIFO).
-   - `reserved_quantity` incremented on the quant.
-   - Returns actual taken quantity.
-5. Create `stock.move.line` records for each `(location, lot, package, owner)` combination.
-6. Move state → `assigned` if fully reserved, `partially_available` if partial.
-
-### Removal Strategy (Quant Selection)
-
-**What it is:** When Odoo reserves stock for a delivery/transfer, it needs to decide **which specific quants** (which lot, which shelf, which package) to take from. The removal strategy is the rule that controls this picking order.
-
-**When it fires:** During reservation (`_action_assign`). The chain is:
-
-1. A picking is confirmed or the user clicks "Check Availability"
-2. `stock.move._action_assign()` is called — [stock_move.py:1888](../addons/stock/models/stock_move.py#L1888)
-3. For each move, it calls `_update_reserved_quantity()` — [stock_move.py:1975](../addons/stock/models/stock_move.py#L1975)
-4. Which calls `stock.quant._get_reserve_quantity()` — [stock_quant.py:833](../addons/stock/models/stock_quant.py#L833)
-5. Which calls `stock.quant._gather()` — [stock_quant.py:770](../addons/stock/models/stock_quant.py#L770)
-6. **Inside `_gather()`**, the removal strategy is resolved and quants are sorted accordingly
-7. `_get_reserve_quantity()` then walks the sorted quants one by one, reserving from each until the needed qty is fulfilled
-
-**In plain terms:** "I need 25 units of Product X from WH/Stock. Which quants do I take first?" The removal strategy answers that question.
-
-#### Where to set it (lookup priority)
-
-Source: [`stock_quant.py:617–627`](../addons/stock/models/stock_quant.py#L617)
-
-| Priority | Where | Field | UI label | Behavior |
-|---|---|---|---|---|
-| 1st (wins) | Product Category form | `removal_strategy_id` | "Force Removal Strategy" | Overrides everything. Applies regardless of which location stock is picked from. |
-| 2nd | Location form (walks up parents) | `removal_strategy_id` | "Removal Strategy" | If product category has no strategy, Odoo checks the source location. If empty, checks the parent location, then grandparent, etc. |
-| Default | — | — | — | If nothing is set anywhere: **FIFO** |
-
-**Example:** Product category "Dairy" has FEFO set. Location WH/Stock has FIFO set. When reserving milk → **FEFO wins** (product category always takes priority).
-
-#### Available strategies
-
-Source: [`stock_quant.py:740–747`](../addons/stock/models/stock_quant.py#L740), [`stock_quant.py:770–790`](../addons/stock/models/stock_quant.py#L770)
-
-**FIFO — First In First Out** (method: `fifo`, default)
-
-Sorts by: `in_date ASC, id ASC`
-
-Picks quants that **entered the location earliest**. `in_date` is stamped on the quant when stock physically arrives (receipt validation). If two quants arrived at the same time, the one with the lower database ID goes first.
-
-**LIFO — Last In First Out** (method: `lifo`)
-
-Sorts by: `in_date DESC, id DESC`
-
-Opposite of FIFO — picks the **most recently arrived** quants first.
-
-**FEFO — First Expiry First Out** (method: `fefo`)
-
-Sorts by: `removal_date ASC, in_date ASC, id ASC`
-
-Picks quants whose **removal date is soonest**. Requires the `product_expiry` module (Settings > Inventory > Traceability > Expiration Dates). Source: [`product_expiry/models/stock_quant.py:25–28`](../addons/product_expiry/models/stock_quant.py#L25)
-
-Key dates on `stock.lot` (all auto-computed from `expiration_date` minus product template offsets):
-
-| Field | UI label | What it means | Used by FEFO? |
-|---|---|---|---|
-| `expiration_date` | Expiration Date | Goods become dangerous / must not be consumed | No |
-| `removal_date` | Removal Date | Goods should be pulled from shelves | **Yes — this is the sort key** |
-| `use_date` | Best Before Date | Quality starts deteriorating (not dangerous) | No |
-| `alert_date` | Alert Date | Triggers expiration alert activity | No |
-
-Source: [`production_lot.py:12–20`](../addons/product_expiry/models/production_lot.py#L12)
-
-Important: when `removal_date` passes (is in the past), `available_quantity` on the quant is forced to **0** — the lot becomes unreservable. Source: [`product_expiry/models/stock_quant.py:30–36`](../addons/product_expiry/models/stock_quant.py#L30)
-
-**Closest Location** (method: `closest`)
-
-Sorts by: `location_id.complete_name ASC` (Python sort, not SQL)
-
-Picks quants from the sub-location whose **full path name comes first alphabetically** (e.g., `WH/Stock/Aisle-1/Shelf-A` before `WH/Stock/Aisle-2/Shelf-B`). This is a proxy for physical proximity — works if location naming reflects physical layout. Source: [`stock_quant.py:788–789`](../addons/stock/models/stock_quant.py#L788)
-
-**Least Packages** (method: `least_packages`)
-
-Uses an **A* search algorithm** to find the fewest packages that cover the needed quantity. Source: [`stock_quant.py:629–737`](../addons/stock/models/stock_quant.py#L629)
-
-How it works:
-1. Groups quants by `package_id`, calculates available qty per package
-2. Unpackaged items are treated as individual units (qty=1 each)
-3. Runs A* search: tries combinations of packages, uses heuristic `remaining_qty / largest_package_qty` to estimate remaining packages needed
-4. Returns the combination that uses the fewest packages to fulfil the demand
-5. If no packages exist, falls back to standard FIFO domain
-6. Catches `MemoryError` gracefully if the search space is too large
-
-Example: Need 50 units. Available packages: [48, 25, 25, 10]. Algorithm picks the 48-pack + one 25-pack (2 packages, 73 units) rather than 25+25+10 (3 packages, 60 units).
-
-#### End-to-end walkthrough
-
-Scenario: Warehouse stores cheese (tracked by lot). Product category "Dairy" has **FEFO** removal strategy.
-
-| Lot | `in_date` | `removal_date` | Available qty |
-|---|---|---|---|
-| LOT-A | Jan 1 | Mar 15 | 20 |
-| LOT-B | Jan 10 | Mar 5 | 15 |
-| LOT-C | Feb 1 | Mar 25 | 30 |
-
-Sale order confirmed for 25 units. Reservation runs:
-
-1. `_action_assign()` called on the delivery move
-2. `_gather()` resolves strategy → FEFO (from product category)
-3. Quants sorted by `removal_date ASC`: LOT-B (Mar 5), LOT-A (Mar 15), LOT-C (Mar 25)
-4. `_get_reserve_quantity()` walks the sorted list:
-   - LOT-B: take all 15 → remaining need = 10
-   - LOT-A: take 10 of 20 → remaining need = 0
-5. Two `stock.move.line` records created (one per lot)
-6. Move state → `assigned`
-
-Result: LOT-B (expiring soonest) is fully consumed first. LOT-C is untouched.
-
-If the strategy were **FIFO** instead: LOT-A (Jan 1, oldest) would be taken first (20 units), then LOT-B (5 units). Expiration dates would be ignored entirely — LOT-B might expire on the shelf.
-
-### available_quantity vs virtual_available
-
-| Field | Location | Meaning |
-|---|---|---|
-| `available_quantity` | `stock.quant` | On-hand minus reserved (current) |
-| `qty_available` | `product.product` | Total on-hand across all internal locations |
-| `free_qty` | `product.product` | `qty_available` minus all reserved |
-| `virtual_available` | `product.product` | Forecasted: on-hand + incoming - outgoing |
-
----
-
-## Delivery Status on Sale Order
-
-Source: [`addons/sale_stock/models/sale_order.py:33`](../addons/sale_stock/models/sale_order.py#L33)
-
-| `delivery_status` | Condition |
+| Method | Role |
 |---|---|
-| `False` | No pickings or all cancelled |
-| `pending` | Pickings exist, none done |
-| `started` | At least one picking done, no line qty delivered yet |
-| `partial` | At least one picking done, some `qty_delivered` > 0 |
-| `full` | All pickings done or cancelled |
-
-`qty_delivered` on each order line is computed from done outgoing `stock.move` records ([`sale_stock/models/sale_order_line.py:196`](../addons/sale_stock/models/sale_order_line.py#L196)).
-
----
-
-## UI Entry Points
-
-| Entry Point | Path | What It Does |
-|---|---|---|
-| Confirm button | SO form | Triggers `_action_confirm()`, creates pickings |
-| Delivery smart button | SO form | Opens related `stock.picking` records |
-| Check Availability | Picking form | Calls `action_assign()`, reserves stock |
-| Unreserve | Picking form | Calls `do_unreserve()`, frees reserved stock |
-| Validate | Picking form | Calls `button_validate()`, finalises transfer |
-| Return | Picking form (done) | Creates reverse picking |
-| Backorder | Wizard at validation | Creates new picking for remaining qty |
-| Inventory menu | Inventory → Operations → Transfers | Lists all pickings by type |
-| Inventory Overview | Inventory → Overview | Kanban by operation type |
+| [`SaleOrderLine._action_launch_stock_rule()`](../addons/sale_stock/models/sale_order_line.py#L375) | Builds procurements from confirmed goods lines |
+| [`StockRule.run()`](../addons/stock/models/stock_rule.py#L426) | Finds a rule per procurement and dispatches by action |
+| [`StockRule._get_rule()`](../addons/stock/models/stock_rule.py#L546) | Route priority and location walk |
+| [`StockMove._action_confirm()`](../addons/stock/models/stock_move.py#L1770) | Sets Waiting / Waiting Another Move, raises upstream procurements, groups into transfers |
+| [`StockMove._action_assign()`](../addons/stock/models/stock_move.py#L2135) | Reservation |
+| [`StockPicking.button_validate()`](../addons/stock/models/stock_picking.py#L1176) | Checks, backorder wizard, validation |
+| [`StockMove._action_done()`](../addons/stock/models/stock_move.py#L2350) | Quant updates, push rules, downstream reservation, backorders |
+| [`StockMove._push_apply()`](../addons/stock/models/stock_move.py#L1270) | Next step of multi-step flows |
+| [`StockPicking._create_return()`](../addons/stock/models/stock_picking.py#L976) | Draft return transfer |
+| [`StockWarehouseOrderpoint._procure_orderpoint_confirm()`](../addons/stock/models/stock_orderpoint.py#L748) | Reordering rules to procurements |
+| [`StockRule._run_scheduler_tasks()`](../addons/stock/models/stock_rule.py#L681) | Nightly scheduler |
 
 ---
 
-## Configuration
+## Gotchas & Non-Obvious Behavior
 
-| Setting | Location | Effect |
-|---|---|---|
-| `delivery_steps` (UI: "Outgoing Shipments") | Inventory → Config → Warehouses → Warehouse Configuration tab | Sets how many operations a delivery requires — **only visible when Storage Locations (`stock.group_adv_location`) is enabled** |
-| `reception_steps` (UI: "Incoming Shipments") | Inventory → Config → Warehouses → Warehouse Configuration tab | Sets how many operations a receipt requires — **only visible when Storage Locations (`stock.group_adv_location`) is enabled** |
-| `reservation_method` | Operation Type form | When stock gets reserved |
-| `create_backorder` | Operation Type form | Whether leftover qty creates a new picking |
-| `use_create_lots` | Operation Type form | Whether new lot numbers can be created |
-| Multi-Locations | Settings → Inventory | Enables sub-locations within warehouses |
-| Multi-Warehouses | Settings → Inventory | Enables multiple warehouses per company |
-
----
-
-## Edge Cases & Gotchas
-
-- **Negative stock:** By default Odoo allows it. There is no `allow_negative_stock` field on `stock.location`. Negative stock prevention is handled as a parameter in quant availability logic (`stock.quant`), not as a per-location config field. Source: [`stock_quant.py`](../addons/stock/models/stock_quant.py)
-- **MTO + MTS hybrid:** `mts_else_mto` procure method first tries to take from stock; only triggers an order if stock is insufficient.
-- **SO line qty decrease after confirmation:** For moves that are not yet done, Odoo automatically reduces the move quantity to match the new SO line quantity. This applies to both pick and delivery moves. Source: [`test_sale_stock.py:1092`](../addons/sale_stock/tests/test_sale_stock.py#L1092)
-- **Cancelling a confirmed SO:** Calls `picking_ids.action_cancel()` for all non-done pickings and unreserves all stock. Source: [`sale_stock/models/sale_order.py:252`](../addons/sale_stock/models/sale_order.py#L252)
-- **Changing delivery address on SO:** Odoo creates a chatter warning on open pickings but does NOT automatically update `partner_id` on them unless `update_delivery_shipping_partner` context is set. Source: [`sale_stock/models/sale_order.py:160`](../addons/sale_stock/models/sale_order.py#L160)
-- **Picking state is computed:** `stock.picking.state` is computed from move states — you cannot write it directly.
-- **Reservation priority:** When multiple pickings compete for the same stock, high-priority (urgent) pickings and those with earlier deadlines are reserved first. Sort order in `action_assign()`: `(-priority, not deadline, deadline, date, id)`. Source: [`stock_picking.py:1203`](../addons/stock/models/stock_picking.py#L1203)
-- **Validated incoming moves trigger auto-assign:** After validating a receipt or internal transfer, `_trigger_assign()` runs to auto-reserve any waiting outgoing moves that now have sufficient stock. Source: [`stock_picking.py:1277`](../addons/stock/models/stock_picking.py#L1277)
-- **Delivery date propagation:** `commitment_date` on SO propagates to `date_deadline` on stock moves. Source: [`sale_stock/models/sale_order.py:176`](../addons/sale_stock/models/sale_order.py#L176)
-- **Check Availability never triggers pull rules:** `action_assign()` / `_action_assign()` only reserves stock that already exists at the source location. It does NOT trigger procurement or fire pull rules. Pull rules fire exclusively during `_action_confirm()` (when `procure_method` is `make_to_order` or `mts_else_mto`) or when `stock.rule.run()` is called directly by SO confirmation, scheduler, Replenish button, etc.
-- **`Quantity Done` is never auto-filled by Check Availability:** Check Availability creates `stock.move.line` records with `quantity` (reserved). `qty_done` is only set when the user validates or when an immediate transfer dialog fills it. These are separate concerns — reservation ≠ done.
-- **Custom fallback route: `mts_else_mto` belongs on the delivery rule, not the replenishment rule:** In a Stock → Customers (delivery) + Stock2 → Stock (replenishment) chain, set `procure_method=mts_else_mto` on the delivery rule. `_action_confirm()` checks `move.rule_id.procure_method` on the delivery move — the replenishment rule's `procure_method` is irrelevant at that stage. See [`stock_move.py:1554`](../addons/stock/models/stock_move.py#L1554).
-- **Existing moves ignore newly assigned routes:** Assigning a route to a product or changing rule `procure_method` after a picking is already created has no effect on that picking's move. The move already has `rule_id` set. Only new SO confirmations will use the updated configuration.
+- **Buy and Manufacture are not product checkboxes.** They are warehouse routes that apply when the product has a vendor or a regular BoM. With only a vendor, a sale order never creates an RFQ; add Replenish on Order (MTO) or a reordering rule.
+- **MTO without a vendor or BoM blocks confirmation** with "No rule has been found to replenish ...".
+- **Reserve never procures**, and changing routes or supply methods does not affect moves that already exist.
+- **Validating without marking anything picked processes every reserved quantity.** Mark lines picked to validate only part of a transfer.
+- **Return lines start at 0.** Use Return All for a full return; the portal request only produces a label, not a transfer.
+- **A printed transfer receives no new moves**: later quantity increases on the order create a second transfer.
+- **Changing the delivery address updates open transfers**, except when the same save also edits order lines.
+- **Negative stock is allowed**; nothing in `stock` prevents validating more than is on hand.
+- **Scrap destination**: the company scrap location is its Inventory Loss location with the lowest id. Installation creates the "Inventory adjustment" location before any "Scrap" location and creates "Scrap" only for companies that have no Inventory Loss location yet, so scraps usually land in "Inventory adjustment" unless another location is chosen on the scrap form ([`res_company.py:165`](../addons/stock/models/res_company.py#L165)).
+- **Suggest Min-Max needs a Daily Demand.** It scales Min and Max by their ratio to the stored Daily Demand; a rule whose Daily Demand is 0 gets Min = Max = 0 ([`stock_orderpoint_suggest.py:29`](../addons/stock/wizard/stock_orderpoint_suggest.py#L29)).
+- **Replenishment Horizon defaults to 365 days**, so reordering rules count demand planned up to a year ahead. Lower it for just-in-time ordering.
+- **Tracked quants come first**: at equal strategy, quants with a lot are reserved before untracked ones of the same product.
+- **Goods without Track Inventory still create deliveries**; their moves are Ready at once and never reserved.
+- **Several warehouses force Storage Locations on**, and Storage Locations cannot be switched off while a company has more than one warehouse.
+- **Warehouse addresses are transit locations**: delivering to a warehouse's own partner sends goods to a transit location, not to a customer.
+- **Route assignments are stored on templates**: the `stock_route_product` table holds `product.template` ids in its `product_id` column; query it through the template, not the variant.
+- **Delivery Status "Started"** means a first step (e.g. PICK) is done but nothing reached the customer yet.
 
 ---
 
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
+- [`stock_valuation.md`](stock_valuation.md) — valuation, COGS, periodic vs perpetual (configured in `account`)
+- [`inventory_forecast_report.md`](inventory_forecast_report.md) — forecast report and availability widget
+- [`mrp.md`](mrp.md) — manufacturing orders, kits, Manufacture rule
+- [`accounting_multicompany_branches.md`](accounting_multicompany_branches.md) — inter-company flows and security

@@ -32,6 +32,33 @@ The split key is `field.inherited`: on employee create/write, all inherited-from
 
 **New in 20.0 — fan-out to later versions.** Editing a version-related field on the employee form while *not* on the chronologically last version pops a confirmation dialog: *This version* / *Change all* / *Cancel*. "Change all" writes the same values to every version from the edited one forward and re-saves with `multi_update_version_ids` in the context, which widens the chatter "As of …" range to cover the whole run ([form_view.js:44](../addons/hr/static/src/views/form_view.js#L44)). Contract start/end are explicitly excluded from this fan-out (they have their own sync path, below).
 
+### Payroll "Version update" dialog (new in 20.0, `hr_payroll`)
+
+The mirror case of the fan-out dialog: you are on the **latest** version and it already has validated or paid payslips. Payroll asks whether the edit is a real change of terms (**Create new version** from a date) or a fix of a mistake (**Correct the current version**, which also affects those payslips). It exists so a raise entered in October does not silently rewrite the September payslips.
+
+**When it opens** — on the first field change of an edit session, not on save ([version_record_patch.js:15](../enterprise/hr_payroll/static/src/js/version_record_patch.js#L15)). It stays closed when any of these holds:
+
+| Skip condition | Where |
+|---|---|
+| The employee is new (not saved yet) | `!record.resId` |
+| A choice was already made in this edit session (reset on save/discard) | `this.versionChoice` |
+| Every pending change is `contract_date_end` or `resource_calendar_id` | `EXCLUDED_FIELDS`, [:7](../enterprise/hr_payroll/static/src/js/version_record_patch.js#L7) |
+| The form shows no version | `!version_id` |
+| A version with a later `date_version` exists (you are on an older one) | `action_check_version_status`, [hr_version.py:754](../enterprise/hr_payroll/models/hr_version.py#L754) |
+| The version has no payslip in `validated`/`paid` (draft/computed do not count) | `_get_valid_payslips_count`, [hr_version.py:642](../enterprise/hr_payroll/models/hr_version.py#L642) |
+
+The exclusion check looks at **all pending changes of the form**, not only the last field touched.
+
+**What each button does**
+
+| Choice | Result |
+|---|---|
+| Correct the current version | Normal save, nothing else. |
+| Create new version | On save, `action_create_version_from_update` copies the version, applies the changes that are `hr.version` fields, creates it via `create_version`, then **discards the form** ([version_record_patch.js:55](../enterprise/hr_payroll/static/src/js/version_record_patch.js#L55), [hr_version.py:769](../enterprise/hr_payroll/models/hr_version.py#L769)). Date must be after the current version start and not in the future. |
+| Discard / close | All pending changes on the form are discarded. |
+
+**Pitfall — employee-only fields.** Unlike the core fan-out dialog, which keeps only fields whose `related` points to `version_id`, this one only excludes two fields. Editing a phone, tags, or a custom `hr.employee` one2many such as `geo_payroll` work logs ([hr_employee.py:35](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_employee.py#L35)) opens it. Choosing *Create new version* for such an edit creates a copy of the version with no change and **throws the edit away**; choose *Correct the current version*. The default date is also broken (`"2026-09-" + "-01"` = `2026-09--01`), so the date field opens empty.
+
 ### Creating versions
 
 `create_version(values)` ([hr_employee.py:804](../addons/hr/models/hr_employee.py#L804)): finds the version in force at `date_version`, copies it, applies the diff. Traps:

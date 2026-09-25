@@ -1,207 +1,168 @@
-# AI Module — Odoo 19 Enterprise
+# AI Module — Odoo AI
 
-> **Module:** `ai` (+ ~20 satellite modules) | **Path:** [`enterprise/ai/`](../enterprise/ai/)
-> **License:** OEEL-1 (Enterprise only) | **pgvector required** (auto-detected by [`ai_auto_install`](../enterprise/ai_auto_install/))
+> **Module:** `ai` (+ about 55 satellite modules) | **Path:** [`enterprise/ai/`](../enterprise/ai/)
+> Verified against Odoo 20 source on 2026-09-24.
 
 ## What It Does & Why It Exists
 
-`ai` is the central LLM integration layer of Odoo Enterprise. It exposes three primary capabilities to every other module:
+`ai` is the central AI layer of Odoo Enterprise (license OEEL-1). Every AI feature in the other apps goes through it:
 
-1. **Conversational agents** (`ai.agent`) — partners-with-a-prompt that users chat with in Discuss, in form-view side panels, or in livechat.
-2. **AI server actions** (`ir.actions.server` with `state='ai'`) — automation steps that hand a record + a prompt to an LLM and let it call other server actions as "tools" (function-calling).
-3. **AI computed fields** (via [`ai_fields`](../enterprise/ai_fields/)) — `compute=` style fields whose value is a single-shot LLM call against record context, used by Studio, Documents, ESG, Recruitment, etc.
+1. **Agents** (`ai.agent`) — assistants with a prompt, skills and knowledge sources that users chat with in Discuss, in a record's side panel, from the systray, or as livechat operators.
+2. **AI server actions** (`ir.actions.server`, `state='ai'`) — an automation step that hands a record and a prompt to the model and lets it call other server actions as tools.
+3. **AI fields** ([`ai_fields`](../enterprise/ai_fields/)) — fields whose value is written by the model from the record's data, used by Studio and several apps.
+4. **Writing helpers** — "Write an email", "Rewrite content", chatter and file-viewer help, AI prompt blocks inside mail templates, image generation, voice transcription.
+5. **MCP server** ([`ai_mcp`](../enterprise/ai_mcp/)) — lets external AI clients (Claude, ChatGPT, Grok) query Odoo.
 
-The module is RAG-capable: each agent can have `ai.agent.source` records (attachments) that get chunked, embedded, and stored in pgvector. Retrieval is cosine similarity through `ai_embedding.embedding_vector` (1536 dims).
-
-It is **strictly bring-your-own-key**: there is no Odoo IAP fallback. If `ai.openai_key` / `ai.google_key` (or `ODOO_AI_CHATGPT_TOKEN` / `ODOO_AI_GEMINI_TOKEN` env vars) are not set, every AI call raises `UserError`.
+All model calls go to **Odoo AI**, an IAP paid service ([`iap_service_odoo_ai`](../enterprise/ai/data/iap_service_data.xml#L4); the manifest sets [`iap_paid_service`](../enterprise/ai/__manifest__.py#L80)). Usage consumes IAP credits of the `odoo_ai` account. There is **no bring-your-own-key**: no provider, model or API-key setting exists in the database. Odoo AI decides which upstream model answers.
 
 ---
 
-## The Big Picture — How It Works
+## The Big Picture — How a Request Flows
 
 ```
-User sends prompt in ai_chat channel
-   │
-   ▼
-ai.agent._generate_response(prompt, history, ctx)
-   │  builds system prompt + RAG context
-   ▼
-LLMApiService(provider=agent._get_provider()).request_llm(...)
-   │  loops up to ai.max_successive_calls (default 20)
-   │     ├─ provider-specific HTTP call (OpenAI Responses API or Gemini generateContent)
-   │     ├─ if response contains tool calls → run them, append outputs as "inputs"
-   │     └─ if pure text or __end_message → break
-   ▼
-Markdown sanitize → message_post on discuss.channel as agent partner
+Agent chat (async)                                  One-shot calls (sync)
+------------------                                  ---------------------
+user message in an ai_chat channel                  AI server action / AI field / composer button
+   |                                                   |
+   v                                                   v
+ai.session._save_and_submit_request                 ai.session._get_direct_response
+   |  POST /api/odoo_ai/1/get_completions              |  loop: POST /api/odoo_ai/1/get_completions_sync
+   |  with webhook_url + HMAC secret                   |    tool calls -> run ir.actions.server tools
+   v                                                   |    repeat until a text answer (max 30 rounds)
+Odoo AI (https://ai.api.odoo.com)                      v
+   |  calls back /ai/completion_result_ready        answer returned to the caller
+   v
+ai.session._continue_agent_loop
+   |  tool calls -> confirm / run tools -> next round
+   v
+answer posted in the channel as the agent's partner
 ```
 
-### Provider dispatch
-The whole module routes through one class: `LLMApiService` ([`utils/llm_api_service.py:87`](../enterprise/ai/utils/llm_api_service.py#L87)). Its `__init__` only knows two providers (`'openai'`, `'google'`) and raises `NotImplementedError` for anything else. Provider is derived from the chosen `llm_model` via the hard-coded `PROVIDERS` list in [`utils/llm_providers.py:16`](../enterprise/ai/utils/llm_providers.py#L16).
+- **Transport** — [`call_odoo_ai`](../enterprise/ai/utils/ai_utils.py#L109) posts to `<endpoint>/api/odoo_ai/<route>` with the IAP account token and database UUID. The endpoint defaults to [`https://ai.api.odoo.com`](../enterprise/ai/utils/ai_utils.py#L70) and can be changed with the ICP `ai.endpoint`.
+- **Chat is asynchronous** — [`_save_and_submit_request`](../enterprise/ai/models/ai_session.py#L470) stores the request on `ai.session`, submits it after commit, and waits in `loop_state='waiting_model'`. Odoo AI posts the result to [`completion_result_ready`](../enterprise/ai/controllers/thread.py#L142), a public route that checks an HMAC signature before resuming the session.
+- **One-shot calls are synchronous** — [`_run_agentic_loop`](../enterprise/ai/models/ai_session.py#L1194) calls [`1/get_completions_sync`](../enterprise/ai/models/ai_session.py#L1265) and runs tool calls in-process.
 
-### Agent vs. AI Action vs. AI Field — same pipe, different callers
+### Where AI shows up — same pipe, different callers
 
-| Caller | Provider/Model selection | Tools | History |
+| Caller | Tools | History | Path |
 |---|---|---|---|
-| `ai.agent` (chat) | User-selectable per agent (`llm_model` field) | `topic_ids.tool_ids` (`ir.actions.server use_in_ai=True`) | Yes (last N messages from channel) |
-| AI server action | **Hard-coded** OpenAI + `gpt-4.1` ([`ir_actions_server.py:26-27`](../enterprise/ai/models/ir_actions_server.py#L26)) | `ai_tool_ids` of the action | No |
-| AI computed field | **Hard-coded** `gpt-4.1` ([`ai_fields/tools.py:59`](../enterprise/ai_fields/tools.py#L59)) | None — schema-coerced output | No |
-
-This is intentional: agents are user-tunable; deterministic automation paths are pinned to a known model so prompt regressions don't surprise users.
+| Agent chat (`ai.agent`) | The agent's skills | Yes (the session's messages) | Async, webhook |
+| AI server action | `ai_tool_ids` of the action | No | Sync ([`_ai_action_run`](../enterprise/ai/models/ir_actions_server.py#L207)) |
+| AI field | None — output forced to the field's JSON schema, web grounding on | No | Sync ([ai_fields_tools.py](../enterprise/ai/utils/ai_fields_tools.py#L160)) |
+| Composer / prompt buttons | The agent's default tools | No | Sync, `/ai/get_direct_response` |
+| Scheduled agent automation (`ai_agentic`) | The agent's skills, auto-confirmed | Kept in a chat for inspection | Via `base.automation` |
 
 ---
 
-## The Provider System (the part that matters for Claude)
+## Agents, Skills and Tools
 
-### `Provider` NamedTuple
-```python
-PROVIDERS = [
-    Provider("openai", "OpenAI", "text-embedding-3-small", {...}, [llm tuples]),
-    Provider("google", "Google", "gemini-embedding-001",   {...}, [llm tuples]),
-]
-```
-([`llm_providers.py:16-52`](../enterprise/ai/utils/llm_providers.py#L16))
+### `ai.agent` — the assistant
 
-There is **no plugin/registry mechanism**. Adding a provider means editing this Python list. Other modules can monkey-patch it but nothing in core does.
+[ai_agent.py](../enterprise/ai/models/ai_agent.py#L43). Each agent owns a hidden `res.partner` so it can author messages.
 
-### `LLMApiService` branch points
-Every provider-aware method has an `if self.provider == 'openai': … elif 'google': … else raise NotImplementedError` switch:
+- **`system_prompt`** — the agent's instructions.
+- **`skill_ids`** — what it can do. New agents start with the native skills ([`skill_ids`](../enterprise/ai/models/ai_agent.py#L63)).
+- **`sources_ids`** + **`restrict_to_sources`** — knowledge for RAG, and whether it may answer only from it ([`restrict_to_sources`](../enterprise/ai/models/ai_agent.py#L58)).
+- **`allowed_agent_ids`** — other agents it may delegate to; delegation runs as a child `ai.session` ([`allowed_agent_ids`](../enterprise/ai/models/ai_agent.py#L80)).
+- **`embedding_model`** — set from Odoo AI's default when the agent is created.
+- The shipped **Odoo AI** agent ([data](../enterprise/ai/data/ai_agent_data.xml#L3)) is a system agent and cannot be deleted ([`_unlink_except_system_agent`](../enterprise/ai/models/ai_agent.py#L141)).
 
-| Method | Purpose |
+### `ai.skill` — instructions plus tools
+
+[ai_skill.py](../enterprise/ai/models/ai_skill.py#L6). A skill is a block of instructions and optional tools (`tool_ids`, server actions with `use_in_ai`). With tools it is "executable", without it is "guidance". Shipped skills: Shape View, Search Database, Update Records, Create Records, Generate Image, Web Search ([ai_skill_data.xml](../enterprise/ai/data/ai_skill_data.xml#L3)). Native skills (Generate Image, Web Search) cannot be edited or deleted. Removing a skill from an agent clears the tool state of its open sessions.
+
+`ai.topic` does not exist in 20.0; use `ai.skill`.
+
+### Tools — server actions the model may call
+
+A tool is an `ir.actions.server` with **Use in AI** ([`use_in_ai`](../enterprise/ai/models/ir_actions_server.py#L83)), an `ai_tool_name`, a description and, for code actions, a JSON schema for its arguments. The ORM helpers live on the abstract [`ai.tool`](../enterprise/ai/models/ai_tool.py#L53).
+
+- Tools run **with the user's rights**: the evaluation context uses a non-sudo environment ([`_ai_tool_run`](../enterprise/ai/models/ir_actions_server.py#L298)).
+- **Create Records** and **Update Records** stop and show a confirmation preview before writing ([update](../enterprise/ai/models/ai_tool.py#L1008), [create](../enterprise/ai/models/ai_tool.py#L1114)), unless the session is set to auto-confirm.
+- The generic record tools refuse every `ir.*` model (reading `ir.ui.menu` and `ir.attachment` excepted) and `base.automation`, `res.device`, `res.groups`, `res.groups.privilege`, `res.users.settings` ([`_check_agent_model_access`](../enterprise/ai/models/ai_tool.py#L96), [`AI_MODELS_BLOCKLIST`](../enterprise/ai/utils/ai_utils.py#L31)).
+- Limits: `ai.max_successive_calls` (30 model rounds per request) and `ai.max_tool_calls_per_call` (20 tool calls per round; the rest are returned as "Not executed").
+
+### `ai.session` — the conversation state
+
+[ai_session.py](../enterprise/ai/models/ai_session.py#L82). One session per chat (child sessions for delegation). `loop_state` tells where it waits: model, user confirmation, user answer, client result, external result or child session ([`loop_state`](../enterprise/ai/models/ai_session.py#L103)). Session options: web search, "think longer", restrict to sources, show agent steps, auto-confirm.
+
+---
+
+## RAG — Sources and Embeddings
+
+- **Sources** (`ai.agent.source`): files and URLs; `ai_documents_source` adds Documents, `ai_knowledge` adds Knowledge articles ([`type`](../enterprise/ai/models/ai_agent_source.py#L21)). Each source shows a status (processing, indexed, incomplete, failed, skipped) and can be switched off.
+- **Chunks and vectors** (`ai.embedding`): 1536-dimension pgvector column with an HNSW cosine index ([`embedding_vector`](../enterprise/ai/models/ai_embedding.py#L39)). Embeddings are computed through Odoo AI by crons ([ir_cron.xml](../enterprise/ai/data/ir_cron.xml#L5)); a credit failure marks the chunk `iap_credit_error`.
+- **Retrieval** ([`_build_rag_context`](../enterprise/ai/models/ai_agent.py#L206)): the prompt is embedded and the **top 5 chunks with cosine similarity ≥ 0.9** are added to the context ([`_get_similar_chunks`](../enterprise/ai/models/ai_embedding.py#L43)). Weakly related chunks are dropped, not ranked lower.
+- **Embedding model** — chosen by Odoo AI ([`_get_default_embedding_model`](../enterprise/ai/models/ai_embedding.py#L224)). A daily cron moves chunks and agents off embedding models Odoo AI has deprecated and re-embeds them ([`_cron_update_deprecated_embedding_models`](../enterprise/ai/models/ai_embedding.py#L283)).
+- **pgvector is mandatory.** The `ai` pre-init hook creates the `vector` extension or aborts the install ([`pgvector_is_available`](../enterprise/ai/__init__.py#L20)). `ai_auto_install` (auto-installed with `mail`) installs `ai` only when that succeeds ([ai_auto_install](../enterprise/ai_auto_install/__init__.py#L6)).
+
+---
+
+## Module Map
+
+| Module | Role |
 |---|---|
-| `__init__` ([line 88](../enterprise/ai/utils/llm_api_service.py#L88)) | Sets `base_url` |
-| `_get_api_token` ([line 211](../enterprise/ai/utils/llm_api_service.py#L211)) | Looks up config_parameter + env var |
-| `_request_llm` ([line 524](../enterprise/ai/utils/llm_api_service.py#L524)) | Dispatches to `_request_llm_openai` or `_request_llm_google` |
-| `_to_open_ai_tool_schema` ([line 672](../enterprise/ai/utils/llm_api_service.py#L672)) | Schema mutation only for OpenAI |
-| `_build_tool_call_response` ([line 692](../enterprise/ai/utils/llm_api_service.py#L692)) | Builds the per-provider tool-output object |
+| `ai` | Core: agents, skills, tools, sessions, embeddings, composer, transcription, AI server actions. Depends on `mail` and `iap` |
+| `ai_agentic` | The **AI** app (menus Agents; Configuration → Skills, Tools, Default Prompts) and scheduled agent automations on `base.automation` ([`ai_agent_id`](../enterprise/ai_agentic/models/base_automation.py#L17)). Not auto-installed |
+| `ai_auto_install` | Installs `ai` when pgvector is available |
+| `ai_fields`, `ai_server_actions`, `web_studio_ai_fields` | AI fields, AI field updates in server actions, Studio UI |
+| `ai_mcp` | MCP server at `/mcp` with OAuth (auto-installed with `ai`) |
+| `ai_livechat`, `ai_website_livechat` and `ai_website_*_livechat` | Agents as livechat operators, per website channel |
+| `ai_documents`, `ai_documents_source`, `ai_knowledge`, `ai_agentic_documents`, `ai_agentic_knowledge` | Document sorting, Documents and Knowledge as agent sources |
+| `ai_crm`, `ai_account`, `ai_account_reports`, `ai_sale`, `ai_purchase`, `ai_stock`, `ai_project`, `ai_product`, `ai_helpdesk`, `ai_calendar`, `ai_timesheet_grid`, `ai_mass_mailing`, `ai_social`, `ai_esg`, `ai_marketing_automation*` | App-specific prompts, tools and skills |
+| `ai_website`, `ai_html_builder`, `ai_cloud_storage` | Website and editor features, cloud-stored sources |
+| `voip_ai`, `sign_ai`, `hr_recruitment_ai` | Call transcription, Sign and Recruitment helpers |
 
-The OpenAI path uses the **Responses API** (`/responses`), not Chat Completions. Tool calls come back as `output[].type=='function_call'` items; tool results go back in as `function_call_output` items keyed by `call_id`.
+Every satellite except `ai_agentic` and the test modules is auto-installed when its dependencies are present. `ai_app` and `esg_csrd_ai` do not exist in 20.0; the AI app is `ai_agentic`, ESG uses `ai_esg`.
 
-The Google path uses Gemini's native API (not its OpenAI compatibility shim) because the shim doesn't handle `type: file`. Tool calls come back in `candidates[].content.parts[].functionCall`.
+Integration points in core models:
 
-### Embeddings
-`ai.embedding` ([`models/ai_embedding.py`](../enterprise/ai/models/ai_embedding.py)) stores 1536-dim vectors via the custom `Vector` ORM field ([`orm/field_vector`](../enterprise/ai/orm/)) and an `ivfflat` cosine-ops index. Each provider declares its own embedding model; switching an agent's LLM model also switches the embedding model and triggers re-embedding of all sources (`_sync_new_agent_provider`, [`ai_agent.py:343-346`](../enterprise/ai/models/ai_agent.py#L343)).
-
----
-
-## Module Map (what depends on what)
-
-```
-ai (core)
-├── ai_app          — packaging meta-module, depends on attachment_indexation
-├── ai_auto_install — installs ai if pgvector is present
-├── ai_fields       — AI computed fields (model.field with compute via LLM)
-│   ├── ai_server_actions — server actions of state='ai'
-│   ├── web_studio_ai_fields — Studio UI for creating AI fields
-│   └── test_ai_fields
-├── ai_knowledge    — Knowledge article AI text drafting
-├── ai_account      — Invoice/SO line text drafting
-├── ai_documents    — Auto-sort uploaded documents into folders
-│   ├── ai_documents_account
-│   └── ai_documents_source — index Documents as agent sources
-├── ai_crm          — Auto-create leads from text
-│   └── ai_crm_livechat
-├── ai_livechat     — AI agents as livechat operators
-│   └── ai_website_livechat
-├── ai_website
-├── voip_ai         — Whisper transcription of call recordings
-├── sign_ai
-├── hr_recruitment_ai
-└── esg_csrd_ai
-```
-
-External integration points the AI module hooks into:
-- **`mail`**: `mail.thread`, `mail.template`, `mail.render.mixin`, `mail.composer.mixin` — AI prompts in mail rendering.
-- **`discuss.channel`**: new `channel_type='ai_chat'` ([`discuss_channel.py:30`](../enterprise/ai/models/discuss_channel.py#L30)).
-- **`res.partner`**: every agent has a `partner_id` so it can be a chat author.
-- **`ir.actions.server`**: extended with `state='ai'` and tool metadata.
-- **`ir.attachment`**: file context source for prompts and embeddings.
+- **`discuss.channel`**: `channel_type='ai_chat'` and `ai_agent_id` (`groups=NO_ACCESS`, only sudo code writes it) ([discuss_channel.py](../enterprise/ai/models/discuss_channel.py#L17)).
+- **`mail.render.mixin`**: AI prompt blocks in templates are evaluated at render time when `eval_ai_prompts` is set ([mail_render_mixin.py](../enterprise/ai/models/mail_render_mixin.py#L22)).
+- **`ir.actions.server`**: `state='ai'`, tool metadata ([`state`](../enterprise/ai/models/ir_actions_server.py#L49)).
+- **`ai.composer`**: which agent and default prompt serve each entry point — HTML field, mail composer, text selection, chatter, systray, voice transcription, file viewer, media dialog ([`INTERFACE_KEYS`](../enterprise/ai/models/ai_composer.py#L11)).
 
 ---
 
 ## Configuration
 
-Settings (Settings → General Settings → Integrations):
+There is no AI settings page for keys or models. What you configure:
 
-| Field | config_parameter | env var | Effect |
-|---|---|---|---|
-| OpenAI key | `ai.openai_key` | `ODOO_AI_CHATGPT_TOKEN` | Required for any OpenAI/`gpt-*` model usage |
-| Google key | `ai.google_key` | `ODOO_AI_GEMINI_TOKEN` | Required for any Gemini model usage |
-| — | `ai.max_successive_calls` | — | Tool-call loop ceiling, default 20 |
-| — | `ai.max_tool_calls_per_call` | — | Parallel tool calls per turn, default 20 |
+- **Credits** — the Odoo AI IAP account; running out raises "Not enough credits to use Odoo AI" and sends a notification.
+- **AI app** (`ai_agentic`) — agents, skills, tools (administrators), default prompts per entry point.
+- **System parameters** — `ai.endpoint`, `ai.max_successive_calls` (30), `ai.max_tool_calls_per_call` (20), `ai.max_transcription_retries` (5, seeded).
+- **MCP** (Settings, `ai_mcp`) — **Dynamic Client Registration** (ICP `enable_dcr`, off) and **Allowed Client ID Metadata Documents** (ICP `cimd_allowed_urls`) ([res_config_settings.py](../enterprise/ai_mcp/models/res_config_settings.py#L8)).
 
-Defined in [`models/res_config_settings.py`](../enterprise/ai/models/res_config_settings.py) and [`views/res_config_settings_views.xml`](../enterprise/ai/views/res_config_settings_views.xml).
+**Access** ([ir.access.csv](../enterprise/ai/security/ir.access.csv)): internal users read agents, skills, composers, prompt buttons and sources; only `base.group_system` creates or edits them. A skill's tools are visible to administrators only. The AI app menu requires `base.group_user_regular`, so light users do not see it.
 
 ---
 
-## Why There Is No Claude (Anthropic) Provider
+## Claude, Anthropic and Other LLMs
 
-There is no architectural reason — Anthropic was simply not added to the `PROVIDERS` list. The codebase has no anthropic SDK import, no `'anthropic'` branch, and no `anthropic_key` setting. Adding it requires touching every dispatch point listed above.
+**Inside Odoo there is no provider choice for anyone.** Odoo AI selects the upstream models; code comments refer to OpenAI and Gemini behavior ([validators.py](../enterprise/ai/utils/tools_schema/validators.py#L84)), and live voice transcription opens a browser WebSocket straight to OpenAI's realtime API with a short-lived token from Odoo AI ([realtime_client.js](../enterprise/ai/static/src/core/realtime_client.js#L35)). No Anthropic path exists, and no customer key can be supplied for any vendor. `LLMApiService`, `llm_providers.PROVIDERS`, `ai.openai_key` and `ai.google_key` do not exist in 20.0.
 
-### Concrete differences vs. OpenAI / Gemini that complicate a port
+**The supported way to use Claude with Odoo is the MCP server** ([`ai_mcp`](../enterprise/ai_mcp/__manifest__.py#L18)):
 
-| Concern | OpenAI (current) | Anthropic Messages API | Impact |
-|---|---|---|---|
-| Endpoint | `POST /v1/responses` | `POST /v1/messages` | New base URL + path |
-| Auth | `Authorization: Bearer …` | `x-api-key: …` + `anthropic-version: 2023-06-01` header | New `_get_base_headers` branch |
-| System prompt | First role in `input` array | Top-level `system` field (string or content blocks) | New body shape |
-| User/assistant turns | `input: [{role, content:[...]}]` | `messages: [{role, content:[...]}]`, no system role allowed | Conversion of `inputs` and `chat_history` |
-| Tool definitions | `tools: [{type:"function", name, parameters, strict}]` | `tools: [{name, input_schema, description}]` (no `strict`, no `additionalProperties` rewrite) | New `_to_anthropic_tool_schema` |
-| Tool call in response | `output[].type=='function_call'` w/ `call_id` | `content[].type=='tool_use'` w/ `id` | Separate parser |
-| Tool result back to model | `{type:'function_call_output', call_id, output}` as next `input` | `{role:'user', content:[{type:'tool_result', tool_use_id, content}]}` | New `_build_tool_call_response` branch |
-| Files / PDFs | `{type:'input_file', file_data: data: URI}` | `{type:'document', source:{type:'base64', media_type, data}}` | New `_build_file` |
-| Images | `{type:'input_image', image_url}` | `{type:'image', source:{...}}` | Same |
-| Structured output | `text.format = json_schema (strict=true)` | Native `output_config.format` with `type: json_schema` (Opus 4.5+) | Reuse strict schema verbatim — no rewrite |
-| Web grounding | `web_search_preview` tool | `web_search_20250305` server tool with different config | Easy rename, but feature parity differs |
-| Embeddings | `text-embedding-3-small` (1536) | **None — Anthropic ships no embedding endpoint** | Hard problem (see below) |
-| Token usage shape | `usage.input_tokens / output_tokens / input_tokens_details.cached_tokens` | `usage.input_tokens / output_tokens / cache_read_input_tokens / cache_creation_input_tokens` | Adapt logging |
+- **Endpoint** `https://<odoo>/mcp`, bearer-authenticated with scope `mcp` ([mcp_controller.py](../enterprise/ai_mcp/controllers/mcp_controller.py#L19)). Two ways in: an API key generated with the MCP scope (user avatar → Security), or OAuth — Odoo acts as the authorization server (discovery, consent, token and revoke routes in [oauth_server_controller.py](../enterprise/ai_mcp/controllers/oauth_server_controller.py#L24)).
+- **Client identification** — clients publishing a Client ID Metadata Document are accepted when their URL is allowlisted; the seeded list contains ChatGPT, claude.ai MCP, Claude Code and Grok ([data](../enterprise/ai_mcp/data/ir_config_parameter_data.xml#L8)). Dynamic Client Registration is off by default.
+- **Tools** — shipped MCP tools are read-only: list models, list fields, search, read_group, and an initial-context tool (user, timezone, companies) ([data](../enterprise/ai_mcp/data/ir_actions_server_data.xml#L3)). An administrator can expose other eligible server actions with **Available in MCP** and must flag **Readonly Tool** truthfully ([`use_in_mcp`](../enterprise/ai_mcp/models/ir_actions_server.py#L10)).
+- **Rights** — calls run as the token's user after `_can_execute_action_on_records`. They are sent with `tool_request_confirmed=True` ([`_mcp_tools_call`](../enterprise/ai_mcp/models/ai_mcp_request_dispatcher.py#L67)): a write tool exposed to MCP runs without Odoo's confirmation preview, so the MCP client's own approval step is the only gate.
 
-### The embedding problem
-
-`ai.agent` couples chat model and embedding model through `_get_provider()` → `provider.embedding_model`. If Claude is the chat model, there is no Anthropic embedding to pair with it. Three honest options:
-
-1. **Decouple** — add `embedding_provider` separately on `ai.agent` so a Claude agent can use OpenAI/Google embeddings. Requires editing the `Provider` schema and the re-sync logic in [`ai_agent.py:333-347`](../enterprise/ai/models/ai_agent.py#L333).
-2. **Borrow** — give the Anthropic provider entry an `embedding_model` that points at OpenAI's `text-embedding-3-small`; route embedding calls to `LLMApiService(provider='openai')` regardless. Cheapest change, but requires the user to also configure an OpenAI key.
-3. **Voyage AI** — Anthropic's recommended embedding partner. Means another provider with its own auth and API. Most work, most consistent UX.
-
-### Hard-coded surfaces that won't pick up Claude automatically
-
-Even after adding the provider, these stay on OpenAI unless explicitly changed:
-
-- [`ir_actions_server.py:26-27`](../enterprise/ai/models/ir_actions_server.py#L26) — `AI_PROVIDER='openai'`, `AI_MODEL='gpt-4.1'`
-- [`ai_fields/tools.py:59`](../enterprise/ai_fields/tools.py#L59) — `OPENAI_MODEL='gpt-4.1'`
-- [`voip_ai/models/voip_call.py:63`](../enterprise/voip_ai/models/voip_call.py#L63) — `LLMApiService(self.env)` defaults to `provider='openai'` for Whisper transcription. Anthropic has no transcription endpoint, so this stays OpenAI regardless.
-
----
-
-## What It Would Take — Minimum Viable Anthropic Provider
-
-A custom addon `custom_addons/ai_anthropic/` that:
-
-1. **Extends `PROVIDERS`** by monkey-patching `odoo.addons.ai.utils.llm_providers.PROVIDERS.append(Provider('anthropic', 'Anthropic', borrowed_embedding_model, {...}, [('claude-opus-4-7','Claude Opus 4.7'), …]))` in `__init__.py` at import time. `post_init_hook` does not work here — it only fires on install, so patches would be lost on the next process restart (see [`ai_anthropic_integration_plan.md`](ai_anthropic_integration_plan.md) §8.2).
-2. **Patches `LLMApiService`** with `monkey_patch` or method override to add:
-   - `'anthropic'` branch in `__init__`, `_get_api_token`, `_request_llm`, `_build_tool_call_response`
-   - new `_request_llm_anthropic(...)` method translating system_prompts/user_prompts/tools/files/inputs → Messages API body and parsing `content[]` for `tool_use` / `text` blocks
-3. **Inherits `res.config.settings`** to add `anthropic_key` field + view extension.
-4. **Inherits `ai.agent`** only if you want the embedding decoupling (option 1 above) — otherwise nothing to change here, the new models will appear in the existing `llm_model` selection automatically because `_get_llm_model_selection` rebuilds from the patched `PROVIDERS`.
-
-### Realistic effort
-- ~400 LOC for the provider port itself
-- ~50 LOC for settings
-- Tests (mock the Messages API like [`test_gemini_integration.py`](../enterprise/ai/tests/test_gemini_integration.py) does for Gemini)
-- Decision point on embeddings before any of the above — that's the architectural choice, not the code.
-
-### Caveats Odoo-side
-- Hard-coded `AI_MODEL='gpt-4.1'` paths (server actions, ai_fields) will keep using OpenAI. To switch them to Claude you'd need to either fork those modules or add a config_parameter override and patch them too — that's a separate piece of work.
-- No fallback / retry across providers exists. If the chosen agent model fails, the call fails.
-- The tool-loop assumes the OpenAI semantics around `__end_message`. Claude's tool loop terminates differently — Claude returns `stop_reason='end_turn'` vs `'tool_use'`. The loop in `_request_llm_silent` ([line 608-660](../enterprise/ai/utils/llm_api_service.py#L608)) needs to respect that signal instead of just "no `next_actions`".
+Pointing `ai.endpoint` at a self-hosted service that speaks Odoo AI's private `/api/odoo_ai/1/*` protocol would be the only way to change the in-Odoo model [Guessing — the protocol is undocumented and not in this source].
 
 ---
 
 ## Edge Cases & Gotchas
 
-- **No `ai.composer` for tool action**: AI server actions don't go through `ai.composer`, so the user can't pick the model — it's always GPT-4.1.
-- **Channel garbage collection**: AI chat channels are auto-deleted after 1 day of inactivity ([`discuss_channel.py:108-115`](../enterprise/ai/models/discuss_channel.py#L108)).
-- **Provider switch re-embeds everything**: changing `llm_model` to a model from a different provider triggers re-embedding of all sources — costly on large source sets.
-- **Tool call cap**: `ai.max_tool_calls_per_call` (default 20) silently truncates parallel tool batches. If Claude's parallel-tool behavior differs, this limit may bite earlier.
-- **`is_system_agent` agents cannot be deleted** ([`ai_agent.py:356-361`](../enterprise/ai/models/ai_agent.py#L356)).
-- **`ai_agent_id` is `groups=fields.NO_ACCESS`** on `discuss.channel` — only sudo flows can write it.
+- **Agent chat needs an Internet-reachable Odoo.** Odoo AI calls back `web.base.url` + `/ai/completion_result_ready`. Behind NAT or a firewall, chats stay "Waiting for Model"; no code times a waiting session out. One-shot features (AI fields, server actions, composer buttons) work without the callback.
+- **Web grounding and tools do not mix.** A one-shot call with both raises an error; use the Web Search skill instead ([`_run_agentic_loop`](../enterprise/ai/models/ai_session.py#L1194)).
+- **AI chat channels are garbage-collected** after 30 days without activity, or after 1 day if they hold no message ([`_remove_ai_chat_channels`](../enterprise/ai/models/discuss_channel.py#L57)).
+- **AI fields fill in the background.** A daily cron computes empty AI fields in batches ([`_cron_fill_ai_fields`](../enterprise/ai_fields/models/ir_model_fields.py#L141)); saving a field's prompt triggers it. Its comment about "the openAI key" is stale — there is no key.
+- **AI server actions log their tool calls** in the record's chatter under an AI author.
+- **Scheduled agent automations auto-confirm tool calls** — the agent can create and update records without a preview; each run is kept in a chat.
+- **High RAG threshold** — with similarity ≥ 0.9, loosely phrased questions often get no source chunk.
+- **Live voice audio goes from the browser to OpenAI**, not through the Odoo server; recorded calls are transcribed through Odoo AI (`1/get_transcription`).
+
+## Related Docs
+
+- [`INDEX.md`](INDEX.md)

@@ -2,7 +2,8 @@
 
 > **Module:** `equity` | **Path:** [`enterprise/equity/`](../enterprise/equity/)
 > **Odoo Apps category:** Accounting/Accounting (UI placement only -- no accounting integration)
-> **License:** OEEL-1 (**changed in 20.0**, was LGPL-3)
+> **License:** OEEL-1
+> Verified against Odoo 20 source on 2026-09-24.
 
 ## What It Does
 
@@ -47,7 +48,7 @@ Track equity ownership structure, cap table changes, and shareholder communicati
 ### Use Case 4: Share Transfer Between Shareholders
 **Situation:** Founder A sells 1,000 shares to a new investor.
 **In Odoo:** Equity > Ownership > Transactions > Create. Set transaction_type = "Transfer", seller = Founder A, subscriber = New Investor, security_class = "Ordinary Shares", securities = 1,000, price per security = 200.
-**Result:** Cap table automatically deducts 1,000 shares from Founder A and adds 1,000 to New Investor. Validation at [`_compute_invalid_securities_error():147-212`](../enterprise/equity/models/equity_transaction.py#L147) ensures the seller has enough shares. **Changed in 20.0:** a single **Send** button on the transaction notifies seller and subscriber together (in 19.0 there were separate "Send to Seller" / "Send to Subscriber" buttons).
+**Result:** Cap table automatically deducts 1,000 shares from Founder A and adds 1,000 to New Investor. Validation at [`_compute_invalid_securities_error():147-212`](../enterprise/equity/models/equity_transaction.py#L147) ensures the seller has enough shares. A single **Send** button on the transaction notifies seller and subscriber together.
 
 ---
 
@@ -75,7 +76,7 @@ Track equity ownership structure, cap table changes, and shareholder communicati
 2. The `equity.mail.compose.message` wizard opens with the shareholder template pre-filled
 3. Each recipient gets their own message, with a portal button carrying a token unique to them
 
-**Why this works:** [`_equity_ensure_token()`](../enterprise/equity/models/res_partner.py#L138) generates a UUID token stored in a `NO_ACCESS` group field. **Changed in 20.0:** the link is no longer baked into the mail template body -- the wizard prepends it as an HTML button via [`_get_equity_button_markup()`](../enterprise/equity/wizard/equity_mail_compose_message.py#L36), so the token is resolved per recipient at send time. The portal templates at [`equity_portal_templates.xml`](../enterprise/equity/views/equity_portal_templates.xml) render the shareholder's transactions, cap table position, and valuations.
+**Why this works:** [`_equity_ensure_token()`](../enterprise/equity/models/res_partner.py#L138) generates a UUID token stored in a `NO_ACCESS` group field. The wizard prepends the portal link as an HTML button via [`_get_equity_button_markup()`](../enterprise/equity/wizard/equity_mail_compose_message.py#L36) — it is not part of the mail template body — so the token is resolved per recipient at send time. The portal templates at [`equity_portal_templates.xml`](../enterprise/equity/views/equity_portal_templates.xml) render the shareholder's transactions, cap table position, and valuations.
 
 ### How to Set the Equity Currency
 1. Create the **first** transaction for a company
@@ -257,9 +258,9 @@ Create UBO Record  →  Request UBO Form  →  Portal Submission  →  PDF Gener
 ### `equity.mail.compose.message` -- Equity Email Wizard (new in 20.0)
 > [`equity_mail_compose_message.py`](../enterprise/equity/wizard/equity_mail_compose_message.py)
 
-A `TransientModel` on `mail.composer.mixin` that replaces the 19.0 approach of inheriting `mail.compose.message` and hiding fields via a `hide_recipients` context key. It carries `equity_button_text` / `equity_button_url`; [`action_send_mail()`](../enterprise/equity/wizard/equity_mail_compose_message.py#L69) loops over `partner_ids` and posts one message per recipient, prepending a button whose URL embeds that recipient's own access token. Mails are rendered with the `equity.mail_notification_light` layout (the standard light layout with the header row stripped).
+A `TransientModel` on `mail.composer.mixin`. It carries `equity_button_text` / `equity_button_url`; [`action_send_mail()`](../enterprise/equity/wizard/equity_mail_compose_message.py#L69) loops over `partner_ids` and posts one message per recipient, prepending a button whose URL embeds that recipient's own access token. Mails are rendered with the `equity.mail_notification_light` layout (the standard light layout with the header row stripped).
 
-Both the shareholder mail and the UBO request now flow through this wizard, which is why the mail templates no longer contain the portal link themselves.
+Both the shareholder mail and the UBO request flow through this wizard; the mail templates themselves do not contain the portal link.
 
 ### `res.partner` -- Extensions
 > [`res_partner.py`](../enterprise/equity/models/res_partner.py)
@@ -328,7 +329,7 @@ Both groups belong to the `res.groups.privilege` "Equity" under the Accounting c
 
 No `res.config.settings` fields exist for this module -- all configuration is done through security groups and security classes.
 
-**Changed in 20.0 -- security file layout.** `security/ir.model.access.csv` was replaced by the unified [`security/ir.access.csv`](../enterprise/equity/security/ir.access.csv), which merges ACLs and record rules into one file with an `operation` column (`crud` / `cru` / `r`) and an optional `domain`. The two `ir.rule` records that used to live in `equity_security.xml` moved there.
+Security lives in the unified [`security/ir.access.csv`](../enterprise/equity/security/ir.access.csv), which merges ACLs and record rules into one file with an `operation` column (`crud` / `cru` / `r`) and an optional `domain`.
 
 ---
 
@@ -348,7 +349,7 @@ No `res.config.settings` fields exist for this module -- all configuration is do
 
 - **UBO uniqueness.** Only one UBO record per (company, holder) pair. You cannot have overlapping UBO records for the same person at the same company -- use `end_date` to mark historical control periods and create a new record for the new period.
 
-- **Portal record rule.** Portal and internal users can only see transactions where they are the `seller_id` or `subscriber_id`. Equity Viewers/Managers see all transactions. **Fixed in 20.0:** the rule compares `user.partner_id.id` -- in 19.0 it compared `user.id` against a partner field, so it matched almost nothing.
+- **Portal record rule.** Portal and internal users can only see transactions where they are the `seller_id` or `subscriber_id`, matched via `user.partner_id.id`. Equity Viewers/Managers see all transactions.
 
 - **Multi-company scoping is new in 20.0.** `equity.transaction`, `equity.valuation`, `equity.ubo` and `equity.cap.table` all gained a `company_id` related to `partner_id.company_id`, plus `_check_company_auto = True` and a company record rule (`('company_id', 'parent_of', company_ids)` OR unset). Partners with no company stay visible everywhere. Seller, subscriber and UBO holder are `check_company=True`, so they must belong to the same company branch as the investee.
 

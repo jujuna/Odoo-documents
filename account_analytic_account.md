@@ -1,7 +1,7 @@
 # account.analytic.account — Analytic Account Model
 
 > **Module:** `analytic` | **Path:** [`addons/analytic/`](../addons/analytic/)
-> Verified against Odoo **20.0** source — 2026-09-22
+> Verified against Odoo 20 source on 2026-09-24.
 
 ## Overview
 
@@ -112,7 +112,7 @@ Example: `[CC-2024-001] IT Department - ACME Inc.`
 
 ### Multi-Field Search
 
-The model defines [`_rec_names_search = ('name', 'code')`](../addons/analytic/models/analytic_account.py#L18) (a tuple in 20.0; it was a list in 19.0), enabling search on both name and code. `code` carries a BTree index for fast exact lookups.
+The model defines [`_rec_names_search = ('name', 'code')`](../addons/analytic/models/analytic_account.py#L18), enabling search on both name and code. `code` carries a BTree index for fast exact lookups.
 
 ---
 
@@ -128,9 +128,9 @@ When the **company of an account changes**, Odoo searches (as sudo) for any link
 
 **Why?** Analytic lines are company-specific; moving an account to a different company without reassigning its lines breaks the company hierarchy assumption.
 
-### Record-Level Security — changed in 20.0
+### Record-Level Security
 
-19.0 shipped `ir.rule` records in `security/analytic_security.xml` plus an `ir.model.access.csv`. **20.0 merged both into a single [`security/ir.access.csv`](../addons/analytic/security/ir.access.csv)** with an `operation` column (`crud`, `r`, …) and an optional `domain`. The multi-company rules are unchanged in substance:
+Record-level security lives in a single [`security/ir.access.csv`](../addons/analytic/security/ir.access.csv), with an `operation` column (`crud`, `r`, …) and an optional `domain`. The multi-company rules:
 
 | Model | Domain |
 |---|---|
@@ -139,7 +139,7 @@ When the **company of an account changes**, Odoo searches (as sudo) for any link
 | `account.analytic.applicability` | `['|', ('company_id','=',False), ('company_id','parent_of',company_ids)]` |
 | `account.analytic.distribution.model` | `['|', ('company_id','=',False), ('company_id','parent_of',company_ids)]` |
 
-Also new in 20.0: `analytic.group_analytic_accounting` now carries `implied_ids = [base.group_user]`, and [`res_groups.py`](../addons/analytic/models/res_groups.py) registers it as a **light group** via `_get_light_group_xmlids()` — it shows up as a simple toggle in the v20 group UI rather than a full access group.
+`analytic.group_analytic_accounting` carries `implied_ids = [base.group_user]`, and [`res_groups.py`](../addons/analytic/models/res_groups.py) registers it as a **light group** via `_get_light_group_xmlids()` — it shows up as a simple toggle in the group UI rather than a full access group.
 
 ---
 
@@ -199,11 +199,9 @@ When an account is **moved to a different plan** (`write({'plan_id': new_plan_id
 
 ## Data Lifecycle
 
-### Copying — behavior changed in 20.0
+### Copying
 
-19.0 overrode `copy_data()` to append `" (copy)"` to the duplicated account's name. **That override was removed in 20.0** — duplicating an analytic account now keeps the **exact same name** unless you pass one in `default`. Analytic lines are still not copied (one2many fields are not copied by default), so the duplicate starts with a zero balance.
-
-If you relied on the "(copy)" suffix (scripts, imports, dedup logic), it is gone.
+Duplicating an analytic account keeps the **exact same name** unless you pass one in `default`. Analytic lines are not copied (one2many fields are not copied by default), so the duplicate starts with a zero balance.
 
 ### Web Read Context
 
@@ -240,7 +238,7 @@ Two distinct mechanisms — **neither is a cron**; `analytic` ships no `ir.cron`
 
 | Change | Impact |
 |---|---|
-| `name` is **no longer required** ([analytic_line.py:170](../addons/analytic/models/analytic_line.py#L170)) | Lines can be created without a description. Custom code that assumed a non-empty `name` (grouping keys, report labels) must handle `False`. |
+| `name` is optional ([analytic_line.py:170](../addons/analytic/models/analytic_line.py#L170)) | Lines can be created without a description. Custom code that assumed a non-empty `name` (grouping keys, report labels) must handle `False`. |
 | `product_uom_id` is now `compute='_compute_product_uom_id', store=True, readonly=False` ([analytic_line.py:188](../addons/analytic/models/analytic_line.py#L188)) | `_compute_product_uom_id()` is an empty hook — it exists so downstream modules (timesheets, MRP) can default the unit. Override the compute, don't onchange it. |
 | New `write()` → `_check_can_write(vals)` hook ([analytic_line.py:240](../addons/analytic/models/analytic_line.py#L240), [:287](../addons/analytic/models/analytic_line.py#L287)) | The base returns `True`. It is the sanctioned extension point for write-locking analytic lines (e.g., timesheet validation locks) without overriding `write` in every module. |
 | `company_id` gained `index=True` ([analytic_line.py:206](../addons/analytic/models/analytic_line.py#L206)) | Faster company-filtered aggregation — relevant to `_compute_debit_credit_balance`, which always filters on company. |
@@ -266,9 +264,9 @@ Changing `company_id` is rejected outright when lines exist. There is **no autom
 
 Moving `plan_id` runs raw SQL over `account_analytic_line` and raises a `RedirectWarning` if the target column is already used. In practice accounts get archived, not reparented.
 
-### 5. Duplicating No Longer Renames
+### 5. Duplicating Keeps the Same Name
 
-See **Copying** above — the `" (copy)"` suffix was removed in 20.0.
+See **Copying** above — duplicates keep the exact same name unless you pass one via `default`.
 
 ### 6. Display Name Shows the Commercial Partner
 
