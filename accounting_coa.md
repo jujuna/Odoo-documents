@@ -131,7 +131,7 @@ Source: [`template_generic_coa.py`](../addons/account/models/template_generic_co
 | `cash_account_code_prefix` | `'1015'` | Auto-prefix for new cash accounts |
 | `transfer_account_code_prefix` | `'1017'` | Internal transfer intermediary |
 | `account_fiscal_country_id` | `base.us` | US tax rules |
-| `anglo_saxon_accounting` | `True` | COGS posted at delivery, not invoicing |
+| `anglo_saxon_accounting` | `True` | Only adds price-difference lines to vendor bills ([`account_move.py:6001`](../addons/account/models/account_move.py#L6001)). COGS lines are posted on customer invoices for every perpetual product, whatever the flag |
 
 #### Chart Template Loading — Step by Step
 
@@ -417,7 +417,7 @@ These accounts **reset to zero** at the start of each fiscal year. Their year-en
 | `expense` | "Expenses" | Primary operating costs: purchases, services consumed. Odoo auto-suggests for vendor bill lines. | "Operating Expenses 6000" |
 | `expense_other` | "Other Expenses" | Non-operating losses: bank charges, fines. | "Bank Fees 6900" |
 | `expense_depreciation` | "Depreciation" | Depreciation charges posted by `account_asset`. | "Depreciation 6600" |
-| `expense_direct_cost` | "Cost of Revenue" | COGS — direct cost of goods sold. Odoo posts COGS here on delivery (Anglo-Saxon). | "Cost of Goods Sold 5000" |
+| `expense_direct_cost` | "Cost of Revenue" | COGS — direct cost of goods sold. For perpetual products the COGS lines of customer invoices debit the product's expense account ([`_get_cogs_lines_vals()`](../addons/account/models/account_move.py#L6020)); give that account this type to report it as Cost of Revenue. | "Cost of Goods Sold 5000" |
 
 ### Special
 
@@ -1240,7 +1240,7 @@ Source: [`account/models/company.py:1278`](../addons/account/models/company.py#L
 | Source | Value |
 |---|---|
 | Inventory system (`product.total_value`) | 78 units x $500 = **$39,000** |
-| Accounting ledger (sum of posted lines on `1400`) | Maybe **$38,500** (due to timing of invoice postings) |
+| Accounting ledger (sum of posted lines on `1400`) | e.g. **$38,500**, last month's closing balance: in periodic mode bills post to expense, so `1400` moves only at closings |
 | **Gap** | **$500** |
 
 Odoo creates:
@@ -1262,7 +1262,7 @@ After posting, the ledger on `1400` now shows $39,000 — matching inventory.
 - Account `1400` also has: `account_stock_expense_id` = `6000 Operating Expenses`
 
 **During the month:**
-- Every stock move (receipt, delivery, adjustment) already creates journal entries in real-time
+- Vendor bills post to `1400` and customer invoices carry COGS lines; receipts, deliveries and adjustments post nothing unless a location has a valuation account
 - But the **variation** (difference between expenses recognized and inventory movement) is NOT posted during the period
 
 **At month-end closing:**

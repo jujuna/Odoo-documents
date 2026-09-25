@@ -2,7 +2,7 @@
 
 > **Module:** `stock_account` + `stock_landed_costs` | **Path:** [`addons/stock_account/`](../addons/stock_account/) + [`addons/stock_landed_costs/`](../addons/stock_landed_costs/)
 > **Odoo Apps category:** Inventory / Accounting
-> **Verified from source:** Odoo 20 (`20.0` branch of this checkout) on 2026-09-22
+> **Verified from source:** Odoo 20 (`20.0` branch of this checkout) on 2026-09-22; journal-entry, Anglo-Saxon, account and COGS-eligibility passages corrected 2026-09-25 (see [`stock_transfers_corrections.md`](stock_transfers_corrections.md))
 
 ## How to Read This Document
 
@@ -32,8 +32,8 @@ Tracks the monetary value of inventory as products move between locations. Assig
 | `property_valuation`, `property_cost_method`, `property_stock_journal`, `property_stock_valuation_account_id`, `property_price_difference_account_id` on the category | `stock_account/models/product.py` | [`account/models/product.py`](../addons/account/models/product.py) |
 | `account_stock_variation_id` / `account_stock_expense_id` on the account | `stock_account/models/account_account.py` | [`account/models/account_account.py`](../addons/account/models/account_account.py) |
 | `_get_product_accounts()` | `stock_account/models/product.py` | [`account/models/product.py`](../addons/account/models/product.py) |
-| COGS lines on customer invoices | `stock_account._stock_account_prepare_realtime_out_lines_vals()` | [`account.move._create_cogs_lines()`](../addons/account/models/account_move.py#L5961) |
-| Purchase price difference lines | `purchase_stock/models/account_invoice.py` (file deleted) | [`account.move._get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6059) |
+| COGS lines on customer invoices | `stock_account._stock_account_prepare_realtime_out_lines_vals()` | [`account.move._create_cogs_lines()`](../addons/account/models/account_move.py#L5966) |
+| Purchase price difference lines | `purchase_stock/models/account_invoice.py` (file deleted) | [`account.move._get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6064) |
 | Periodic closing | `stock_account.res_company.action_close_stock_valuation()` | [`account.res_company.action_close_stock_valuation()`](../addons/account/models/company.py#L1278) |
 | Inventory Valuation report | `stock_account/report/stock_valuation_report.py` | [`account/report/account_stock_valuation_report.py`](../addons/account/report/account_stock_valuation_report.py) |
 
@@ -63,7 +63,7 @@ Before using inventory valuation, a company must make two choices. These are set
 | Choice | Name | How it works | Best for |
 |---|---|---|---|
 | **After the fact** | Periodic (at closing) | No journal entries during daily operations. At the end of the month/quarter, an accountant runs a "closing" that compares physical inventory value to the books and posts the difference. | Small companies, companies with an accountant who reconciles manually, companies that don't need real-time financial reporting. |
-| **Immediately** | Perpetual (real-time) | Every time a receipt or delivery is validated, Odoo automatically creates a journal entry. The balance sheet is always up to date. | Companies that need real-time financial visibility, companies with auditors who expect automated inventory tracking, any company using FIFO or AVCO seriously. |
+| **When goods are billed or invoiced** | Perpetual (UI: "Perpetual (at invoicing)") | Receipts and deliveries post nothing themselves. The vendor bill debits the Stock Valuation account and the customer invoice carries COGS lines (core help: "An accounting entry is automatically created to value the inventory when a product is billed or invoiced", [`product.py:38`](../addons/account/models/product.py#L38)). Goods received but not billed, or delivered but not invoiced, reach the books at the Stock Closing. | Companies that need real-time financial visibility, companies with auditors who expect automated inventory tracking, any company using FIFO or AVCO seriously. |
 
 **Where to set it:** Inventory > Configuration > Product Categories > "Inventory Valuation" field.
 
@@ -83,51 +83,52 @@ This is the "costing method." It determines what cost Odoo assigns when you send
 
 ## Anglo-Saxon vs Continental Accounting
 
-This is a fundamental configuration that changes **when expenses are recognized**. Think of it this way:
+The two accounting styles decide **when expenses are recognized**:
 
-> **Anglo-Saxon** = "I'll record the expense only when I sell the product" (cost stays on balance sheet until sale)
-> **Continental** = "I'll record the expense when I buy the product" (cost goes to P&L immediately, then adjusted at period end)
+> **Anglo-Saxon** = "I'll record the expense only when I sell the product" (cost stays on the balance sheet until the sale)
+> **Continental** = "I'll record the expense when I buy the product" (cost goes to P&L at purchase, then the change in inventory is adjusted at period end)
 
-**Why does this matter?** It determines how your financial statements look during the month. Anglo-Saxon shows inventory as an asset and only converts it to expense (COGS) when you invoice a customer. Continental records the purchase as an expense right away, then adjusts at month-end.
+**In Odoo 20 the valuation mode decides which style you get, not the Anglo-Saxon flag.** `anglo_saxon_accounting` ([`company.py:147`](../addons/account/models/company.py#L147)) is read in one place only: it adds price-difference lines to vendor bills ([`account_move.py:6001`](../addons/account/models/account_move.py#L6001)). COGS lines and the bill account follow the product's valuation.
 
-| Aspect | Anglo-Saxon (Perpetual) | Continental |
+| Aspect | Perpetual (`real_time`) | Periodic (`periodic`) |
 |---|---|---|
-| **When is expense recognized?** | At invoice time -- COGS lines auto-generated | At period closing -- variation entry posted |
-| **Purchase bill account** | Stock Valuation account (deferred to sale) | Expense account (immediately expensed) |
-| **COGS lines on invoice?** | Yes (`display_type='cogs'`) | No |
-| **Configuration** | `company.anglo_saxon_accounting = True` | `False` (default) |
-| **Typical use** | US, UK, Australia, international IFRS | France, Germany, Belgium, many EU countries |
-| **Purchase price difference** | Standard cost only -- posted to price diff account | Not applicable |
+| **Style** | Anglo-Saxon | Continental |
+| **Receipt / delivery validated** | No journal entry (unless a location has a valuation account) | No journal entry |
+| **Vendor bill line account** | Stock Valuation ([`account_move_line.py:790`](../addons/account/models/account_move_line.py#L790)) | Expense |
+| **COGS lines on customer invoices** | Yes, whatever the Anglo-Saxon flag ([`account_move.py:5998`](../addons/account/models/account_move.py#L5998)) | No |
+| **When is expense recognized?** | At customer invoice, through COGS lines | At vendor bill, adjusted by the Stock Closing variation |
+| **Stock Closing** | Manual only; the cron skips perpetual companies | Cron (daily / monthly) or manual |
+| **Purchase price difference** | Standard cost only, with the Anglo-Saxon flag and a category Price Difference Account | Not applicable |
 
-Source: [`company.py:147`](../addons/account/models/company.py#L147) -- `anglo_saxon_accounting` field
+A perpetual company can still present a continental P&L. When its stock valuation account has both a Stock Variation and a Stock Expense account, the closing posts the period's change of the Stock Valuation balance between those two accounts ([`_get_continental_realtime_variation_vals()`](../addons/account/models/company.py#L1522)).
 
 ### How It Affects the Purchase Flow
 
-**Anglo-Saxon -- step by step:**
-1. You receive goods -> Journal entry moves value INTO Stock Valuation (balance sheet asset)
-2. You get the vendor bill -> Bill debits Stock Valuation (not Expense!), credits AP
+**Perpetual -- step by step:**
+1. You receive goods -> the move is valued at the PO price; no journal entry
+2. You post the vendor bill -> the bill debits Stock Valuation (not Expense) and credits AP; the receipt takes the bill's price
 3. The cost sits on the balance sheet until you sell the product
 4. Only when you invoice a customer does the cost move from Stock Valuation to COGS (expense)
 
-**Continental -- step by step:**
-1. You receive goods -> Same journal entry as Anglo-Saxon (Stock Valuation increases)
-2. You get the vendor bill -> Bill debits **Expense** (P&L), credits AP -- cost is expensed NOW
-3. At month-end, accountant runs closing -> Adjusting entry reconciles the stock variation
-4. No COGS lines are auto-generated on customer invoices
+**Periodic -- step by step:**
+1. You receive goods -> the move is valued; no journal entry
+2. You post the vendor bill -> the bill debits **Expense** (P&L) and credits AP -- the cost is expensed now
+3. At closing, the change in inventory value is posted between Stock Valuation and Stock Variation
+4. No COGS lines are generated on customer invoices
 
-**The practical difference:** Mid-month, Anglo-Saxon shows accurate inventory value on the balance sheet. Continental shows the purchase as an expense immediately, which means your P&L fluctuates with purchases, not sales.
+**The practical difference:** Mid-month, perpetual shows billed inventory on the balance sheet (goods received but not billed are missing until the bill or the closing). Periodic shows purchases as expense immediately, so the P&L follows purchases, not sales, until the closing.
 
 ### How It Affects the Sale Flow
 
-**Anglo-Saxon:** On customer invoice posting, auto-generated COGS lines move cost from Stock Valuation to Expense. This is the moment the "cost of the sale" appears on the P&L. Source: [`_get_cogs_lines_vals()`](../addons/account/models/account_move.py#L6015), called from [`_create_cogs_lines()`](../addons/account/models/account_move.py#L5961)
+**Perpetual:** On customer invoice posting, COGS lines move cost from Stock Valuation to Expense. This is the moment the "cost of the sale" appears on the P&L. Source: [`_get_cogs_lines_vals()`](../addons/account/models/account_move.py#L6020), called from [`_create_cogs_lines()`](../addons/account/models/account_move.py#L5966)
 
-**Continental:** No COGS lines on invoice. At period closing, `_get_continental_realtime_variation_vals()` posts the cumulative inventory variation. The P&L only shows accurate cost-of-sales figures after the closing is run. Source: [`company.py:1522`](../addons/account/models/company.py#L1522)
+**Periodic:** No COGS lines on invoices. The Stock Closing posts the difference between inventory value and the Stock Valuation account ([`_get_stock_valuation_account_vals()`](../addons/account/models/company.py#L1489)). The P&L only shows accurate cost-of-sales figures after the closing is run.
 
 ### Purchase Price Difference (Anglo-Saxon + Standard Cost Only)
 
 When a vendor bill price differs from `standard_price`, Odoo creates price difference lines on the bill.
 
-Source: [`_get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6059)
+Source: [`_get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6064)
 
 > **Changed in 20.** This used to live in `purchase_stock/models/account_invoice.py` (`_stock_account_prepare_anglo_saxon_in_lines_vals()`). That file is gone; the logic is now in `account` and runs for any purchase document, not only one coming from a PO.
 
@@ -156,7 +157,7 @@ These walkthroughs follow real user actions in the Odoo UI, explaining what happ
 
 This is the most common scenario. A company buys goods from suppliers and resells them to customers.
 
-**The complete lifecycle in one sentence:** You buy goods (inventory increases on balance sheet) -> you receive the bill (confirms the cost) -> you sell goods (inventory decreases, COGS appears on P&L) -> you invoice the customer (COGS journal entry auto-created, revenue recorded).
+**The complete lifecycle in one sentence:** You receive goods (stock quantity and value increase, no journal entry) -> you post the bill (confirms the cost; the inventory appears on the balance sheet) -> you deliver (stock decreases, still no journal entry) -> you invoice the customer (COGS lines move the cost to the P&L, revenue recorded).
 
 **Setup:**
 - Product Category "Merchandise": Costing Method = Average Cost (AVCO), Inventory Valuation = Perpetual
@@ -174,20 +175,22 @@ This is the most common scenario. A company buys goods from suppliers and resell
 - This is an "incoming" move (unvalued location -> valued location)
 - Move value = $8 x 100 = $800
 - Product `standard_price` updated to $8.00 (this IS the average cost)
-- Journal entry auto-created:
+- No journal entry: neither Vendors nor WH/Stock carries a valuation account ([`_should_create_account_move()`](../addons/stock_account/models/stock_move.py#L755))
 
-| Account | Debit | Credit | Explanation |
-|---|---|---|---|
-| 1400 Stock Valuation | $800 | | Inventory increased on balance sheet |
-| Stock Input (interim) | | $800 | Temporary holding until bill arrives |
-
-**Result:** Balance sheet shows $800 of inventory. Product cost = $8.00.
+**Result:** The inventory report shows $800; the Stock Valuation account is still 0 until the bill is posted. Product cost = $8.00.
 
 #### Step 2: Receive Vendor Bill
 
 **User action:** Vendor sends invoice for $8/unit. Create bill from PO, post it.
 
 **What happens:**
+- The bill line is redirected from expense to the Stock Valuation account (taxes left out):
+
+| Account | Debit | Credit |
+|---|---|---|
+| 1400 Stock Valuation | $800 | |
+| Accounts Payable | | $800 |
+
 - The bill confirms the cost was indeed $8 -- no change to move value
 - If the vendor billed $9 instead, the move value would be updated from $800 to $900, and the average cost would change to $9.00
 
@@ -202,7 +205,7 @@ This is the most common scenario. A company buys goods from suppliers and resell
   - Total quantity = 100 + 50 = 150
   - New average cost = $1,300 / 150 = **$8.67/unit**
 - Product `standard_price` updated to $8.67
-- Journal entry: Debit Stock Valuation $500, Credit Stock Input $500
+- No journal entry at the receipt; its bill later debits Stock Valuation $500
 
 **Result:** 150 units in stock, total value $1,300, unit cost $8.67.
 
@@ -461,7 +464,7 @@ Week 4: Buy 300 kg @ $4.50/kg = $1,350
 
 ### Walkthrough 7: Periodic Valuation (Manual Closing Flow)
 
-Not every company wants automatic journal entries on every receipt/delivery. Smaller companies or those with a dedicated accountant might prefer periodic valuation.
+Not every company wants the Stock Valuation account moved by every bill and invoice. Smaller companies or those with a dedicated accountant might prefer periodic valuation: bills go to expense, invoices carry no COGS, and one closing entry per period adjusts the stock account.
 
 **How it differs:**
 - During the month, receipts and deliveries happen normally
@@ -520,7 +523,7 @@ Jan 31: Inventory system says total value = $54,000
 **Scenario:** Customer returns 10 units from a sale where COGS was $8.67/unit.
 
 **Flow:**
-1. Create return from delivery (Inventory > Operations > Returns)
+1. Click **Return** on the done delivery; it creates a draft return transfer with every line at 0 ([`_create_return()`](../addons/stock/models/stock_picking.py#L976))
 2. Return stock move: Customer Location -> WH/Stock
 3. This is an "incoming" move (`is_in = True`)
 
@@ -530,7 +533,7 @@ Jan 31: Inventory system says total value = $54,000
 - So returned value = $8.67 * 10 = $86.70 (preserves original cost). The `abs()` is needed because the origin out move's `value` is negative.
 - Inventory increases by $86.70
 
-Source: [`_get_value_from_returns()`](../addons/stock_account/models/stock_move.py#L576)
+Source: [`_get_value_from_returns()`](../addons/stock_account/models/stock_move.py#L575)
 
 **On credit note:** COGS lines are reversed, moving value back from Expense to Stock Valuation.
 
@@ -556,13 +559,13 @@ Understanding the accounts is crucial. Here are the accounts involved and what e
 
 | Account | Type | What it represents | When it changes |
 |---|---|---|---|
-| **Stock Valuation** (e.g., 1400) | Balance Sheet -- Current Asset | "How much inventory do we own right now?" | Increases on receipt, decreases on delivery/sale |
-| **COGS / Expense** (e.g., 5100) | Profit & Loss -- Expense | "What did the products we sold this period cost us?" | Increases when customer invoice is posted |
-| **Stock Input (interim)** | Balance Sheet -- Liability | "We received goods but haven't been billed yet." Think of it as an IOU to the supplier -- you have the goods, but you haven't recorded the bill. When the bill arrives, this account zeros out. | Credited on receipt, debited when vendor bill arrives |
-| **Stock Output (interim)** | Balance Sheet -- Asset | "We delivered goods but haven't invoiced the customer yet." Think of it as a claim -- you gave goods away and need to bill for them. When the invoice is posted, this account zeros out. | Debited on delivery, credited when customer invoice is posted |
-| **Price Difference** | P&L -- Expense | "Difference between what we expected to pay and what we actually paid" | Only with Standard cost when bill differs from standard |
-| **Inventory Loss** | P&L -- Expense | "Value of goods lost/damaged/stolen" | When inventory adjustment reduces quantity |
-| **Stock Variation** | P&L -- Expense | "Change in inventory value during the period" | At periodic closing |
+| **Stock Valuation** (e.g., 1400) | Balance Sheet -- Current Asset | "How much inventory do we own right now?" | Perpetual: debited by vendor bills, credited by COGS lines on customer invoices (credit notes and vendor refunds reverse them). Both modes: Stock Closing entries, and entries of moves that touch a location with a valuation account |
+| **COGS / Expense** (e.g., 5100) | Profit & Loss -- Expense | "What did the products we sold this period cost us?" | Perpetual: debited by COGS lines when a customer invoice is posted. Periodic: debited by vendor bills |
+| **Price Difference** | P&L -- Expense | "Difference between the standard cost and what we actually paid" | On vendor bills: standard cost, Anglo-Saxon flag and a category Price Difference Account only |
+| **Inventory Loss** (the location's Loss Account) | P&L -- Expense | "Value of goods lost/damaged/stolen" | Only when the Inventory adjustment location has a Loss Account (`valuation_account_id`); otherwise the loss reaches the books at the Stock Closing |
+| **Stock Variation** | P&L -- Expense | "Change in inventory value not yet in the books" | At the Stock Closing |
+
+There are no Stock Input / Stock Output interim accounts in 20. Receipts and deliveries post nothing ([`_should_create_account_move()`](../addons/stock_account/models/stock_move.py#L755)). Goods received but not billed, or delivered but not invoiced, are covered by the accruals the Stock Closing can post ([`_create_accrual_moves()`](../addons/account/models/company.py#L1346)).
 
 ### How Money Flows Through Accounts (Perpetual AVCO)
 
@@ -571,38 +574,31 @@ PURCHASE FLOW:
                          Receipt                    Vendor Bill
   Vendor                Validated                    Posted
     |                      |                           |
-    |   Stock Input     <--+-->  Stock Valuation       |
-    |   (Liability)        |     (Asset)               |
-    |                      |     + $1,000              |
-    |                      |                           |
-    |                      |     Stock Input        <--+-->  Accounts Payable
-    |                      |     (Liability)            |    (Liability)
-    |                      |     - $1,000               |    + $1,000
+    |   stock + units      |                           |
+    |   move value +$1,000 |                           |
+    |   (no journal entry) |     Stock Valuation    <--+-->  Accounts Payable
+    |                      |     (Asset) + $1,000          (Liability) + $1,000
 
 SALE FLOW:
                         Delivery                   Customer Invoice
   Customer              Validated                    Posted
     |                      |                           |
-    |   (move valued       |                           |
-    |    internally but    |                           |
-    |    COGS posted at -->+---------------------->    |
-    |    invoice time)     |                           |
-    |                      |     Stock Valuation    <--+  (COGS auto-line)
-    |                      |     (Asset)               |
-    |                      |     - $800                |
+    |   stock - units      |                           |
+    |   move value -$800   |                           |
+    |   (no journal entry) |     Stock Valuation    <--+  (COGS auto-line)
+    |                      |     (Asset) - $800        |
     |                      |                           |
     |                      |     COGS Expense       <--+  (COGS auto-line)
-    |                      |     (P&L)                 |
-    |                      |     + $800                |
+    |                      |     (P&L) + $800          |
     |                      |                           |
     |                      |     Revenue            <--+  (Invoice line)
-    |                      |     (P&L)                 |
-    |                      |     + $1,200              |
+    |                      |     (P&L) + $1,200        |
     |                      |                           |
     |                      |     Accounts Receivable<--+  (Invoice line)
-    |                      |     (Asset)               |
-    |                      |     + $1,200              |
+    |                      |     (Asset) + $1,200      |
 ```
+
+Between the receipt and the bill, and between the delivery and the invoice, the inventory report and the Stock Valuation account disagree. The Stock Closing shows and settles the gap.
 
 ### How Money Flows (Perpetual + Anglo-Saxon + Standard Cost -- Purchase Price Difference)
 
@@ -610,8 +606,7 @@ SALE FLOW:
 PURCHASE FLOW WITH PRICE DIFFERENCE:
 
   Receipt validated (100 units, standard_price = $9):
-    Debit:  Stock Valuation  $900
-    Credit: Stock Input       $900
+    Move value $900. No journal entry.
 
   Vendor bill posted ($10/unit = $1,000 total):
     Debit:  Stock Valuation  $1,000   (bill line account overridden to stock val)
@@ -621,7 +616,7 @@ PURCHASE FLOW WITH PRICE DIFFERENCE:
     Debit:  Price Difference  $100    (10 - 9 = $1/unit * 100 units)
     Credit: Stock Valuation   $100
 
-  Net effect on Stock Valuation: +$900 (receipt) +$1,000 (bill) -$100 (price diff) = $900 = standard
+  Net effect on Stock Valuation: +$1,000 (bill) -$100 (price diff) = $900 = standard
 ```
 
 ---
@@ -630,7 +625,7 @@ PURCHASE FLOW WITH PRICE DIFFERENCE:
 
 ### Q: I changed the product cost. What happened to existing inventory?
 
-**Standard cost:** Changing `standard_price` immediately changes the displayed total value of your stock. But it does NOT create any journal entry. The accounting books won't match until the next closing (periodic) or until you sell (perpetual -- COGS uses new price).
+**Standard cost:** Changing `standard_price` immediately changes the displayed total value of your stock. But it does NOT create any journal entry (`product.value` records carry none, see below). The accounting books won't match until the next Stock Closing, in both modes. Selling at the new price does not close the gap: the COGS lines use the new price while the account still holds the old one.
 
 **AVCO:** You normally don't manually change the cost -- Odoo recalculates it on every receipt. If you DO manually change it, Odoo creates a `product.value` record marking the override, and from Odoo 20 it replays the valuation from that date forward, so the out moves after it are re-costed at the new average (and their COGS journal items re-priced in place).
 
@@ -694,7 +689,7 @@ The bridge between an invoice line and the stock moves that back it is the compu
 ### Provides To
 | Consumer | What they use |
 |---|---|
-| `account.move` | COGS journal items on customer invoices -- `account` builds them, `stock_account` supplies the values via `_use_inventory_valuation()` and `_get_cogs_value()` |
+| `account.move` | COGS journal items on customer invoices -- `account` builds them and owns the eligibility rule `_use_inventory_valuation()` (extended by `stock_dropshipping`, `repair`, `sale_stock_renting`); `stock_account` supplies the values via `_get_cogs_value()` |
 | `stock.quant` | `value` field computed from product valuation |
 | `account.stock.valuation.report` | Real move-based figures (and the Inventory Loss section) in place of the `qty_available * standard_price` approximation |
 | `account_reports` (enterprise) | The Inventory Valuation menu entry under Accounting > Audit |
@@ -708,13 +703,12 @@ The bridge between an invoice line and the stock moves that back it is the compu
 | **COGS** | Cost of Goods Sold. The amount you paid for products you sold. Shows on the Profit & Loss as an expense. |
 | **Balance Sheet** | A snapshot of what your company OWNS (assets) and OWES (liabilities) at a point in time. Inventory is an asset. |
 | **P&L / Income Statement** | Shows revenue minus expenses over a period. COGS is an expense here. Revenue minus COGS = Gross Profit. |
-| **Journal Entry (JE)** | A record of a financial transaction. Always has equal debits and credits. Odoo creates these automatically for stock moves. |
+| **Journal Entry (JE)** | A record of a financial transaction. Always has equal debits and credits. For inventory, Odoo creates them from vendor bills, customer invoices (COGS lines), the Stock Closing, and moves that touch a location with a valuation account; receipts and deliveries post none. |
 | **Debit / Credit** | Debit = left side, Credit = right side. For assets: debit increases, credit decreases. For expenses: debit increases. For liabilities/revenue: credit increases. |
-| **Interim Account** | A temporary holding account. Balances out when both sides of a transaction are complete (e.g., goods received + bill posted). |
 | **Valued Location** | A location where inventory has monetary value (internal warehouses, transit). Supplier/Customer locations are NOT valued. |
 | **Stock Move** | A record of products moving from one location to another. Every pick, delivery, receipt, and transfer creates stock moves. |
-| **Perpetual Valuation** | Real-time accounting. Every stock move automatically creates a journal entry. |
-| **Periodic Valuation** | Batch accounting. No JEs during the month. One closing entry at month-end adjusts everything at once. |
+| **Perpetual Valuation** | "Perpetual (at invoicing)": bills debit the Stock Valuation account and customer invoices carry COGS lines. Stock moves themselves post nothing. |
+| **Periodic Valuation** | Batch accounting. Bills go to expense and invoices carry no COGS. One closing entry per period adjusts the Stock Valuation account. |
 | **Standard Price** | The `standard_price` field on a product. For Standard costing = manual fixed cost. For AVCO = running average. For FIFO = display approximation. |
 
 ---
@@ -1059,7 +1053,7 @@ Source: [`stock_move.py:248`](../addons/stock_account/models/stock_move.py#L248)
 2. refreshes the in-move values with `skip_check=True`,
 3. calls [`_correct_inventory_valuation(from_date)`](../addons/stock_account/models/product.py#L247), which replays `_run_standard` / `_run_avco` / `_run_fifo` with `correction=True` from that date forward and **rewrites the value of every affected out move**.
 
-This is what makes the following safe in 20, all of which were lossy or unsupported in 19: editing a done move's date ([`write()`](../addons/stock_account/models/stock_move.py#L181)), adjusting a move's value by hand (`product.value`), a vendor bill arriving after the goods were already sold, and resetting a picking to draft ([`_action_reset_to_draft()`](../addons/stock_account/models/stock_move.py#L798), which also deletes the stock journal entries).
+This is what makes the following safe in 20, all of which were lossy or unsupported in 19: editing a done move's date ([`write()`](../addons/stock_account/models/stock_move.py#L181)), adjusting a move's value by hand (`product.value`), a vendor bill arriving after the goods were already sold, and resetting a manufacturing order to draft or in progress ([`_action_reset_to_draft()`](../addons/stock_account/models/stock_move.py#L797), which also deletes the stock journal entries). Transfers have no reset: only [`mrp_production.py:2039`](../addons/mrp/models/mrp_production.py#L2039) calls these methods.
 
 ### Journal Entry Creation
 
@@ -1127,11 +1121,11 @@ Cron job record: `account.ir_cron_post_stock_valuation` (moved from `stock_accou
 
 ---
 
-## COGS on Customer Invoices (Anglo-Saxon)
+## COGS on Customer Invoices (Perpetual)
 
-When a customer invoice is posted, Odoo auto-generates two additional journal lines per eligible product line.
+When a customer invoice is posted, Odoo auto-generates two additional journal lines per eligible product line. Eligibility depends on perpetual valuation, not on the Anglo-Saxon flag.
 
-> **Changed in 20 -- ownership moved to `account`.** `_stock_account_prepare_realtime_out_lines_vals()` no longer exists. `account.move._post()` calls [`_create_cogs_lines()`](../addons/account/models/account_move.py#L5961), which builds *both* the customer-invoice COGS lines ([`_get_cogs_lines_vals()`](../addons/account/models/account_move.py#L6015)) and the vendor-bill price difference lines ([`_get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6059)). `stock_account` contributes only the numbers and the eligibility rule.
+> **Changed in 20 -- ownership moved to `account`.** `_stock_account_prepare_realtime_out_lines_vals()` no longer exists. `account.move._post()` calls [`_create_cogs_lines()`](../addons/account/models/account_move.py#L5966), which builds *both* the customer-invoice COGS lines ([`_get_cogs_lines_vals()`](../addons/account/models/account_move.py#L6020)) and the vendor-bill price difference lines ([`_get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6064)). `stock_account` contributes only the numbers and the eligibility rule.
 
 **Conditions** (in `_get_cogs_lines_vals()`):
 - Invoice is a sale document (`is_sale_document(include_receipts=True)`)
@@ -1141,7 +1135,7 @@ When a customer invoice is posted, Odoo auto-generates two additional journal li
 
 ### COGS Value Computation
 
-Source: [`_get_cogs_value()`](../addons/stock_account/models/account_move_line.py#L87) (the `stock_account` override; the base in `account` simply returns `product.standard_price`)
+Source: [`_get_cogs_value()`](../addons/stock_account/models/account_move_line.py#L80) (the `stock_account` override; the base in `account` simply returns `product.standard_price`)
 
 The COGS unit price is determined by:
 1. No product, or zero quantity: fall back to the line's own `price_unit`
@@ -1152,22 +1146,22 @@ The COGS unit price is determined by:
 3. If no stock moves: `product.standard_price` for Standard/AVCO, `product._get_fifo_value(qty) / qty` for FIFO
 4. Final: `abs(price_unit * cogs_qty / line_quantity_uom)`, where `_get_cogs_qty()` flips the sign for `out_refund`
 
-Source for the move-side price: [`_get_price_unit()`](../addons/stock_account/models/stock_move.py#L321) -- **renamed in 20**, it replaces both `_get_cogs_price_unit()` and the old `_get_price_unit_delivery()` / `_get_price_unit_dropshipped()` pair.
+Source for the move-side price: [`_get_price_unit()`](../addons/stock_account/models/stock_move.py#L321) -- **new in 20**, it replaces `_get_cogs_price_unit()`. `_get_price_unit_delivery()` ([`stock_move.py:808`](../addons/stock_account/models/stock_move.py#L808), used by `sale_stock_margin`) and `_get_price_unit_dropshipped()` ([`:823`](../addons/stock_account/models/stock_move.py#L823)) still exist.
 
 ### Re-pricing already-posted COGS
 
-New in 20. A move's value can change *after* the invoice is posted -- a late vendor bill, a landed cost, a manual adjustment. [`_set_cogs()`](../addons/stock_account/models/account_move_line.py#L57) walks the `cogs_origin_id` back to the invoice line, recomputes the price, and rewrites the two existing COGS journal items in place (with `check_move_validity=False`, since both sides move symmetrically). It is triggered from `stock.move.write()` when `value` changes and from `_action_done()`.
+New in 20. A move's value can change *after* the invoice is posted -- a late vendor bill, a landed cost, a manual adjustment. [`_set_cogs()`](../addons/stock_account/models/account_move_line.py#L50) walks the `cogs_origin_id` back to the invoice line, recomputes the price, and rewrites the two existing COGS journal items in place (with `check_move_validity=False`, since both sides move symmetrically). It is triggered from `stock.move.write()` when `value` changes and from `_action_done()`.
 
 ### Eligible for Stock Account
 
-Source: [`_use_inventory_valuation()`](../addons/stock_account/models/account_move_line.py#L17), extending [the base in `account`](../addons/account/models/account_move_line.py#L3816)
+Source: [`_use_inventory_valuation()`](../addons/account/models/account_move_line.py#L3818) in `account`, extended by [`stock_dropshipping`](../addons/stock_dropshipping/models/account_move_line.py#L7), [`repair`](../addons/repair/models/account_move_line.py#L19) and `sale_stock_renting`. `stock_account` does not override it.
 
 > **Renamed in 20:** this was `_eligible_for_stock_account()`.
 
 Returns `True` only if:
 - Product is storable (`is_storable`) -- base check
 - Product `valuation == 'real_time'` -- base check (**new**: the perpetual test is part of the predicate now, not a separate condition)
-- ALL linked stock moves are NOT dropshipped -- `stock_account` check
+- ALL linked stock moves are NOT dropshipped -- `stock_dropshipping` check
 - (`repair` adds a further exclusion for already-accounted lines)
 
 Dropshipped products don't get COGS lines because they never enter the company's stock.
@@ -1228,7 +1222,7 @@ Source: [`_post()`](../addons/stock_account/models/account_move.py#L40)
 | `account_move_id` / `invoice_line_ids` | Many2one / One2many | The stock journal entry created for this move, and the invoice lines pointing at it |
 | `price_unit` | Float | Legacy field (to be removed, use `value`) |
 | `standard_price` | Float (computed) | `product_id.with_company(move.company_id).standard_price` |
-| `to_refund` | Boolean | Trigger SO/PO quantity update on returns. **Changed in 20:** the `stock.return.picking` wizard extension that propagated it was deleted; it is now carried by [`stock.picking._prepare_return_move_default_values()`](../addons/stock_account/models/stock_picking.py#L34). |
+| `to_refund` | Boolean | Trigger SO/PO quantity update on returns. **Changed in 20:** the `stock.return.picking` wizard extension that propagated it was deleted; it is now carried by [`stock.picking._prepare_return_move_default_values()`](../addons/stock_account/models/stock_picking.py#L34). No view shows the field in 20, so every return updates SO/PO quantities. |
 
 **`remaining_qty` and `remaining_value`** -- These represent how much of an incoming move's quantity is still in stock (not consumed by outgoing FIFO moves). For FIFO, this drives the stack and `remaining_value` is prorated from `move.value`. For AVCO/Standard, `remaining_value = remaining_qty * standard_price`. Neither is stored, so `stock.move` overrides [`_read_group_select()`](../addons/stock_account/models/stock_move.py#L198) / [`_read_group_postprocess_aggregate()`](../addons/stock_account/models/stock_move.py#L207) to sum them in Python -- that is what makes the Aging Report pivot work.
 
@@ -1249,7 +1243,7 @@ Tracks manual value updates for products, lots, and individual moves.
 | `date` | Datetime | When the change was made |
 | `user_id` | Many2one(res.users) | Who made the change |
 | `description` | Char | Auto-generated sentence naming the old/new value, quantity and user |
-| `account_move_id` | Many2one(account.move) | **New in 20.** The journal entry booked for the adjustment, reachable from the entry via its "Product Value" stat button |
+| `account_move_id` | Many2one(account.move) | **New in 20.** Declared (with an "open entry" action), but nothing in 20.0 writes it: a value adjustment books no journal entry; the difference reaches the books at the Stock Closing |
 | `current_value_details`, `current_value_description`, `computed_value_description` | computed, display-only | What the move is currently worth and why -- surfaced on the Adjust Valuation dialog so the user sees the justification before overriding it |
 
 **On create -- changed in 20:** it no longer just re-values the targeted moves. For a move-level record it calls `moves._set_value(recompute_date=...)`; for a product/lot-level record it first resolves the affected moves through `_get_fifo_stack()`. Either way the replay path runs, so every downstream out move is re-costed from that date forward.
@@ -1597,11 +1591,11 @@ Source: [`addons/stock_landed_costs/models/res_config_settings.py`](../addons/st
 | `_get_remaining_moves()` | [`product.py:315`](../addons/stock_account/models/product.py#L315) | Returns remaining inventory by move (FIFO stack) |
 | `action_close_stock_valuation()` | [`account/models/company.py:1278`](../addons/account/models/company.py#L1278) | Manual/auto closing entry creation |
 | `_get_location_valuation_vals()` | [`res_company.py:82`](../addons/stock_account/models/res_company.py#L82) | Location reclassification lines for the closing entry |
-| `_create_cogs_lines()` | [`account/models/account_move.py:5961`](../addons/account/models/account_move.py#L5961) | COGS + price difference line generation on posting |
-| `_get_price_difference_lines_vals()` | [`account/models/account_move.py:6059`](../addons/account/models/account_move.py#L6059) | Purchase price difference lines (Anglo-Saxon + Standard) |
-| `_get_cogs_value()` | [`account_move_line.py:87`](../addons/stock_account/models/account_move_line.py#L87) | COGS value per invoice line |
-| `_set_cogs()` | [`account_move_line.py:57`](../addons/stock_account/models/account_move_line.py#L57) | Re-prices already-posted COGS lines when a move's value changes |
-| `_use_inventory_valuation()` | [`account_move_line.py:17`](../addons/stock_account/models/account_move_line.py#L17) | Checks if a line qualifies for COGS / valuation account (was `_eligible_for_stock_account()`) |
+| `_create_cogs_lines()` | [`account/models/account_move.py:5966`](../addons/account/models/account_move.py#L5966) | COGS + price difference line generation on posting |
+| `_get_price_difference_lines_vals()` | [`account/models/account_move.py:6064`](../addons/account/models/account_move.py#L6064) | Purchase price difference lines (Anglo-Saxon + Standard) |
+| `_get_cogs_value()` | [`account_move_line.py:80`](../addons/stock_account/models/account_move_line.py#L80) | COGS value per invoice line |
+| `_set_cogs()` | [`account_move_line.py:50`](../addons/stock_account/models/account_move_line.py#L50) | Re-prices already-posted COGS lines when a move's value changes |
+| `_use_inventory_valuation()` | [`account/models/account_move_line.py:3818`](../addons/account/models/account_move_line.py#L3818) | Checks if a line qualifies for COGS / valuation account (was `_eligible_for_stock_account()`); dropship exclusion in `stock_dropshipping` |
 | `_compute_account_id()` | [`account/models/account_move_line.py:725`](../addons/account/models/account_move_line.py#L725) | Overrides purchase bill account to stock valuation |
 | `button_validate()` | [`stock_landed_cost.py:114`](../addons/stock_landed_costs/models/stock_landed_cost.py#L114) | Validates landed cost, creates JE, updates move values |
 | `get_valuation_lines()` | [`stock_landed_cost.py:166`](../addons/stock_landed_costs/models/stock_landed_cost.py#L166) | Splits costs across products (the split arithmetic lives here in 20) |
@@ -1622,7 +1616,8 @@ Source: [`addons/stock_landed_costs/models/res_config_settings.py`](../addons/st
    -> _set_value(): move.value = _get_value()   (positive)
       Priority chain: _get_value_from_quotation() returns PO line price * qty
    -> _update_standard_price(): standard_price = total_value / qty_available
-   -> _create_account_move(): Debit Stock Valuation, Credit Location Account
+   -> _create_account_move(): no entry -- neither Vendors nor WH/Stock has a
+      valuation_account_id
 
 2. Vendor bill posted -> account.move._post()
    -> super()._post() -> _create_cogs_lines() (price difference lines, if standard cost)
@@ -1660,7 +1655,7 @@ Source: [`addons/stock_landed_costs/models/res_config_settings.py`](../addons/st
 1. Receipt validated -> stock.move._action_done()
    -> _set_value(): move.value = _get_value()
       No bill yet -> _get_value_from_quotation() returns PO price * qty
-   -> _create_account_move(): Debit location_dest.valuation_account_id, Credit stock_valuation
+   -> _create_account_move(): no entry (no location with valuation_account_id)
 
 2. Bill line account: account.move.line._compute_account_id() (in `account`)
    -> _use_inventory_valuation() True -> account overridden from expense
@@ -1686,7 +1681,9 @@ Source: [`addons/stock_landed_costs/models/res_config_settings.py`](../addons/st
    -> Creates stock.move: WH/Stock -> Inventory Loss location
    -> is_out = True (valued -> unvalued)
    -> move.value = - standard_price * adjustment_qty
-   -> JE: Debit Inventory Loss (location valuation_account_id), Credit Stock Valuation
+   -> JE only if the Inventory adjustment location has a valuation_account_id
+      (Loss Account): Debit that account, Credit Stock Valuation. A fresh chart
+      sets none, so by default no entry is created
 ```
 
 ### Scenario 5: Landed Cost Validation -- Code Trace
@@ -1719,7 +1716,7 @@ Source: [`addons/stock_landed_costs/models/res_config_settings.py`](../addons/st
    -> _set_value(): move.value = _get_value()
       -> _get_value_from_returns(): abs(origin_move.value) * qty / origin_valued_qty
          (abs() because the origin out move's value is negative)
-   -> _create_account_move(): Debit location.valuation_account_id, Credit Stock Valuation
+   -> _create_account_move(): no entry (Customers has no valuation_account_id)
    -> _update_standard_price(): AVCO/FIFO recalculated
 
 2. Credit note posted -> account.move._post() -> _create_cogs_lines()
@@ -1836,9 +1833,9 @@ The only group this module defines is `stock_account.group_lot_on_invoice` ("Dis
 
 - **Editing a done move's date replays the valuation.** `stock.move.write()` detects a date change on a valued move and calls `_set_value(recompute_date=min(old, new))`, which re-costs everything from that instant forward. Source: [`write()`](../addons/stock_account/models/stock_move.py#L181). Backdating is additionally blocked inside a locked fiscal period by a constraint on `stock.picking.date_done` -- [`_check_backdate_allowed()`](../addons/stock_account/models/stock_picking.py#L13), bypassable with the `stock_account.skip_lock_date_check` system parameter.
 
-- **Resetting a move to draft clears its journal entry.** `_action_reset_to_draft()` / `_action_reset_to_progress()` draft and unlink the stock `account.move`, zero the move value, and replay the product's valuation. Source: [`stock_move.py:792`](../addons/stock_account/models/stock_move.py#L792).
+- **Resetting a move to draft clears its journal entry.** `_action_reset_to_draft()` / `_action_reset_to_progress()` draft and unlink the stock `account.move`, zero the move value, and replay the product's valuation. Source: [`_clear_journal_entries()`](../addons/stock_account/models/stock_move.py#L781). Only manufacturing orders call them ([`mrp_production.py:2039`](../addons/mrp/models/mrp_production.py#L2039)); a transfer cannot be reset.
 
-- **Purchase price difference only for Standard + Anglo-Saxon:** [`_get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6059) runs only on purchase documents of an Anglo-Saxon company, and only produces lines when `_get_price_diff_account()` resolves -- which it does only for `cost_method == 'standard'`. FIFO and AVCO products don't get price difference entries because their cost is dynamic. **Changed in 20:** there is no expense-account fallback; an unset category account means no lines at all.
+- **Purchase price difference only for Standard + Anglo-Saxon:** [`_get_price_difference_lines_vals()`](../addons/account/models/account_move.py#L6064) runs only on purchase documents of an Anglo-Saxon company, and only produces lines when `_get_price_diff_account()` resolves -- which it does only for `cost_method == 'standard'`. FIFO and AVCO products don't get price difference entries because their cost is dynamic. **Changed in 20:** there is no expense-account fallback; an unset category account means no lines at all.
 
 - **COGS not created for dropship:** `_use_inventory_valuation()` returns `False` if any linked stock move is a dropship. Dropship COGS is handled through the stock move's direct valuation.
 

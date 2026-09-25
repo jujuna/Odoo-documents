@@ -312,7 +312,7 @@ Moves join an existing transfer when they share references, source, destination,
 
 ### Delivered quantity and delivery status
 
-- Goods lines compute Delivered from done outgoing moves minus done returns that keep "Update quantities on SO/PO" (`to_refund`, on by default, [`stock_move.py:27`](../addons/stock_account/models/stock_move.py#L27)) ([`sale_order_line.py:185`](../addons/sale_stock/models/sale_order_line.py#L185)).
+- Goods lines compute Delivered from done outgoing moves minus done returns with `to_refund` (on by default and copied to the return, [`stock_move.py:27`](../addons/stock_account/models/stock_move.py#L27); no view shows it in 20, so every return counts) ([`sale_order_line.py:185`](../addons/sale_stock/models/sale_order_line.py#L185)).
 - **Delivery Status** is a `sale` field ([`sale_order.py:440`](../addons/sale/models/sale_order.py#L440)); `sale_stock` computes it from transfers ([`sale_order.py:77`](../addons/sale_stock/models/sale_order.py#L77)):
 
 | Status | Condition |
