@@ -470,7 +470,7 @@ Not every company wants the Stock Valuation account moved by every bill and invo
 - During the month, receipts and deliveries happen normally
 - **No journal entries are created from stock moves**
 - The inventory module tracks all quantities and values internally
-- At month-end the accountant opens the **Inventory Valuation** report (Accounting > Audit > Inventory > Inventory Valuation, menu shipped by `account_reports`) and clicks **Generate Entries**
+- At month-end the accountant opens the **Inventory Valuation** report (Accounting > Review > Inventory > Inventory Valuation, menu shipped by `account_reports`) and clicks **Generate Entries**
 - Odoo compares:
   - What the inventory system says the value is (based on quants + cost method)
   - What the accounting ledger shows for the stock valuation account
@@ -658,7 +658,7 @@ Technically possible by changing the product category's costing method. Odoo wil
 - **Per quant:** Inventory > Reporting > Inventory Valuation (shows `value` per location/lot)
 - **Per move:** the `value`, `remaining_qty` and `remaining_value` optional columns on any `stock.move` list, plus the "Aging Report" and "Intercompany Deliveries" saved filters shipped in [stock_move_views.xml](../addons/stock_account/views/stock_move_views.xml)
 - **In accounting:** General Ledger for the Stock Valuation account
-- **The report:** Accounting > Audit > Inventory > Inventory Valuation -- the OWL client action `account.action_report_stock_valuation`, backed by the `account.stock.valuation.report` abstract model. It is also where periodic closing entries are generated.
+- **The report:** Accounting > Review > Inventory > Inventory Valuation -- the OWL client action `account.action_report_stock_valuation`, backed by the `account.stock.valuation.report` abstract model. It is also where periodic closing entries are generated.
 
 ### Q: When does a vendor bill change the move value?
 

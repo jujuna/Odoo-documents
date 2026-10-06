@@ -36,14 +36,14 @@ The cron pushes a `0` only for an employee RS already knows (`rs_status` or `rs_
 
 ### Authentication flow
 
-Credentials live on `res.users` (module `rs_base_methods`). Each user has their own `rs_username` / `rs_password`. API calls always run as `env.user` and use that user's token cache.
+Credentials live on `res.users.settings` (module `rs_base_methods`), one value per user **and per company**; `res.users` shows them for the active company. API calls run as `env.user` under the employee's legal entity (its root company), so the login and token cache of that company are used whatever company is active ([`_request`](../custom_addons/gec_odoo_modules/employee_registry_rs/models/employee_registry_rs_service.py#L110)).
 
 1. Service asks `env.user._get_rs_rest_token()` for a fresh token.
 2. `rs_base_methods` checks the cached `rs_access_token` + `rs_token_expiry` on the user; if fresh → returns it. If expired/missing → POST `/Users/Authenticate`, cache the new token on the user, return it.
 3. If RS returns 401, the service calls `_rs_rest_authenticate(force=True)` and retries once.
 4. Manual actions (Sync Now, Sync Countries) use the current logged-in user's credentials.
-5. The daily cron uses whichever user is set on the `ir.cron` record (Technical → Scheduled Actions → "RS Employee Registry: Daily Sync" → User field). That user must have RS credentials filled in and HR Officer rights.
-6. **One RS login serves one legal entity.** The buttons refuse an employee whose company (with its branches) is not the company you are working in; the cron only syncs the employees of its user's default company and that company's branches. A database with several legal entities needs one cron (and one RS user) per entity.
+5. The daily cron runs one pass per legal entity as that company's **RS Responsible User** (the flag in Preferences, set per company); the `User` on the `ir.cron` record no longer matters. The responsible user needs HR Officer rights and a login stored under the root company.
+6. **One RS login serves one legal entity.** The buttons refuse an employee whose company (with its branches) is not the company you are working in; the cron syncs each legal entity in its own pass. A database with several legal entities needs one RS Responsible User per entity; the same person may be it for all of them, with one login stored per entity.
 
 Only one-step authentication is supported — the service account must have 2FA disabled.
 
@@ -123,8 +123,8 @@ Alternative pre-link: click **Fetch from RS** before pushing. The button is visi
 
 ## Configuration & Settings
 
-### Per-user credentials (Settings → Users → select user → Preferences → "Revenue Service (rs.ge)")
-Provided by [`rs_base_methods`](../custom_addons/gec_odoo_modules/rs_base_methods/). Each user who interacts with RS gets their own `rs_username` / `rs_password` and their own bearer-token cache. Two test buttons live on the same form: **Test SOAP (e-invoice)** and **Test REST (employee registry)**.
+### Per-user, per-company credentials (switch to the company, then Settings → Users → select user → Preferences → "Revenue Service (rs.ge)")
+Provided by [`rs_base_methods`](../custom_addons/gec_odoo_modules/rs_base_methods/). Each user who interacts with RS gets their own `rs_username` / `rs_password` and their own bearer-token cache, one set per company; the form shows the company it is editing. **Test SOAP (e-invoice)** also stores the company's rs.ge taxpayer id; **Test REST (eapi.rs.ge)** pairs the device for that company.
 
 ### Module-wide settings (Settings → Employees → RS Employee Registry)
 
@@ -132,7 +132,7 @@ Provided by [`rs_base_methods`](../custom_addons/gec_odoo_modules/rs_base_method
 - **Sync Countries from RS** — calls `/Employees/GetCountries` as the current logged-in user and populates `res.country.rs_country_code` by matching on the Georgian country name, compared in `ka_GE` whatever the user's language ([`sync_countries_from_rs`](../custom_addons/gec_odoo_modules/employee_registry_rs/models/employee_registry_rs_service.py#L216)). The Georgian names come from `gec_i18n_base`. Run once after install, then only when new countries are added on either side.
 
 ### Cron identity
-The daily cron runs as whatever user is set on the `ir.cron` record (Technical → Scheduled Actions → "RS Employee Registry: Daily Sync" → User field). On install it is the superuser, which has no RS credentials. Change it to a dedicated service-account user with `rs_username`/`rs_password` filled in, HR Officer rights, and the legal entity it serves as default company. If the cron user has no credentials, the cron logs a warning and no-ops. The interval is 1 day; databases installed before 2026-09-23 keep their stored 3-day interval (the record is `noupdate`), so change it on the Scheduled Action.
+The daily cron runs one pass per legal entity (root company) as that company's RS Responsible User ([`_cron_sync_employees_to_rs`](../custom_addons/gec_odoo_modules/employee_registry_rs/models/hr_employee.py#L572)); the Scheduler User on the `ir.cron` record is irrelevant. Flag the user in each company (Preferences, per company); they need HR Officer rights and a login stored under the root company. A company without a responsible user is skipped with a log line, and a failing company never stops the others. The interval is 1 day; databases installed before 2026-09-23 keep their stored 3-day interval (the record is `noupdate`), so change it on the Scheduled Action.
 
 ---
 
@@ -155,8 +155,8 @@ The daily cron runs as whatever user is set on the `ir.cron` record (Technical �
 - **Contract model changed in v19.** There is no `hr.contract` — contracts live as `hr.version` rows with `contract_date_start/end`, and `hr.employee` delegates to the current version via `current_version_id`. The status-derivation reads from `current_version_id`, not from a non-existent `hr.contract`.
 - **Future dates don't terminate.** An employee with a `departure_date` in the future stays status `1` until that date arrives. Same for `contract_date_end` — only a *past* end date flips the target to `0`.
 - **Archiving is a termination signal.** Setting `active=False` on the employee → target status goes to `0` even without a `departure_date`. The cron sends it only if RS already knows the employee (see the state derivation above).
-- **Token cache is per-user, survives restarts.** Tokens live on `res.users.rs_access_token` (set by `rs_base_methods`). Each user's cache is independent. A corrupted token can linger for up to 40 min — click **Test REST (employee registry)** on the user form to force a re-auth immediately.
-- **2FA is not supported.** If the RS service account has SMS-based 2FA, `/Users/Authenticate` returns a `PIN_TOKEN` instead of an `ACCESS_TOKEN` and the module raises a `UserError`. Use a separate API service account with 2FA disabled.
+- **Token cache is per user and per company, survives restarts.** Tokens live on `res.users.settings.rs_access_token` (company-dependent, set by `rs_base_methods`) and are shown on the user for the active company. Each cache is independent. A corrupted token can linger for up to 40 min — switch to the company and click **Test REST (eapi.rs.ge)** on the user form to force a re-auth immediately.
+- **2FA needs a one-time pairing per company.** If the RS account has SMS-based 2FA, `/Users/Authenticate` returns a `PIN_TOKEN`; the interactive **Test REST** opens a PIN wizard and stores the device code for that company, after which logins skip the SMS. The cron cannot answer a PIN: pair the device before enabling the sync, or it logs the 2FA error for that entity.
 - **`identification_id` is group-gated.** It's declared with `groups="hr.group_hr_user"` on `hr.version`. The cron runs as its Scheduler User and reads it without `sudo()`, so that user needs HR Officer rights. Forms shown to non-HR users don't display the RS page (also gated to `hr.group_hr_user`).
 - **Country code drift.** RS numeric codes follow ISO 3166-1, but the RS list is authoritative. If a name doesn't match exactly between Odoo's Georgian translation and RS's Georgian spelling, the sync-countries action silently skips it — review matches if you see missing codes. Before 2026-09-23 the match used the clicking user's language, so an English-language user matched nothing.
 - **The sync log is per company.** Each row carries the employee's company (or the active company for calls without an employee) and is only visible in that company; "Created by" is the user who made the call. RS Employee Browser searches are private to the HR manager who ran them.

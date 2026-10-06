@@ -5,7 +5,7 @@
 
 ## Status on Odoo 20
 
-- **Ported and tested, not installed.** The manifest, OWL 3 grids, icons, `ir.access.csv`, withholding field names, payment states, `_display_address` and the Binary file fields are ported. The module is `uninstalled` on `gec20_prod1` (checked 2026-09-24). On a scratch database (2026-09-24) 32 of its 33 tests pass; the failing one is the next point.
+- **Ported, tested and installed.** The manifest, OWL 3 grids, icons, `ir.access.csv`, withholding field names, payment states, `_display_address` and the Binary file fields are ported. The module is installed on `gec20_prod1` since 2026-09-25 (checked 2026-09-27). On a scratch database (2026-09-24) 32 of its 33 tests pass; the failing one is the next point.
 - **Individuals with a Tax ID are exported as companies.** In 20.0 `is_company` is computed: a contact is a company when it is its own commercial entity and has a Tax ID ([res_partner.py:946](../odoo/addons/base/models/res_partner.py#L946)); core commit `f2965048f60f` removed the Person/Company switch, and writing `is_company = False` is recomputed away. `l10n_ge` does not refine it, while 15 other localizations do (e.g. [l10n_uz](../addons/l10n_uz/models/res_partner.py#L8): only a 9-digit TIN is a company). A recipient whose 11-digit personal number is in Tax ID therefore gets an empty first-name column, the full name in the last-name column and the "Legal form not detected" warning, on payment rows, annex E rows and the manual-row onchange, which all split on `is_company` ([`_split_name`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L693)). Salary rows are not affected. `test_payment_row` fails on this. Open decision: a Georgian `_compute_is_company` in `gec_localization` (9-digit ID = organization, 11-digit = person), or splitting by the Form 30 category's `is_organization` in this module.
 
 ## What It Does & Why It Exists
@@ -282,6 +282,7 @@ Access ([ir.access.csv](../custom_addons/gec_odoo_modules/gec_income_tax_report/
 - **Salary rate is always 20.** The matrix also allows 0, 5, 10 and 12 for employees; such cases need other rows.
 - **Annex E sees only withheld payments.** Fees correctly paid without withholding do not reach annex E.
 - **Totals in the grid footer** cover the visible page only; the header totals cover the declaration. `Total Pension 2%` is the employee share only.
+- **An empty declaration usually means the wrong month.** Salary rows follow the payslip's paid date, not its pay period, and New defaults to last month. August slips paid on 5 September belong to the September declaration, so the August declaration generates zero rows. Compare the payslips' **Payment Date** (payslip form, Other Info tab) with the declaration's Month before looking elsewhere.
 - **One declaration per company and month.** An amendment regenerates and re-uploads the full annex; on the portal delete the uploaded rows first, because a second import adds duplicates.
 - **Classifier drift:** rs.ge re-versions the classifiers about once a year. Rules carry validity periods, so old months still validate with their own rules; a new combination is refused until the CSVs are reloaded.
 - **Portal probe still open:** the row math has never been compared with a portal-computed draft under a company registered in the pension e-system.

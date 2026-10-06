@@ -132,7 +132,7 @@ Rules if built: own models, no `declaration_type` on the Form 30 models (it woul
 
 | # | Question | Who decides |
 |---|---|---|
-| Q1 | Advances: should down-payment invoices carry `18% AD` (code 2)? Does the final invoice's negative down-payment line then net code 1 correctly across months? Check a real down-payment invoice first; see [`rs_einvoice_down_payments.md`](rs_einvoice_down_payments.md) | verify in DB, then accountant |
+| Q1 | Advances: should down-payment invoices carry `18% AD` (code 2)? Checked on a scratch DB 2026-10-02 (advance example 3.9 in [`l10n_ge_vat_report.md`](l10n_ge_vat_report.md)): by default the advance and its deduction both carry `18%`, so everything stays in code 1; with `18% AD` set on the advance invoice, posting copies it to the order line and the final invoice deducts it from code 2 (code 2 = +advance in the advance month, −advance in the supply month; code 1 = full supply). Open: is a negative code 2 how the portal offsets an advance? See also [`rs_einvoice_down_payments.md`](rs_einvoice_down_payments.md) | accountant |
 | Q2 | Code 5: the extra rule for state companies that Tako will supply | accountant |
 | Q3 | Code 6: how the production cost of a self-built building is identified | accountant + dev |
 | Q4 | Code 6¹: how repair costs of own buildings are recognised (dedicated account? analytic?) | accountant + dev |
