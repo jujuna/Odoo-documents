@@ -1032,4 +1032,4 @@ Balance sheet shows Accounts Payable with any outstanding rent bills
 - [accounting_coa.md](accounting_coa.md) — full chart of accounts reference with multi-company and template loading
 - [analytic_budget.md](analytic_budget.md) — budget system with project integration
 - [accounting_reports.md](accounting_reports.md) — all standard reports: P&L, Balance Sheet, Cash Flow, Aged Receivables
-- [accounting_migration.md](accounting_migration.md) — opening balances, lock dates, suspense account pattern
+- [accounting_migration.md](../dev_notes/reference/accounting_migration.md) — opening balances, lock dates, suspense account pattern

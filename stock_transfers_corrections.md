@@ -446,7 +446,7 @@ The closing is launched from the Inventory Valuation report ([`controller.js:83`
   - quantity down or line removed: the Return Decision wizard asks whether the goods came back (return transfer plus a type-5 return waybill) or never left (return transfer only) ([`return_decision_wizard.py:22`](../custom_addons/gec_odoo_modules/rs_waybill/wizards/return_decision_wizard.py#L22), [`_create_return_picking()`](../custom_addons/gec_odoo_modules/rs_waybill/models/rs_waybill.py#L1438)).
 - **Cancel cascades to rs.ge.** Cancelling a transfer deletes a draft waybill on rs.ge, or refuses (cancels) an active one; an rs.ge failure blocks the cancel ([`action_cancel()`](../custom_addons/gec_odoo_modules/rs_waybill/models/stock_picking.py#L109)).
 - **Customer returns** get a type-5 return waybill when their receipt operation type has waybills enabled; it is created once the return is reserved. Receipts from a purchase never get one ([`_rs_try_create_waybill()`](../custom_addons/gec_odoo_modules/rs_waybill/models/stock_picking.py#L160), [`_rs_create_return_waybill()`](../custom_addons/gec_odoo_modules/rs_waybill/models/stock_picking.py#L449)).
-- **Gap:** a done delivery whose waybill never reached rs.ge is not frozen. Unlocking and editing it changes stock and sales but no waybill. Open findings for the module are in [`rs_waybill_einvoice_fix_plan.md`](rs_waybill_einvoice_fix_plan.md).
+- **Gap:** a done delivery whose waybill never reached rs.ge is not frozen. Unlocking and editing it changes stock and sales but no waybill. Open findings for the module are in [`rs_waybill_einvoice_fix_plan.md`](../dev_notes/plans/rs_waybill_einvoice_fix_plan.md).
 
 ---
 
@@ -512,7 +512,7 @@ Found while writing this doc and fixed in those docs on 2026-09-25:
 - [`accounting_coa.md`](accounting_coa.md): the Anglo-Saxon flag described as "COGS posted at delivery", COGS "posted on delivery", and "every stock move creates journal entries in real time".
 - [`inventory.md`](inventory.md#delivered-quantity-and-delivery-status): `to_refund` described as the "Update quantities on SO/PO" option, which has no field in 20.
 
-Not edited: [`rs_waybill_einvoice_fix_plan.md`](rs_waybill_einvoice_fix_plan.md) (item bodies are Odoo 19 on purpose; its 20.0 notes already say `stock.return.picking` is gone) and [`certification_exam.md`](certification_exam.md) (Odoo 19 practice questions).
+Not edited: [`rs_waybill_einvoice_fix_plan.md`](../dev_notes/plans/rs_waybill_einvoice_fix_plan.md) (item bodies are Odoo 19 on purpose; its 20.0 notes already say `stock.return.picking` is gone) and [`certification_exam.md`](../dev_notes/reference/certification_exam.md) (Odoo 19 practice questions).
 
 ---
 
@@ -523,7 +523,7 @@ Not edited: [`rs_waybill_einvoice_fix_plan.md`](rs_waybill_einvoice_fix_plan.md)
 - [`stock_valuation.md`](stock_valuation.md) — costing methods, move value priority, COGS mechanics, closing
 - [`inventory_forecast_report.md`](inventory_forecast_report.md) — how open moves appear in the forecast
 - [`mrp.md`](mrp.md) — manufacturing orders, the only documents with a reset to draft
-- [`rs_waybill_einvoice_fix_plan.md`](rs_waybill_einvoice_fix_plan.md) — open findings in `rs_waybill`
+- [`rs_waybill_einvoice_fix_plan.md`](../dev_notes/plans/rs_waybill_einvoice_fix_plan.md) — open findings in `rs_waybill`
 
 ---
 

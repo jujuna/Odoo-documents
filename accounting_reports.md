@@ -1315,4 +1315,4 @@ Everything below is a behaviour or API change from Odoo 19 that affects custom r
 - [INDEX.md](INDEX.md)
 - [accounting_coa.md](accounting_coa.md) — account types determine which domain expressions match
 - [accounting_multicompany_branches.md](accounting_multicompany_branches.md) — company filter, consolidation and the Interco Comparison report
-- [accounting_migration.md](accounting_migration.md) — which reports to validate before go-live
+- [accounting_migration.md](../dev_notes/reference/accounting_migration.md) — which reports to validate before go-live

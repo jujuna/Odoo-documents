@@ -400,7 +400,7 @@ Each phase is approved before it starts and committed by the user when it passes
 - [`INDEX.md`](INDEX.md)
 - [`rs_einvoice.md`](rs_einvoice.md) — the sales and purchase flows the crons and buttons above serve
 - [`employee_registry_rs.md`](employee_registry_rs.md) — the registry cron and its "one login per legal entity" rule
-- [`rs_waybill_fix_plan.md`](rs_waybill_fix_plan.md) — waybill corrections; independent of this change
+- [`rs_waybill_fix_plan.md`](../dev_notes/plans/rs_waybill_fix_plan.md) — waybill corrections; independent of this change
 - [`CODE_REVIEW.md`](../custom_addons/gec_odoo_modules/rs_einvoice/CODE_REVIEW.md) — items 1.1 and 3.x are resolved by this design
 
 ---

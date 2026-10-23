@@ -1302,4 +1302,4 @@ Everything else in this document — the branch vs multi-company decision, the `
 
 - [`INDEX.md`](INDEX.md)
 - [`accounting_reports.md`](accounting_reports.md) -- consolidation, the company filter, and the Interco Comparison report
-- [`accounting_migration.md`](accounting_migration.md) -- opening balances and lock dates per company
+- [`accounting_migration.md`](../dev_notes/reference/accounting_migration.md) -- opening balances and lock dates per company

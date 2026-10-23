@@ -1,7 +1,7 @@
 # VAT Declaration (rs.ge) — `gec_vat_declaration`
 
 > **Module:** `gec_vat_declaration` | **Path:** [`custom_addons/gec_odoo_modules/gec_vat_declaration/`](../custom_addons/gec_odoo_modules/gec_vat_declaration/)
-> **Status:** Phase 1 of [`vat_declaration_build_plan.md`](vat_declaration_build_plan.md), built 2026-10-22, commits `4daad73` + `8759c4a` (grid, Georgian),
+> **Status:** Phase 1 of [`vat_declaration_build_plan.md`](../dev_notes/plans/vat_declaration_build_plan.md), built 2026-10-22, commits `4daad73` + `8759c4a` (grid, Georgian),
 > 12 tests pass on a scratch DB (incl. a browser test of the grid). Not installed on gec20_prod1.
 
 ## What It Does & Why It Exists
@@ -135,6 +135,6 @@ Each page is a grid drawn by the `gec_vat_grid` widget, laid out like the portal
   December cells 19-20 (not in the captured form).
 
 ## Related
-- [`vat_declaration_build_plan.md`](vat_declaration_build_plan.md) · [`vat_declaration_technical_design.md`](vat_declaration_technical_design.md) ·
-  [`vat_declaration_rs_portal_pages.md`](vat_declaration_rs_portal_pages.md) · [`l10n_ge.md`](l10n_ge.md) (the VAT Report and the tax fixes) ·
+- [`vat_declaration_build_plan.md`](../dev_notes/plans/vat_declaration_build_plan.md) · [`vat_declaration_technical_design.md`](../dev_notes/plans/vat_declaration_technical_design.md) ·
+  [`vat_declaration_rs_portal_pages.md`](../dev_notes/reference/vat_declaration_rs_portal_pages.md) · [`l10n_ge.md`](l10n_ge.md) (the VAT Report and the tax fixes) ·
   [`gec_income_tax_report.md`](gec_income_tax_report.md) (Form 30, the pattern)

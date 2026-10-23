@@ -24,7 +24,7 @@ The examples use these rates:
 ---
 
 > **Payroll and Form 30, checked 2026-10-13** (Opus bug-hunter on prod1 data; details in
-> [form30_entry_redesign_plan.md](form30_entry_redesign_plan.md) section 4.4 "Salaries"): September Form 30 tax 6,287.95
+> [form30_entry_redesign_plan.md](../dev_notes/plans/form30_entry_redesign_plan.md) section 4.4 "Salaries"): September Form 30 tax 6,287.95
 > equals the 331320 credits and pension matches; advances, repayments and exempt relief are right. Paths that go wrong:
 > - **S1** a net-pay payment rejected or never sent: core Mark Unpaid keeps the Payment Date, so a slip paid again next month
 >   is declared twice (Pay Salaries) or stays in the old month (Register Payment). Fix planned (Form 30 step 1: Mark Unpaid
@@ -1148,4 +1148,4 @@ required, and tested with real payroll data.
 - [`hr_payroll_component_settlement.py`](../custom_addons/gec_payroll_types/geo_payroll/models/hr_payroll_component_settlement.py) — immutable Work Item ledger
 - [`payroll_structure_data.xml`](../custom_addons/gec_payroll_types/geo_payroll/data/payroll_structure_data.xml) — GEO salary structures and rules
 
-Design history and technical decisions: [geo_payroll_implementation_plan.md](geo_payroll_implementation_plan.md).
+Design history and technical decisions: [geo_payroll_implementation_plan.md](../dev_notes/plans/geo_payroll_implementation_plan.md).

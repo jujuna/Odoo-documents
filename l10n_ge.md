@@ -247,7 +247,7 @@ A full credit note posts the opposite balances on the same tags, so the lines re
 - Tax groups carry no settlement accounts in 20.0; those moved to `account.return.type` ([`account_returns.md`](account_returns.md)). Moving the month's VAT to 333010 / 140610 is a manual entry, if the accountant wants one.
 - Lock the period yourself with the tax lock date after filing ([`account_returns.md`](account_returns.md), Which lock date does what).
 - [Likely] An account manager can create a Georgian VAT return type by hand: Accounting > Configuration > Accounting > Return Types, report **VAT Report**, monthly, with settlement accounts. Managers have full rights on return types and the views allow creation; nobody has tried it on a database yet.
-- Deadlines: withholding is declared by the 15th of the following month ([`mof_order_996_2010.md`](mof_order_996_2010.md)); VAT and CIT on distributions are also monthly [Unverified in our docs].
+- Deadlines: withholding is declared by the 15th of the following month ([`mof_order_996_2010.md`](../dev_notes/reference/mof_order_996_2010.md)); VAT and CIT on distributions are also monthly [Unverified in our docs].
 
 ---
 
@@ -262,7 +262,7 @@ Our WHT taxes run on core `l10n_account_withholding_tax`. The flag is `is_withho
 
 The payment entry for the 1,000 GEL management-fee bill with 10%: Payable +1,000, Bank −900, 331212 −100, plus a "WH Base" / "WH Base Counterpart" pair of ±1,000 ([_prepare_withholding_amls_create_values](../addons/l10n_account_withholding_tax/models/account_withholding_line.py#L348)). The pair posts on the **Withholding Tax Base** account from Settings, or on the bill line's account when that setting is empty ([account_withholding_line.py:482](../addons/l10n_account_withholding_tax/models/account_withholding_line.py#L482)). Our WHT taxes carry no tags, so nothing reaches the VAT Report.
 
-**Paying the State Treasury is a separate, manual step.** No withholding payment sends the tax: **Withhold Only** has no bank line, and **Withhold and Pay** sends only the net to the vendor. The tax stays as a credit on 331212 / 331210 until it is paid by treasury transfer to code 101001000, by the 15th of the next month ([`rs_form30_full_declaration_gap_plan.md`](rs_form30_full_declaration_gap_plan.md), deadline row). None of our modules clears these accounts, and neither account allows reconciliation. Two ways to settle a month:
+**Paying the State Treasury is a separate, manual step.** No withholding payment sends the tax: **Withhold Only** has no bank line, and **Withhold and Pay** sends only the net to the vendor. The tax stays as a credit on 331212 / 331210 until it is paid by treasury transfer to code 101001000, by the 15th of the next month ([`rs_form30_full_declaration_gap_plan.md`](../dev_notes/plans/rs_form30_full_declaration_gap_plan.md), deadline row). None of our modules clears these accounts, and neither account allows reconciliation. Two ways to settle a month:
 
 | Way | Send | Book |
 |---|---|---|
@@ -433,9 +433,9 @@ What the accountant configures, in order:
 - [`taxes.md`](taxes.md) — tax engine, repartition, tags, fiscal positions, tax precedence on lines
 - [`account_returns.md`](account_returns.md) — return types, closing entry, lock dates
 - [`accounting_coa.md`](accounting_coa.md) — account types and the header-account hierarchy
-- [`mof_order_996_2010.md`](mof_order_996_2010.md) — Georgian tax administration rules and deadlines
+- [`mof_order_996_2010.md`](../dev_notes/reference/mof_order_996_2010.md) — Georgian tax administration rules and deadlines
 - [`gec_income_tax_report.md`](gec_income_tax_report.md) — Form 30 from withholding payments
 - [`l10n_ge_vat_report.md`](l10n_ge_vat_report.md) — accountant's guide to the VAT Report (Georgian): entries per case, line table, wrong default taxes, monthly checks
-- [`vat_declaration_annex_a_plan.md`](vat_declaration_annex_a_plan.md) — plan for an Annex A export
+- [`vat_declaration_annex_a_plan.md`](../dev_notes/plans/vat_declaration_annex_a_plan.md) — plan for an Annex A export
 - [`geo_payroll.md`](geo_payroll.md) — payroll postings, PIT and pension accounts
 - [`basis_bank.md`](basis_bank.md) — bank journals found by BIC, treasury transfers

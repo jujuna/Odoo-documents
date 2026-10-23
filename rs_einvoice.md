@@ -154,5 +154,5 @@ Odoo never polls rs.ge by itself unless the refresh crons are enabled — and on
 - [`INDEX.md`](INDEX.md)
 - [`rs_einvoice_down_payments.md`](rs_einvoice_down_payments.md) — advance invoices, Net vs Native settlement.
 - [`rs_multi_company.md`](rs_multi_company.md) — logins per user and company, the document-company binding, per-company crons.
-- [`rs_waybill_einvoice_fix_plan.md`](rs_waybill_einvoice_fix_plan.md) — older open findings for `rs_waybill` / `rs_einvoice`.
+- [`rs_waybill_einvoice_fix_plan.md`](../dev_notes/plans/rs_waybill_einvoice_fix_plan.md) — older open findings for `rs_waybill` / `rs_einvoice`.
 - [`l10n_ge.md`](l10n_ge.md) — the Georgian taxes the invoices carry.

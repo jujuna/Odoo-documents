@@ -10,7 +10,7 @@
 
 ### Planned change and known issues (2026-10-13)
 
-**Planned:** plan B in [form30_entry_redesign_plan.md](form30_entry_redesign_plan.md) (provisional). Withholding is booked by
+**Planned:** plan B in [form30_entry_redesign_plan.md](../dev_notes/plans/form30_entry_redesign_plan.md) (provisional). Withholding is booked by
 hand in journal entries; the entry's tax line names a withholding tax (new field Withholding Tax), from which Form 30 takes the
 income type and rate exactly as payment rows do today; the 23 withholding taxes get Tax Type None; rows per person and month
 of payment, dated on the bank transaction; export history. Nothing of it is in this module yet.
@@ -294,7 +294,7 @@ Access ([ir.access.csv](../custom_addons/gec_odoo_modules/gec_income_tax_report/
 - **Register Payment carries withholding only in edit mode.** The payment gets withholding lines only when the selected bills form one batch (same vendor, account, currency, bank account) and there is one bill line or **Group Payments** is ticked ([account_payment_register.py:1312](../addons/account/wizard/account_payment_register.py#L1312)); only the wizard path copies them ([`_create_payment_vals_from_wizard`](../addons/l10n_account_withholding_tax/wizards/account_payment_register.py#L281)). Several bills with Group Payments unticked lose the withholding: no row.
 - **Withhold Only** payments (`withhold = 'withhold'`) have no bank line; the tax is booked, the net is paid later ([account_payment.py:131](../addons/l10n_account_withholding_tax/models/account_payment.py#L131)). Their withholding lines give rows dated on that payment, not on the later net payment.
 - **Edited payslips warn forever.** Any inline line edit sets `hr.payslip.edited` and nothing clears it ([hr_payslip.py:173](../enterprise/hr_payroll/models/hr_payslip.py#L173)), so the "Payslip lines were edited manually" warning stays for that slip.
-- **Relief is derived, not stored.** The inversion assumes payroll's PIT = (taxable − 2% of taxable) × 20%. The portal computes (gross − 2% of gross − relief) × 20%, so for an exempt employee payroll withholds 0.4% of the relief more than the portal expects (24 GEL on 6,000 relief). With a vendor benefit company share (`BIK`), payroll takes pension on `GROSS − BIK` ([payroll_structure_data.xml:212](../custom_addons/gec_odoo_modules/geo_payroll/data/payroll_structure_data.xml#L212)) while the portal takes 2% of column 7. Details: [`rs_form30_full_declaration_gap_plan.md`](rs_form30_full_declaration_gap_plan.md) §4.
+- **Relief is derived, not stored.** The inversion assumes payroll's PIT = (taxable − 2% of taxable) × 20%. The portal computes (gross − 2% of gross − relief) × 20%, so for an exempt employee payroll withholds 0.4% of the relief more than the portal expects (24 GEL on 6,000 relief). With a vendor benefit company share (`BIK`), payroll takes pension on `GROSS − BIK` ([payroll_structure_data.xml:212](../custom_addons/gec_odoo_modules/geo_payroll/data/payroll_structure_data.xml#L212)) while the portal takes 2% of column 7. Details: [`rs_form30_full_declaration_gap_plan.md`](../dev_notes/plans/rs_form30_full_declaration_gap_plan.md) §4.
 - **Relief follows today's data.** `pension_fund_member` sits on the employee, not the version, so regenerating an old month uses today's flag. The art. 82 exemption is pooled per person (no company on `hr.payroll.tax.exemption`) and consumed by payslip year, while rows follow the payment date: a December salary paid in January used the old year's cap.
 - **Do not reconcile Form 30 with the month's ledger movement** on 331210 / 331310 / 331320. Payslip entries are dated by accrual, the declaration by payment: a September slip paid in October sits in September's ledger and October's declaration.
 - **A payment that exists only as a bank statement line** (money sent from internet banking) has no withholding line and gives no row. Partial payments of a bill withhold on a proportional base; each payment gives its own row.
@@ -313,7 +313,7 @@ Access ([ir.access.csv](../custom_addons/gec_odoo_modules/gec_income_tax_report/
 ## Related Docs
 
 - [`INDEX.md`](INDEX.md)
-- [`rs_form30_full_declaration_gap_plan.md`](rs_form30_full_declaration_gap_plan.md) — the full declaration (pages 1–6) against Order 996 art. 38, open decisions for the accountant
+- [`rs_form30_full_declaration_gap_plan.md`](../dev_notes/plans/rs_form30_full_declaration_gap_plan.md) — the full declaration (pages 1–6) against Order 996 art. 38, open decisions for the accountant
 - [`l10n_ge.md`](l10n_ge.md) — Georgian chart, taxes and VAT report (`l10n_ge` + `gec_localization`)
 - [`geo_payroll.md`](geo_payroll.md) — the payslip side (PIT, pension, exemptions, advances)
 - Module guides: [`README.md`](../custom_addons/gec_odoo_modules/gec_income_tax_report/README.md) (accountant), [`README_DEV.md`](../custom_addons/gec_odoo_modules/gec_income_tax_report/README_DEV.md) (developer)
