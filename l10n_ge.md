@@ -7,7 +7,7 @@
 
 Odoo 20 ships the Georgian localization `l10n_ge`: a 6-digit IFRS chart of accounts, 36 VAT taxes, 4 fiscal positions and the Georgian **VAT Report** laid out like Annex A of the declaration. It is pure data, loaded once when a company picks the chart; it has no fields, views or business logic.
 
-Everything Georgian that needs more than data lives in our extension `gec_localization`. It adds 10 accounts, 31 taxes (withholding, turnover, CIT, out of scope, non-VAT purchases), payroll account settings, a per-company withholding certificate sequence, default taxes per contact, a "Not Taxed" product flag, a profit distribution (CIT) wizard, bank name and BIC from Georgian IBANs, and contact categories.
+Everything Georgian that needs more than data lives in our extension `gec_localization`. It adds 10 accounts, 62 taxes (withholding, turnover, CIT, out of scope, non-VAT purchases), payroll account settings, a per-company withholding certificate sequence, default taxes per contact, a "Not Taxed" product flag, a profit distribution (CIT) wizard, bank name and BIC from Georgian IBANs, and contact categories.
 
 Users: the accountant who sets up a Georgian company and files the monthly VAT and withholding declarations, and developers of the modules built on it (`geo_payroll`, `gec_payroll_bank`, `gec_income_tax_report`, `basis_bank`). Generic tax mechanics are in [`taxes.md`](taxes.md), return and lock mechanics in [`account_returns.md`](account_returns.md); this doc covers only what is Georgian.
 
@@ -19,7 +19,7 @@ Users: the accountant who sets up a Georgian company and files the monthly VAT a
 Company country = Georgia
   -> Settings > Fiscal Localization: "Georgian Chart of Accounts (IFRS)" (template 'ge')
        l10n_ge:          306 accounts, 5 tax groups, 36 taxes, 4 fiscal positions
-       gec_localization: +10 accounts, 3 account overrides, +6 tax groups, +31 taxes, WHT sequence
+       gec_localization: +10 accounts, 3 account overrides, +6 tax groups, +62 taxes, WHT sequence
   -> invoice / bill line: product tax -> contact default tax (ours) -> fiscal position remap
   -> posting copies each repartition line's tags (1(B), 1(T) ... 33(T)) onto the journal items
   -> VAT Report sums balances per tag -> accountant files on rs.ge, sets the tax lock date by hand
@@ -64,7 +64,7 @@ The VAT declaration never reads accounts. It reads **tags** stamped on journal i
 ### Scenario 3: Paying a foreign consultant
 **Situation:** A non-resident firm invoices 1,000 GEL of management fees.
 **What they do:** Post the bill with **WHT 10% - Non-resident Mgmt/Technical Fees** on the line, then click **Pay**; the dialog opens on **Withhold and Pay**.
-**What happens:** The bill total stays 1,000. The payment pays 900 from the bank and books 100 on 331212. The vendor's "Non-Georgia" position also swaps purchase `18%` for reverse charge; see the gotcha on [three reverse-charge taxes](#gotchas--non-obvious-behavior).
+**What happens:** The bill total stays 1,000. The payment pays 900 from the bank and books 100 on 331212. The vendor's "Non-Georgia" position removes purchase `18%`; reverse charge comes only from the vendor's **Default Purchase Tax** `18% Reverse Charge Services` ([VAT corrections](#corrections-to-l10n_ges-vat-taxes)).
 
 ### Scenario 4: Paying a dividend
 **Situation:** The owners approve 850 GEL net to an individual shareholder.
@@ -80,7 +80,7 @@ The VAT declaration never reads accounts. It reads **tags** stamped on journal i
 | Piece | Source | Content |
 |---|---|---|
 | Chart | [account.account-ge.csv](../addons/l10n_ge/data/template/account.account-ge.csv) | 306 rows, 6-digit codes, `name@ka` on every row: 256 postable accounts + 50 inactive header accounts (9 roots, 41 second level) that form the hierarchy through `parent_id` |
-| Taxes | [account.tax-ge.csv](../addons/l10n_ge/data/template/account.tax-ge.csv) | 36 VAT taxes: 18 sale, 16 purchase, 2 journal-entry only (`18% L`, `18% RE`); all on invoice (no cash basis) |
+| Taxes | [account.tax-ge.csv](../addons/l10n_ge/data/template/account.tax-ge.csv) | 36 VAT taxes: 18 sale, 16 purchase, 2 journal-entry only (`18% Loss of Goods`, `18% Retention of Goods`); all on invoice (no cash basis) |
 | Tax groups | [account.tax.group-ge.csv](../addons/l10n_ge/data/template/account.tax.group-ge.csv) | VAT 18%, 12%, 5%, 0%, Exempt; name and country only |
 | Fiscal positions | [account.fiscal.position-ge.csv](../addons/l10n_ge/data/template/account.fiscal.position-ge.csv) | 4, three auto-applied |
 | VAT Report | [account_tax_report_data.xml:3](../addons/l10n_ge/data/account_tax_report_data.xml#L3) | `account.report` "VAT Report", variant of the generic tax report, Base and Tax columns, 42 lines / 67 expressions |
@@ -93,9 +93,9 @@ The VAT declaration never reads accounts. It reads **tags** stamped on journal i
 | Account | Used by |
 |---|---|
 | 333002 VAT Output | all 18% sale taxes except advances |
-| 333011 VAT Accrued on Customer Advances | `18% AD` |
+| 333011 VAT Accrued on Customer Advances | `18% Advance` |
 | 334010 Input VAT Local Purchases | the six domestic 18% purchase taxes (III.1, III.5–III.8) |
-| 333040 VAT Payable on Imports | `18% / 12% / 5% EX ONLY` |
+| 333040 VAT Payable on Imports | `18% / 12% / 5% Import` |
 | 334040 Input Reverse Charge VAT / 333060 Reverse Charge VAT Payable | the +100% / −100% legs of reverse charge |
 | 140610 VAT Receivable / 333010 VAT Payable | reconcilable, non-trade; nothing in `l10n_ge` refers to them |
 | 331110 CIT, 331210 / 331211 / 331212 WHT, 331310 PIT, 332010 pension, 339090 other taxes | no `l10n_ge` tax; our taxes and payroll use them |
@@ -107,23 +107,23 @@ The report line codes are `ge_1` … `ge_35`; each leaf reads the tags `N(B)` (b
 | Declaration line (form numbering) | Tag | `l10n_ge` tax |
 |---|---|---|
 | I.1 Taxable supplies | 1 | `18%` |
-| I.1.1 Margin scheme | 2 | `18% S` |
-| I.2 Advances received | 3 | `18% AD` |
-| I.3 / I.5 Free goods / free services | 4 / 6 | `18% FOC G` / `18% FOC S` |
-| I.4 Inventory shortage | 5 | `18% L` (journal entries) |
-| I.6 / I.6.1 Own building use / repairs | 7 / 8 | `18% B` / `18% R` |
-| I.7 Barter; I.7.1 retention after cessation | 9 / 10 | `18% BA` / `18% RE` (journal entries) |
-| I.8 Other taxable | 11 | `18% O` |
-| I.9–I.13 Exempt supplies | 12–16 | `0% EXT D`, `0% EXT G`, `0% EXT I`, `0% EXT P`, `0% EXT TA` (base only) |
-| I.14 Export / re-export ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L291)) | 17 | `0% EX` (base only) |
-| I.14.1–14.3 Exempt without deduction | 18–20 | `0% EXT F`, `0% EXT L`, `0% EXT O` (base only) |
-| II.1–II.3 Reverse charge output ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L368)) | 21–23 | `18% R C S`, `18% R C G C`, `18% R C G F` (−100% leg) |
+| I.1.1 Margin scheme | 2 | `18% Margin Scheme` |
+| I.2 Advances received | 3 | `18% Advance` |
+| I.3 / I.5 Free goods / free services | 4 / 6 | `18% Free Supply of Goods` / `18% Free Services` |
+| I.4 Inventory shortage | 5 | `18% Loss of Goods` (journal entries) |
+| I.6 / I.6.1 Own building use / repairs | 7 / 8 | `18% Use of Own Building` / `18% Building Repairs` |
+| I.7 Barter; I.7.1 retention after cessation | 9 / 10 | `18% Barter Sale` / `18% Retention of Goods` (journal entries) |
+| I.8 Other taxable | 11 | `18% Other Transactions` |
+| I.9–I.13 Exempt supplies | 12–16 | `0% Diplomatic Missions`, `0% Natural Gas`, `0% International Transport`, `0% International Projects`, `0% Inventory` (base only) |
+| I.14 Export / re-export ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L291)) | 17 | `0% Export` (base only) |
+| I.14.1–14.3 Exempt without deduction | 18–20 | `0% Financial Services`, `0% Land Plot`, `0% Other Exempt` (base only) |
+| II.1–II.3 Reverse charge output ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L368)) | 21–23 | `18% Reverse Charge Services`, `18% Customs Warehouse`, `18% Free Industrial Zone` (−100% leg) |
 | III.1 Local purchases ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L447)) | 24 | `18%` purchase |
-| III.2 Import VAT | 25 | `EX ONLY` (tax) and `EX ONLY B` (base) |
+| III.2 Import VAT | 25 | `Import` (tax) and `Import Base` (base) |
 | III.3 Import VAT assessed by the authority ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L483)) | 26 | none |
 | III.4 Reverse charge input | 27 | the three reverse-charge taxes (+100% leg) |
 | III.4.1 ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L519)) | — | typed by hand (`external` engine, editable) |
-| III.5–III.8 Fixed assets, building, repairs, barter, auction | 29–33 | `18% FA`, `18% BU`, `18% RFA`, `18% BA`, `18% AU` |
+| III.5–III.8 Fixed assets, building, repairs, barter, auction | 29–33 | `18% Cessation of Activity`, `18% Own Building`, `18% Own Repairs`, `18% Barter Purchase`, `18% Auction` |
 | Totals I.15, II.4, III.9, net VAT ([line](../addons/l10n_ge/data/account_tax_report_data.xml#L674)) | — | aggregation formulas |
 
 ### Fiscal positions: the mapping lives on the tax
@@ -134,17 +134,17 @@ Detection ([_get_fiscal_position](../addons/account/models/partner.py#L259)): a 
 
 | Position | Picked for | Sale `18%` becomes | Purchase `18%` becomes |
 |---|---|---|---|
-| Georgia (VAT Registered), seq 10 | Georgian contact **with any Tax ID** | six taxes: `18% S`, `18% AD`, `18% O`, `0% EXT F`, `0% EXT L`, `0% EXT O` | kept |
-| Georgia (non-VAT Registered), seq 20 | Georgian contact without Tax ID | removed | removed |
-| Non-Georgia, seq 30 | any other country | `0% EX` | three reverse-charge taxes |
-| Domestic non-registered individual | only when pinned | removed | removed |
+| Georgia (VAT Registered), seq 10 | Georgian contact **with any Tax ID** | core: six taxes (`18% Margin Scheme`, `18% Advance`, `18% Other Transactions`, `0% Financial Services`, `0% Land Plot`, `0% Other Exempt`); **ours: `18%`** | kept |
+| Georgia (non-VAT Registered), seq 20 | Georgian contact without Tax ID | core: removed; **ours: `18%`** | removed |
+| Non-Georgia, seq 30 | any other country | `0% Export` | core: three reverse-charge taxes; **ours: removed** |
+| Domestic non-registered individual | only when pinned | core: removed; **ours: `18%`** | removed |
 
-"VAT Registered" means "has a Tax ID": the check is `has_vat` ([partner.py:924](../addons/account/models/partner.py#L924), [res_partner.py:937](../odoo/addons/base/models/res_partner.py#L937)). Every Georgian company keeps its TIN in `vat`, so non-VAT-payer companies get this position too. Our 31 taxes list no position, so they pass through every position unchanged.
+"Core" is `l10n_ge` as shipped; "ours" is what a company gets with `gec_localization` ([corrections](#corrections-to-l10n_ges-vat-taxes)). "VAT Registered" means "has a Tax ID": the check is `has_vat` ([partner.py:932](../addons/account/models/partner.py#L932), [res_partner.py:938](../odoo/addons/base/models/res_partner.py#L938)). Every Georgian company keeps its TIN in `vat`, so non-VAT-payer companies get this position too. Our own taxes list no position, so they pass through every position unchanged.
 
 ### What core `l10n_ge` does not do
 - No withholding, turnover or CIT taxes; it ships only the WHT accounts.
 - No VAT return type, deadline, closing entry or lock ([The VAT period](#the-vat-period)), and no rs.ge submission.
-- No VAT on sales to contacts without a Tax ID as shipped (table above).
+- No VAT on sales to contacts without a Tax ID as shipped (table above); `gec_localization` corrects it.
 - No bank list: `res.bank` does not exist in 20.0; bank name and BIC are fields of each bank account.
 
 ---
@@ -160,8 +160,10 @@ Template functions are registered by method name and the top of the MRO wins ([c
 | Situation | What loads our records |
 |---|---|
 | Company loads the `ge` chart after the module is installed | normal chart load, ours merged in |
-| Module installed while companies already have the `ge` chart | core install hook ([ir_module.py:72](../addons/account/models/ir_module.py#L72)) |
-| Module upgraded | data `<function>` [`_ge_gec_apply_maintenance`](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L36): creates records missing in a company, never rewrites existing ones, fills missing Georgian names |
+| Module installed while companies already have the `ge` chart | core install hook ([ir_module.py:72](../addons/account/models/ir_module.py#L72)); our `post_init` hook also corrects `l10n_ge`'s VAT taxes once ([below](#corrections-to-l10n_ges-vat-taxes)) |
+| Module upgraded | data `<function>` [`_ge_gec_apply_maintenance`](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L36): creates records missing in a company, never rewrites existing ones, fills missing Georgian names. Exception, once per database (flag `gec_localization.tax_texts_20261023`): `_ge_apply_tax_texts` writes the template name, description and invoice label in English and Georgian on every `l10n_ge` and gec tax, and deletes retired taxes (`GE_REMOVED_TAXES`; archived if used) |
+
+**Tax names and labels (2026-10-23).** The accountant's sheet renamed the taxes: `l10n_ge`'s short codes became descriptive names (`18% S` → `18% Margin Scheme` / `18% მარჟის სქემა`), and every tax got a Georgian name. Our taxes carry `name@ka` in [account.tax-ge.csv](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv); `l10n_ge`'s texts are overridden from [ge_core_tax_texts.csv](../custom_addons/gec_odoo_modules/gec_localization/data/template/ge_core_tax_texts.csv) in `_get_account_tax`. The "(company pays)" taxes keep that suffix in the name only; description and label read like the normal withholding tax. `WHT 5% - Resident Individual Residential Rent (company pays)` was removed.
 
 A chart reload never changes **Allow Reconciliation** on an existing account ([chart_template.py:455](../addons/account/models/chart_template.py#L455)). The 331310 override therefore reaches only companies that load the chart after our install. The Payable retypes still land, because the account type forces reconciliation.
 
@@ -169,7 +171,7 @@ A chart reload never changes **Allow Reconciliation** on an existing account ([c
 
 10 new accounts ([account.account-ge.csv](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.account-ge.csv#L2)): 110120 Cash in Foreign Currency, 120300 Amounts Receivable via Acquiring, 120980 Conversion, 140311 Settlements with Accountable Persons, 140810 Receivables from Loans Issued, 160310 Computer Assembly, 160910 Additional Expenses, 310250 Gift Card, 331320 PIT Transit, 710500 Purchased Goods Returns. Rental income uses core's 651010.
 
-Payroll settings on core accounts ([account.account-ge.csv:10](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.account-ge.csv#L10)):
+Settings on core accounts, payroll and withholding ([account.account-ge.csv:10](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.account-ge.csv#L10)):
 
 | Account | Setting | Why |
 |---|---|---|
@@ -177,6 +179,7 @@ Payroll settings on core accounts ([account.account-ge.csv:10](../custom_addons/
 | 332010 Pension Contribution Accrued | Payable, reconcilable | the Pension Agency payment settles it |
 | 331310 PIT Accrued | not reconcilable | used only by two WHT taxes; Pay Salaries would otherwise block on its lines |
 | 331320 PIT Transit (new) | Payable, reconcilable, non-trade | payroll PIT (`PIT_PAYABLE`, [account_chart_template.py:18](../custom_addons/gec_odoo_modules/geo_payroll/models/account_chart_template.py#L18)), paid to the State Treasury from Pay Salaries |
+| 331211 WHT Settled | Payable, reconcilable, non-trade (core: Expense) | withheld tax moved here from 331210 with the State Treasury as partner is paid with the entry line's Pay |
 
 The payment register pays only receivable and payable lines ([account_payment.py:247](../addons/account/models/account_payment.py#L247)); in payroll context `hr_payroll_account` adds current liabilities ([account_payment.py:13](../enterprise/hr_payroll_account/models/account_payment.py#L13)). **Treasury Code** on company contacts ([res_partner.py:29](../custom_addons/gec_odoo_modules/gec_localization/models/res_partner.py#L29)) lets Pay Salaries pay a budget recipient by code instead of a bank account; `geo_payroll` gives its State Treasury contact 101001000 on a fresh install. Payroll flow: [`geo_payroll.md`](geo_payroll.md).
 
@@ -189,12 +192,30 @@ The payment register pays only receivable and payable lines ([account_payment.py
 | VAT 18% Non-Deductible (Purchase) ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L14)) | 1 | into the cost (no account on the tax line) | none |
 | Reverse Charge 18% - Form III-19 ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L18)) | 1 | +18% into the cost, −18% on 333060 | line II.1 (tags 21(B), 21(T)); for buyers not registered for VAT: due, not deducted |
 | Small Business 1% / 3% Turnover ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L6)) | 2, price-included | 339090 | none |
-| CIT 15% - Distributed Profit ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L124)) | 1, journal entries, `division` 15% | +100% 910010, −100% 331110 | none |
+| CIT 15% - Distributed Profit ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L196)) | 1, journal entries, `division` 15% | +100% 910010, −100% 331110 | none |
 | Withholding, non-resident ([first row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L32)) | 11: dividends / interest / royalties 5%, management fees 10%, property rent 20%, offshore royalties / interest / services 15%, other GE income 10%, telecom / transport 10%, oil and gas 4% | 331212 | none |
-| Withholding, resident individuals ([first row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L64)) | 10: dividends / interest / residential rent 5%, services 5% regime, royalties / unregistered services / commercial rent 20%, stipend 20%, gift over GEL 1,000 20%, goods without waybill 3% | 331210 | none |
-| Withholding, salary ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L96)) | 2: salary (PIT) 20%, non-resident employment 20% | 331310 | none |
+| Withholding, resident individuals ([first row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L84)) | 10: dividends / interest / residential rent 5%, services 5% regime, royalties / unregistered services / commercial rent 20%, stipend 20%, gift over GEL 1,000 20%, goods without waybill 3% | 331210 | none |
+| Withholding, salary ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax-ge.csv#L132)) | 2: salary (PIT) 20%, non-resident employment 20% | 331310 | none |
 
 The 6 tax groups are Out of Scope, WHT Non-residents, WHT Residents, Turnover 1%, Turnover 3% and CIT ([account.tax.group-ge.csv](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.tax.group-ge.csv#L2)). Withholding, turnover and CIT tax lines set `use_in_tax_closing` False; core computes it True for other tax lines on balance-sheet accounts ([account_tax.py:5178](../addons/account/models/account_tax.py#L5178)).
+
+### Corrections to `l10n_ge`'s VAT taxes
+
+Since 2026-10-22 (VAT declaration plan, Phase 0) the module corrects three defects of `l10n_ge`'s tax data, so the VAT Report, and the declaration built on it, start from right lines:
+
+| Fix | Core as shipped | With `gec_localization` |
+|---|---|---|
+| A, B: nine **Replaces** links removed ([list](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L4)) | sale `18%` to a Tax-ID customer becomes six taxes (a 100 invoice totals 154); purchase `18%` from abroad becomes three reverse-charge taxes | `18%` stays `18%`; a foreign bill gets no VAT tax unless the vendor's Default Purchase Tax is `18% Reverse Charge Services` (decision 2026-10-22: no automatic reverse charge). `0% Export` still replaces `18%` for export |
+| C: the ten sale taxes that list the VAT Registered position also list non-VAT Registered and Domestic individual ([list](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L17)) | a Georgian buyer without Tax ID gets no VAT | 18% kept. A tax that lists no position is left alone (empty = all positions) |
+| D: `18% / 12% / 5% Import` price-included ([list](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L29)) | an import VAT bill of 180 totals 360 | base 0, tax 180, total 180, on vendor bills only (see the gotcha) |
+
+**How it reaches a company:**
+- A company that loads the `ge` chart while the module is installed gets corrected data: our override of core's root template method [`_get_account_tax`](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L58) edits `l10n_ge`'s rows before they are created. Core runs the most-derived body of that decorated method on every chart load ([chart_template.py:83](../addons/account/models/chart_template.py#L83), [:235](../addons/account/models/chart_template.py#L235)) and skips it in module-filtered loads ([:839](../addons/account/models/chart_template.py#L839)). A one-step install of `gec_localization` on a new Georgian database belongs here: core defers the chart load until every module is loaded ([ir_module.py:117](../addons/account/models/ir_module.py#L117)).
+- A company whose chart was loaded before the module was installed is corrected once by the [`post_init`](../custom_addons/gec_odoo_modules/gec_localization/__init__.py#L5) hook ([_ge_fix_core_vat_taxes](../custom_addons/gec_odoo_modules/gec_localization/models/template_ge.py#L87)). It unlinks only the wrong source tax, adds positions only where VAT Registered is listed, fills Included in Price only when empty, and includes archived records.
+- The same method runs after every `ge` chart load, so a chart **reload** of an uncorrected company completes the repair. Core's reload alone would link the new positions but keep the **Replaces** links ([chart_template.py:402](../addons/account/models/chart_template.py#L402)), stacking six taxes on non-registered buyers too.
+- An upgrade never repairs an existing company. gec20_prod1 was repaired by hand on 2026-10-22.
+
+Proof: [test_ge_vat_mapping.py](../custom_addons/gec_odoo_modules/gec_localization/tests/test_ge_vat_mapping.py#L57) has 6 tests: Tax-ID sale, no-Tax-ID and pinned-individual sales, foreign bill with and without `18% Reverse Charge Services`, import bill, install repair, chart reload. All pass, and each fails on the code without its fix (scratch DB, 2026-10-22). The install path was checked on a database where `l10n_ge` was installed first: 10 links before, only `0% Export` after.
 
 ---
 
@@ -206,7 +227,7 @@ The 6 tax groups are Out of Scope, WHT Non-residents, WHT Residents, Turnover 1%
 4. The report sums the balances per tag ([_report_engine_tax_tags](../enterprise/account_reports/models/account_report.py#L4401)). A leading `-` in the formula flips the sign ([account_report.py:4460](../enterprise/account_reports/models/account_report.py#L4460)): output lines use `-1(B)` so credits show positive; input lines use `24(B)`.
 5. Tags are single records named without sign, created by the report expressions ([_create_tax_tags](../addons/account/models/account_report.py#L805), [account_account_tag.py:87](../addons/account/models/account_account_tag.py#L87)).
 
-Example: a 100 GEL sale with `18%`, and a 100 GEL services bill from a non-resident with `18% R C S`.
+Example: a 100 GEL sale with `18%`, and a 100 GEL services bill from a non-resident with `18% Reverse Charge Services`.
 
 | Journal item | Balance | Tags | Declaration |
 |---|---:|---|---|
@@ -241,6 +262,15 @@ Our WHT taxes run on core `l10n_account_withholding_tax`. The flag is `is_withho
 
 The payment entry for the 1,000 GEL management-fee bill with 10%: Payable +1,000, Bank −900, 331212 −100, plus a "WH Base" / "WH Base Counterpart" pair of ±1,000 ([_prepare_withholding_amls_create_values](../addons/l10n_account_withholding_tax/models/account_withholding_line.py#L348)). The pair posts on the **Withholding Tax Base** account from Settings, or on the bill line's account when that setting is empty ([account_withholding_line.py:482](../addons/l10n_account_withholding_tax/models/account_withholding_line.py#L482)). Our WHT taxes carry no tags, so nothing reaches the VAT Report.
 
+**Paying the State Treasury is a separate, manual step.** No withholding payment sends the tax: **Withhold Only** has no bank line, and **Withhold and Pay** sends only the net to the vendor. The tax stays as a credit on 331212 / 331210 until it is paid by treasury transfer to code 101001000, by the 15th of the next month ([`rs_form30_full_declaration_gap_plan.md`](rs_form30_full_declaration_gap_plan.md), deadline row). None of our modules clears these accounts, and neither account allows reconciliation. Two ways to settle a month:
+
+| Way | Send | Book |
+|---|---|---|
+| Recommended | The transfer from Basis Internet Banking | When the bank line arrives, open it in bank reconciliation, **Set Account**, choose 331212 / 331210 ([set_account_bank_statement_line](../enterprise/account_accountant/models/account_bank_statement.py#L1308)) |
+| From Odoo | A payment to **სახელმწიფო ხაზინა** on a Basis journal, **Basis Bank Transfer Type** = Treasury, **Treasury Code** 101001000, then **Send to Basis Bank** ([account_payment.py:277](../custom_addons/gec_odoo_modules/basis_bank/models/account_payment.py#L277), [account_payment_views.xml:55](../custom_addons/gec_odoo_modules/basis_bank/views/account_payment_views.xml#L55)) | A payment can only post to a Payable or Receivable account ([account_payment.py:169](../addons/account/models/account_payment.py#L169), [:247](../addons/account/models/account_payment.py#L247)), so it lands on the Treasury's Payable. Add a journal entry Dr 331212 / Cr Payable (State Treasury) and reconcile the two Payable lines |
+
+After two or more bank lines get the same account, Odoo creates a reconciliation rule from their common label text ([_check_and_create_reconciliation_rule](../enterprise/account_accountant/models/account_bank_statement.py#L1431)). All Georgian taxes go to the same treasury code, so check the proposed account on every treasury line.
+
 The Form 30 declaration reads these payments ([`gec_income_tax_report.md`](gec_income_tax_report.md)). That module sets **Form 30 Income Type** on 18 of our 23 WHT taxes ([account_tax.py:29](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/account_tax.py#L29)). Five have none: gift 20%, goods without waybill 3%, non-resident other income 10%, telecom / transport 10%, oil and gas 4%.
 
 ---
@@ -251,18 +281,22 @@ Odoo's own per-contact lever is the fiscal position, which can only replace or r
 
 **What the user sees.** **Default Sales Tax** and **Default Purchase Tax** on the contact, Sales & Purchase tab after Fiscal Position ([res_partner_views.xml:87](../custom_addons/gec_odoo_modules/gec_localization/views/res_partner_views.xml#L87)). A **Not Taxed** checkbox on the product hides both tax fields ([product_views.xml:4](../custom_addons/gec_odoo_modules/gec_localization/views/product_views.xml#L4)).
 
-**The rule** ([_ge_partner_product_taxes](../custom_addons/gec_odoo_modules/gec_localization/models/account_tax.py#L8)), per line:
+**The rule** ([_ge_partner_product_taxes](../custom_addons/gec_odoo_modules/gec_localization/models/account_tax.py#L48)), per line:
 1. Product Not Taxed → no tax proposed; one can still be added by hand.
 2. The commercial contact has a default tax for this direction (in the document's company) → it replaces the proposed taxes, the fiscal position still remaps it, and the product's withholding taxes stay.
 3. Otherwise core behavior (product, account fallback on invoices, fiscal position).
 
+Exception (user, 2026-10-21): when the contact is a **VAT Payer** (`gec_vat_payer`, shown next to Individual Entrepreneur / Small Business Status by `gec_income_tax_report`), a withholding tax or "no withholding" label as Default Purchase Tax is added to the product's taxes instead of replacing them ([account_tax.py](../custom_addons/gec_odoo_modules/gec_localization/models/account_tax.py#L48)). The product's `18%` has already passed the fiscal position, so the contact needs a Tax ID: without one, "Georgia (non-VAT Registered)" removes the `18%` first.
+
 | Product taxes | Contact default | Contact position | Line gets |
 |---|---|---|---|
 | `18%` sale | — | — | `18%` (core) |
-| `18%` sale | `0% EX` | — | `0% EX` |
-| `18%` sale | `18%` | Non-Georgia | `0% EX`: the position still remaps |
+| `18%` sale | `0% Export` | — | `0% Export` |
+| `18%` sale | `18%` | Non-Georgia | `0% Export`: the position still remaps |
 | none | `18%` sale | — | `18%` (core would give nothing on orders) |
 | `18%` + WHT 20% purchase | VAT Exempt (Purchase) | — | VAT Exempt (Purchase) + WHT 20% |
+| `18%` purchase | PIT 1% - Small Business IE (label) | VAT Registered (Tax ID), **VAT Payer** ticked | `18%` + label |
+| `18%` purchase | PIT 1% - Small Business IE (label) | VAT Payer not ticked | label only |
 | anything, product Not Taxed | anything | anything | nothing |
 
 **Where it runs.** After `super()` in the three methods that propose line taxes: invoice and bill lines ([_get_computed_taxes](../custom_addons/gec_odoo_modules/gec_localization/models/account_move_line.py#L11), product lines of sale and purchase documents only), sales order lines ([_compute_tax_ids](../custom_addons/gec_odoo_modules/gec_localization/models/sale_order_line.py#L8), not combo lines) and purchase order lines ([_compute_tax_id](../custom_addons/gec_odoo_modules/gec_localization/models/purchase_order_line.py#L7)). Journal entries are never touched, so deferral moves ([account_move.py:878](../enterprise/account_accountant/models/account_move.py#L878)) and asset moves ([account_move.py:449](../enterprise/account_asset/models/account_move.py#L449)) keep their own taxes. Invoices from orders copy the order line taxes ([sale_order_line.py:2067](../addons/sale/models/sale_order_line.py#L2067), [purchase_order_line.py:787](../addons/purchase/models/purchase_order_line.py#L787)). Inter-company invoices also go through the rule ([account_move.py:57](../enterprise/account_inter_company_rules/models/account_move.py#L57)). The module depends on `sale` and `purchase` for these hooks. Nothing else changes: posted documents, the tax engine, payments, reports, and the company default taxes on new products.
@@ -273,7 +307,7 @@ Odoo's own per-contact lever is the fiscal position, which can only replace or r
 
 | # | Decision | Consequence |
 |---|---|---|
-| D1 | The fiscal position still remaps the contact tax | export and reverse-charge positions keep working; until the `l10n_ge` mapping is fixed, a default `18%` on a Tax-ID customer also becomes six taxes |
+| D1 | The fiscal position still remaps the contact tax | export and reverse-charge positions keep working; with the [VAT corrections](#corrections-to-l10n_ges-vat-taxes) a default `18%` on a Tax-ID customer stays `18%` |
 | D2 | Commercial fields ([res_partner.py:44](../custom_addons/gec_odoo_modules/gec_localization/models/res_partner.py#L44)) | copied to a new child contact and pushed to children when the parent changes, in every company ([res_partner.py:806](../odoo/addons/base/models/res_partner.py#L806), [:901](../odoo/addons/base/models/res_partner.py#L901)); a child cannot keep its own value |
 | D3 | Product withholding taxes stay | "VAT Exempt" as vendor default does not drop the withholding (open: Q6 below) |
 | D4 | Not Taxed is literal | nothing is proposed, withholding included |
@@ -281,16 +315,16 @@ Odoo's own per-contact lever is the fiscal position, which can only replace or r
 | D8 | Non-VAT vendor = `VAT Exempt (Purchase)` | an empty field means "no rule"; a 0% tax without tags removes VAT without touching the report |
 
 **Compliance notes.**
-- **No tax is not "exempt".** A line without tax never reaches the VAT Report. Exempt and zero-rated sales need their `0% EXT` / `0% EX` taxes so the base reaches lines I.9–I.14.3. Use Not Taxed only for things that are not a supply (deposits, penalties, pass-through costs).
+- **No tax is not "exempt".** A line without tax never reaches the VAT Report. Exempt and zero-rated sales need their 0% exempt / `0% Export` taxes so the base reaches lines I.9–I.14.3. Use Not Taxed only for things that are not a supply (deposits, penalties, pass-through costs).
 - **Rule of thumb:** the fiscal position states the *regime* (export, reverse charge, non-resident); the contact tax states the counterparty's *VAT status*. Set both on one contact only when the layered result is intended.
-- The purchase field accepts withholding taxes (the sales field excludes them, [res_partner.py:17](../custom_addons/gec_odoo_modules/gec_localization/models/res_partner.py#L17)). A WHT tax picked as Default Purchase Tax replaces the product's VAT.
+- The purchase field accepts withholding taxes (the sales field excludes them, [res_partner.py:17](../custom_addons/gec_odoo_modules/gec_localization/models/res_partner.py#L17)). A WHT tax picked as Default Purchase Tax replaces the product's VAT, unless the contact is a VAT Payer.
 
 **Not covered:**
 
 | Where | Why |
 |---|---|
 | Expenses (`hr_expense`) | taxes come from the product's purchase taxes only ([hr_expense.py:702](../addons/hr_expense/models/hr_expense.py#L702)) |
-| rs.ge waybill → invoice wizard | uses the raw product taxes, without fiscal position or contact default ([rs_invoice_from_waybill_wizard.py:89](../custom_addons/gec_odoo_modules/rs_base_methods/wizards/rs_invoice_from_waybill_wizard.py#L89)) |
+| rs.ge waybill → invoice wizard | lines without a sale order take the product's taxes without the contact default ([rs_invoice_from_waybill_wizard.py:89](../custom_addons/gec_odoo_modules/rs_base_methods/wizards/rs_invoice_from_waybill_wizard.py#L89)); the fiscal position is applied after create ([:509](../custom_addons/gec_odoo_modules/rs_base_methods/wizards/rs_invoice_from_waybill_wizard.py#L509)) |
 | Purchase orders created by replenishment or requisitions | [`_prepare_purchase_order_line`](../addons/purchase/models/purchase_order_line.py#L810) writes `tax_ids` directly |
 | Point of Sale, eCommerce | taxes computed in the browser from product and position |
 | Drafts existing at install | no trigger fires; use **Update Taxes and Accounts** on invoices ([action_update_fpos_values](../addons/account/models/account_move.py#L6611)) or edit the lines |
@@ -335,7 +369,7 @@ What the accountant configures, in order:
 1. **Chart.** Company country Georgia, then Fiscal Localization **Georgian Chart of Accounts (IFRS)**.
 2. **331310.** If the company had the `ge` chart before `gec_localization` was installed, untick **Allow Reconciliation** on 331310.
 3. **Bank suspense.** Core sets it to 120210 Cash in Bank Foreign Currency, a bank-type account, although the **Bank Suspense** setting itself offers only current assets and liabilities ([res_config_settings.py:66](../addons/account/models/res_config_settings.py#L66)). Set it to 120001 Bank Suspense (Settings > Accounting > Default Accounts) so unreconciled statement lines stay apart from a real bank balance.
-4. **Sales tax mapping.** See the first two [gotchas](#gotchas--non-obvious-behavior). Until fixed, check the taxes on the first invoices.
+4. **Foreign vendors.** Default Purchase Tax `18% Reverse Charge Services` on vendors of services from abroad. Other Non-Georgia bills get no VAT tax: before filing, review the month's foreign bills without one. Book customs VAT as a vendor bill with `18% Import`, not as a journal entry.
 5. **Contacts.** Vendors with a Tax ID that are not VAT payers: Default Purchase Tax = VAT Exempt (Purchase). Customers with a fixed regime: Default Sales Tax, or a pinned fiscal position.
 6. **Products.** Not Taxed only for non-supplies; WHT taxes on the purchase taxes of services bought from non-residents or individuals.
 7. **Withholding Tax Base** (Settings > Accounting > Default Accounts, [res_company.py:12](../addons/l10n_account_withholding_tax/models/res_company.py#L12)): optional; set it so the WH Base pair does not land on expense accounts.
@@ -366,16 +400,15 @@ What the accountant configures, in order:
 
 ## Gotchas & Non-Obvious Behavior
 
-- **[Certain] Sales to a Tax-ID customer get three 18% taxes.** The VAT Registered position swaps `18%` for six taxes ([map_tax](../addons/account/models/partner.py#L161), [_compute_tax_map](../addons/account/models/partner.py#L106)); a 100 invoice totals 154. Fix option, not applied anywhere: clear **Replaces** on `18% S`, `18% AD`, `18% O` ([row](../addons/l10n_ge/data/template/account.tax-ge.csv#L42)), `0% EXT F` ([row](../addons/l10n_ge/data/template/account.tax-ge.csv#L70)), `0% EXT L`, `0% EXT O`; `18%` then maps to itself.
-- **[Certain] Sales to contacts without Tax ID carry no VAT.** `18%` lists only the VAT Registered position ([row](../addons/l10n_ge/data/template/account.tax-ge.csv#L2)), so both non-registered positions remove it. Fix option: add those positions to the **Fiscal Position** field of `18%` and of any other sale tax used for private customers.
-- **[Certain] Foreign vendors get three reverse-charge taxes.** Non-Georgia swaps purchase `18%` ([row](../addons/l10n_ge/data/template/account.tax-ge.csv#L82)) for `18% R C S`, `18% R C G C` and `18% R C G F` ([rows](../addons/l10n_ge/data/template/account.tax-ge.csv#L134)). The bill total is unchanged, but II.1–II.3 each get the base and III.4 gets it three times. Fix option: keep **Replaces** only on the variant that fits most bills (services) and pick the others by hand.
+- **[Certain] The VAT corrections reach an existing company only at install or at a chart reload.** A company that had the `ge` chart before `gec_localization` was installed is corrected by the install hook, or later by a reload of the `ge` chart; `-u` never repairs one.
+- **[Certain] Foreign bills get no VAT tax by default.** Non-Georgia removes purchase `18%` ([map_tax](../addons/account/models/partner.py#L161)); the vendor's Default Purchase Tax `18% Reverse Charge Services` gives one reverse-charge tax. Goods bought abroad carry no VAT on the vendor's invoice; customs VAT comes on its own bill.
 - **[Certain] Automatic NBG exchange rates are one day late.** Odoo 20 values a document at the latest rate dated strictly before it, and the NBG provider stores each rate under the day it becomes valid, so every foreign-currency document uses the previous day's official rate. Details: [`currency_exchange_transit.md`](currency_exchange_transit.md).
 - **[Certain] "VAT Registered" means "has a Tax ID"**, and a contact without country gets no position at all (taxes stay as proposed).
-- **[Certain] Import VAT bills double.** `18% / 12% / 5% EX ONLY` are `division` 100% taxes without an included-in-price override ([row](../addons/l10n_ge/data/template/account.tax-ge.csv#L106)). With the company default Tax Excluded, a 180 line gets 180 of tax ([account_tax.py:1113](../addons/account/models/account_tax.py#L1113)): the VAT Report shows the right 180, but the bill totals 360 and 180 lands on the expense account. Set **Included in Price** on the three taxes; then the line is all VAT, base 0, total 180. Proven on a scratch DB, 2026-10-02 (customs bill example 3.8 in [`l10n_ge_vat_report.md`](l10n_ge_vat_report.md)).
+- **[Certain] Import VAT is right only on vendor bills.** `18% / 12% / 5% Import` are `division` 100% taxes; `gec_localization` makes them price-included, so a 180 bill line is all VAT (base 0, total 180). Journal entries compute every tax as excluded ([account_move.py:1681](../addons/account/models/account_move.py#L1681), [account_tax.py:898](../addons/account/models/account_tax.py#L898)): on a manual entry a 180 line still gets 180 of tax on top.
 - **[Certain] Declaration line III.3 is fed by no tax** (tag 26), and III.4.1 is typed by hand.
 - **[Certain] "Not Subject to VAT" is not offered for Georgia.** The company switch exists only for EU countries and Switzerland ([company.py:491](../addons/account/models/company.py#L491)).
 - **[Certain] Two "Current Year Earnings" accounts.** 530110 Retained Earnings and 530510 Profit / Loss for the Reporting Period have that type ([rows](../addons/l10n_ge/data/template/account.account-ge.csv#L173)). Such accounts carry no opening balance in ledgers ([account_account.py:681](../addons/account/models/account_account.py#L681)), and core uses the first by code, 530110, as its unaffected-earnings account ([get_unaffected_earnings_account](../addons/account/models/company.py#L976)). The CIT wizard debits 530110 by default.
-- **[Certain] 331211 WHT Settled is typed Expense** ([row](../addons/l10n_ge/data/template/account.account-ge.csv#L124)), so it shows in the P&L. None of our taxes use it.
+- **[Certain] 331211 WHT Settled is typed Expense in core** ([row](../addons/l10n_ge/data/template/account.account-ge.csv#L124)), so it would show in the P&L. `gec_localization` makes it a non-trade Payable ([row](../custom_addons/gec_odoo_modules/gec_localization/data/template/account.account-ge.csv#L15)). None of our taxes use it.
 - **[Certain] Paying several bills without "Group Payments" hides withholding**: the section appears only when the dialog makes one payment ([account_payment_register.py:151](../addons/l10n_account_withholding_tax/wizards/account_payment_register.py#L151)).
 - **[Likely] Bill prediction can replace line taxes.** With `account_accountant`, typing a label on a draft vendor bill line can load the taxes of the vendor's earlier bills ([_onchange_name_predictive](../enterprise/account_accountant/models/account_move.py#L1053)) over the contact default.
 - **[Certain] Bank name and BIC appear after saving**, not while typing: the fill runs in create/write. Changing an IBAN to another Georgian bank replaces both unless typed in the same save.
@@ -387,8 +420,7 @@ What the accountant configures, in order:
 
 | Item | Status |
 |---|---|
-| Q6: may a contact default purchase tax drop the product's withholding? | open; current code keeps withholding |
-| Fixes for the three `l10n_ge` mapping problems above | open; nothing applied |
+| Q6: may a contact default purchase tax drop the product's withholding? | decided 2026-10-17: one contact default (VAT, withholding tax or 0% label) replaces the product's taxes; products cannot hold withholding taxes |
 | A hand-made VAT return type (cards, closing entry, lock) | open; not tried |
 | [Likely] CIT in equity vs P&L: the wizard charges CIT to 530110, the CIT tax to 910010 expense; IAS 12.57A generally puts tax on distributed profit in profit or loss | accountant to confirm |
 | Form 30 income type for five WHT taxes | accountant to set |

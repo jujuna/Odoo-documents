@@ -59,24 +59,24 @@ The link lives on the **tax**, not on the position. Two fields on the tax form d
 
 **How the document gets its position** ([_get_fiscal_position](../addons/account/models/partner.py#L259)): the position pinned on the contact (Sales & Purchase tab > Fiscal Information > **Fiscal Position**) wins ([partner.py:279](../addons/account/models/partner.py#L279)); a contact without a country gets none ([partner.py:286](../addons/account/models/partner.py#L286)); otherwise the first auto-applied position by sequence whose country, state, ZIP and Tax ID rules match ([partner.py:220](../addons/account/models/partner.py#L220)). Sales orders and invoices test the delivery address ([sale_order.py:609](../addons/sale/models/sale_order.py#L609), [account_move.py:1080](../addons/account/models/account_move.py#L1080)); purchase orders test the vendor ([purchase_order.py:506](../addons/purchase/models/purchase_order.py#L506)).
 
-**What prod1's positions do today** (shipped `l10n_ge` data, unchanged):
+**What the positions do with `gec_localization`** (since 2026-10-22):
 
 | Contact | Position picked | Sales `18%` becomes | Purchase `18%` becomes |
 |---|---|---|---|
-| Georgian, with a Tax ID | Georgia (VAT Registered) | six taxes: `18% S`, `18% AD`, `18% O`, `0% EXT F`, `0% EXT L`, `0% EXT O`: 100 invoices as 154 (defect) | `18%` |
-| Georgian, no Tax ID | Georgia (non-VAT Registered) | removed, no VAT (defect) | removed |
-| Any other country | Non-Georgia | `0% EX`: export, VAT Report line I.14 | `18% R C S` + `18% R C G C` + `18% R C G F`: reverse charge (defect: three at once) |
+| Georgian, with a Tax ID | Georgia (VAT Registered) | `18%` | `18%` |
+| Georgian, no Tax ID | Georgia (non-VAT Registered) | `18%` | removed: a non-registered vendor charges no VAT |
+| Any other country | Non-Georgia | `0% Export`: export, VAT Report line I.14 | removed: no automatic reverse charge; Default Purchase Tax `18% Reverse Charge Services` on the vendor gives one |
 | No country | none | `18%` | `18%` |
-| Pinned "Domestic non-registered individual" | that one | removed (defect) | removed |
+| Pinned "Domestic non-registered individual" | that one | `18%` | removed |
 
-The defects and their configuration fixes are in [`l10n_ge.md`](l10n_ge.md#gotchas--non-obvious-behavior). Posted proof: `INV/2026/00001` is 1,000 + 540 = 1,540.
+Core `l10n_ge` as shipped gives six taxes on a Tax-ID sale, no VAT without a Tax ID and three reverse-charge taxes on a foreign bill; how the module corrects that: [`l10n_ge.md`](l10n_ge.md#corrections-to-l10n_ges-vat-taxes). Documents posted before the correction keep their taxes: on prod1 `INV/2026/00001` is 1,000 + 540 = 1,540.
 
 ### Our layer (`gec_localization`)
 
-[`_ge_partner_product_taxes`](../custom_addons/gec_odoo_modules/gec_localization/models/account_tax.py#L8) runs after core's pick on sales order lines, purchase order lines and invoice/bill lines:
+[`_ge_partner_product_taxes`](../custom_addons/gec_odoo_modules/gec_localization/models/account_tax.py#L48) runs after core's pick on sales order lines, purchase order lines and invoice/bill lines:
 
 1. Product **Not Taxed** → no tax proposed.
-2. The contact (its company) has a **Default Sales Tax** / **Default Purchase Tax** in this company → that tax replaces the line's taxes, **then goes through the same fiscal position**, and the product's withholding taxes stay.
+2. The contact (its company) has a **Default Sales Tax** / **Default Purchase Tax** in this company → that one tax replaces the line's taxes. A VAT default goes through the same fiscal position; a withholding tax or 0% label default does not. Products never carry withholding taxes. Exception: for a contact ticked **VAT Payer**, a withholding tax or label default is added to the line's taxes (the product's 18% stays).
 3. Otherwise core's result is kept.
 
 It also re-proposes all line taxes when the customer or vendor changes on a draft. Full rules and decisions: [`l10n_ge.md`](l10n_ge.md#default-taxes-per-contact-and-not-taxed-products).
@@ -127,7 +127,7 @@ The VAT Report adds up the **tags** on posted items, not tax names ([`l10n_ge_va
 | 334010 Input VAT Local Purchases | 18.00 | | 24(T) |
 | 310110 Accounts Payable Trade and Services | | 118.00 | |
 
-**`BILL/2026/10/0001`** — foreign vendor, `18% R C S` (distribution +100% / −100%, so the vendor is owed 100 and the VAT nets to zero):
+**`BILL/2026/10/0001`** — foreign vendor, `18% Reverse Charge Services` (distribution +100% / −100%, so the vendor is owed 100 and the VAT nets to zero):
 
 | Account | Debit | Credit | Tags |
 |---|---|---|---|
@@ -155,19 +155,19 @@ The VAT Report adds up the **tags** on posted items, not tax names ([`l10n_ge_va
 
 ## Real-World Scenario: why `S00010` shows 0%
 
-**Situation.** `S00010` sells 1 × "Bershka" ჩანთა - 2 at 1.00 to Emma Granger. The product's Sales Taxes are `18%`. The order line has `0% EX`; untaxed 1.00, tax 0.00, total 1.00.
+**Situation.** `S00010` sells 1 × "Bershka" ჩანთა - 2 at 1.00 to Emma Granger. The product's Sales Taxes are `18%`. The order line has `0% Export`; untaxed 1.00, tax 0.00, total 1.00.
 
 **What Odoo did:**
 1. Propose: the product's `18%`.
 2. Ours: Emma's **Default Sales Tax** is also `18%`, so nothing changes.
-3. Map: Emma's country is the United States, she has no Tax ID and no pinned position. "Georgia (VAT Registered)" and "Georgia (non-VAT Registered)" require Georgia; "Non-Georgia" accepts any country. In it, `0% EX` **Replaces** `18%`, so `18%` becomes `0% EX`.
+3. Map: Emma's country is the United States, she has no Tax ID and no pinned position. "Georgia (VAT Registered)" and "Georgia (non-VAT Registered)" require Georgia; "Non-Georgia" accepts any country. In it, `0% Export` **Replaces** `18%`, so `18%` becomes `0% Export`.
 4. Compute: 1 × 1.00 = 1.00, tax 0.
 5. The invoice would post: debit 140110 1.00, credit 611101 1.00 tagged 17(B), so the VAT Report shows a 1.00 export on line I.14. No tax line, because the amount is zero.
 
 Setting `18%` on the product or on the contact cannot change this: both go through step 3.
 
 **What to do:**
-- **The goods leave Georgia (real export):** `0% EX` is the intended result. Keep it.
+- **The goods leave Georgia (real export):** `0% Export` is the intended result. Keep it.
 - **The sale is taxable in Georgia:** for this order, clear Other Info > Invoicing > **Fiscal Position**; the lines switch to `18%` at once. For every order of this customer, a domestic position must be pinned on her, but none of the shipped ones keeps `18%` (table above). Apply fix 2 from [`l10n_ge.md`](l10n_ge.md#gotchas--non-obvious-behavior) first (add both non-registered positions to the **Fiscal Position** field of `18%`), then pin "Domestic non-registered individual".
 
 ---
@@ -184,9 +184,9 @@ Setting `18%` on the product or on the contact cannot change this: both go throu
 ## Gotchas & Non-Obvious Behavior
 
 - **The fiscal position beats the product and our contact default.** Most "wrong tax" questions are answered by the document's **Fiscal Position** field.
-- **No tax is not "exempt".** A line without tax never reaches the VAT Report; exempt and export sales need their `0% EXT …` / `0% EX` taxes.
+- **No tax is not "exempt".** A line without tax never reaches the VAT Report; exempt and export sales need their 0% exempt / `0% Export` taxes.
 - **Existing lines never follow configuration changes.** Re-pick the product, change the position on the order, or click **Update Taxes and Accounts** on a draft invoice.
-- **Price-included swaps change the unit price.** When a position replaces a price-included tax, a unit price taken from the product is recalculated: a product priced 118 with `18%` included sells at 100 under `0% EX` ([account_tax.py:1320](../addons/account/models/account_tax.py#L1320)). A price typed by hand stays.
+- **Price-included swaps change the unit price.** When a position replaces a price-included tax, a unit price taken from the product is recalculated: a product priced 118 with `18%` included sells at 100 under `0% Export` ([account_tax.py:1320](../addons/account/models/account_tax.py#L1320)). A price typed by hand stays.
 - **A position without taxes is not "no position".** Such a position keeps only taxes whose **Fiscal Position** field is empty and removes the rest; an empty Fiscal Position field on the document keeps every tax ([partner.py:161](../addons/account/models/partner.py#L161)).
 
 ### Troubleshooting order for a wrong tax

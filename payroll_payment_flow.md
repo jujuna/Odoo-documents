@@ -125,7 +125,7 @@ Transmission, statements and matching: [`basis_bank.md`](basis_bank.md).
 
 A **Register Payment** button on validated payslips with their own entry
 ([hr_payslip_views.xml:94](../custom_addons/gec_odoo_modules/geo_payroll/views/hr_payslip_views.xml#L94),
-[action_register_payment](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_payslip.py#L1306)):
+[action_register_payment](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_payslip_account.py#L156)):
 
 - Refuses paid payslips, unposted entries, untrusted employee bank accounts, payslips without an
   open NET item, and a NET credit account that is not reconcilable.
@@ -135,6 +135,41 @@ A **Register Payment** button on validated payslips with their own entry
   open ([account_payment_register.py:7](../custom_addons/gec_odoo_modules/geo_payroll/models/account_payment_register.py#L7)).
 
 It does not create bank batches; use it for a one-off payment or an off-cycle slip.
+
+### 4. Corrections, refunds and releasing an entry (2026-10-10)
+
+A correction family (origin, refund, correction) is booked and paid **once**:
+
+- Validating a refund or a correction posts the family's draft entries and reconciles them:
+  the refund against the origin first, then what is left of the refund against the correction
+  ([_gec_settle_correction_family](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_payslip_account.py#L106)).
+  NET lines match per account, the other legs per partner. Both payment paths then pay only what
+  is still open.
+- Origin paid at 1,000.00 (1,020.00 out), corrected to 1,100.00: the correction pays **102.00**
+  (NET 78.40, PIT 19.60, pension 2.00 + 2.00); origin, refund and correction end Paid.
+- Origin never paid: the refund cancels it. Register Payment on it says it was "corrected or
+  refunded", Pay Salaries leaves it out of its run
+  ([_compute_gec_payroll_can_pay](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip_run.py#L21)),
+  and paying the correction marks the whole family Paid.
+- Correction down after the origin was paid: nothing is paid; the correction and refund end Paid,
+  the overpaid net stays open on the employee's net-payable account (overpaid PIT and pension on
+  the authority accounts) and core flags the correction "negative net to report". Recover it by
+  hand on the next payslip: the automatic deduction is not built yet.
+- The "partially paid" guard of Pay Salaries ignores lines matched only with other payslip
+  entries ([_create_payments](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/account_payment_register.py#L8)).
+
+Releasing a payslip's entry (Cancel, list Set to Draft, pay-run reset) is refused when
+([_gec_release_journal_entries](../custom_addons/gec_odoo_modules/geo_payroll/models/hr_payslip_account.py#L231)):
+
+| Case | Message points to |
+|---|---|
+| The entry was posted and the user has no accounting (Invoicing) rights | an accounting user, as core's Cancel |
+| The slip still has a validated refund or correction | cancel the correction and its refund first |
+| An entry line is matched with a payment or a bank statement line | cancel or unreconcile that payment first |
+
+Matches inside the correction family are dropped automatically. So Mark Unpaid followed by
+Cancel can no longer pay a salary twice while its transfer is at the bank, and undoing a Correct
+needs Invoicing rights once the family's entries are posted.
 
 ---
 

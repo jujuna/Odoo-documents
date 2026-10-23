@@ -23,6 +23,21 @@ The examples use these rates:
 
 ---
 
+> **Payroll and Form 30, checked 2026-10-13** (Opus bug-hunter on prod1 data; details in
+> [form30_entry_redesign_plan.md](form30_entry_redesign_plan.md) section 4.4 "Salaries"): September Form 30 tax 6,287.95
+> equals the 331320 credits and pension matches; advances, repayments and exempt relief are right. Paths that go wrong:
+> - **S1** a net-pay payment rejected or never sent: core Mark Unpaid keeps the Payment Date, so a slip paid again next month
+>   is declared twice (Pay Salaries) or stays in the old month (Register Payment). Fix planned (Form 30 step 1: Mark Unpaid
+>   clears the date, a new payment's date wins).
+> - **S2** net pay settled straight from a bank statement: the slip never becomes Paid and is never declared.
+> - **S3** zero net with income tax above zero: no NET line, never Paid, never declared.
+> - **S4** net paid in two parts in two months: all in the last month (the tax law wants each part in its own month).
+> - **Corrections:** a correction slip is computed in full; Form 30 reports origin + correction (1,000 + 1,100 = 2,100).
+> - **Accounts vs the accountant's table:** payroll posts income tax on **331320** (table: 331310, which is not payable, so
+>   Pay Salaries would refuse every slip) and employer pension on **740900** (table: 721000, a P&L choice); keep 331320.
+>   Changing the employer-pension account needs the 10 prod1 rule accounts edited, because the account fill writes only empty
+>   values ([account_chart_template.py:120-122, 172-182](../custom_addons/gec_odoo_modules/geo_payroll/models/account_chart_template.py#L120)).
+
 ## 1. The three records that can affect pay
 
 These names are similar, but they are different records:

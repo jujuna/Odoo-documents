@@ -5,8 +5,28 @@
 
 ## Status on Odoo 20
 
-- **Ported, tested and installed.** The manifest, OWL 3 grids, icons, `ir.access.csv`, withholding field names, payment states, `_display_address` and the Binary file fields are ported. The module is installed on `gec20_prod1` since 2026-09-25 (checked 2026-09-27). On a scratch database (2026-09-24) 32 of its 33 tests pass; the failing one is the next point.
-- **Individuals with a Tax ID are exported as companies.** In 20.0 `is_company` is computed: a contact is a company when it is its own commercial entity and has a Tax ID ([res_partner.py:946](../odoo/addons/base/models/res_partner.py#L946)); core commit `f2965048f60f` removed the Person/Company switch, and writing `is_company = False` is recomputed away. `l10n_ge` does not refine it, while 15 other localizations do (e.g. [l10n_uz](../addons/l10n_uz/models/res_partner.py#L8): only a 9-digit TIN is a company). A recipient whose 11-digit personal number is in Tax ID therefore gets an empty first-name column, the full name in the last-name column and the "Legal form not detected" warning, on payment rows, annex E rows and the manual-row onchange, which all split on `is_company` ([`_split_name`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L693)). Salary rows are not affected. `test_payment_row` fails on this. Open decision: a Georgian `_compute_is_company` in `gec_localization` (9-digit ID = organization, 11-digit = person), or splitting by the Form 30 category's `is_organization` in this module.
+- **Ported, tested and installed.** The manifest, OWL 3 grids, icons, `ir.access.csv`, withholding field names, payment states, `_display_address` and the Binary file fields are ported. The module is installed on `gec20_prod1` since 2026-09-25 (checked 2026-09-27). On a clean scratch database (2026-10-10) all 35 tests pass.
+- **Persons and companies.** In 20.0 `is_company` is computed: a contact is a company when it is its own commercial entity and has a Tax ID ([res_partner.py:946](../odoo/addons/base/models/res_partner.py#L946)); core commit `f2965048f60f` removed the Person/Company switch. `gec_localization` refines it the way other localizations do (e.g. [l10n_uz](../addons/l10n_uz/models/res_partner.py#L8)): a Georgian 11-digit personal number in Tax ID (GE prefix, country Georgia, or no country) makes the contact a person ([res_partner.py](../custom_addons/gec_odoo_modules/gec_localization/models/res_partner.py), `_compute_is_company`). Payment rows, annex E rows and the manual-row onchange split on `is_company` ([`_split_name`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L697)), so such a recipient gets first and last name in their own columns. Salary rows always split as persons.
+
+### Planned change and known issues (2026-10-13)
+
+**Planned:** plan B in [form30_entry_redesign_plan.md](form30_entry_redesign_plan.md) (provisional). Withholding is booked by
+hand in journal entries; the entry's tax line names a withholding tax (new field Withholding Tax), from which Form 30 takes the
+income type and rate exactly as payment rows do today; the 23 withholding taxes get Tax Type None; rows per person and month
+of payment, dated on the bank transaction; export history. Nothing of it is in this module yet.
+
+**Known issues, verified 2026-10-13, not fixed** (details in the plan, sections 4.4, 4.5 and 5.2):
+
+| # | Issue | Evidence |
+|---|---|---|
+| R10 | A payroll correction is reported in full next to its original (1,000 + 1,100 = 2,100); a zero-difference correction is marked paid today and counted | [`_salary_line_vals`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L246); prod1 has no correction slips yet |
+| S1 | A net-pay payment rejected or never sent: core Mark Unpaid keeps `paid_date`; paid again next month the slip is declared twice (Pay Salaries) or stays in the old month (Register Payment) | enterprise hr_payroll `action_payslip_unpaid`; fix planned in step 1 |
+| S2/S3 | Net pay settled straight from a bank statement, or zero net with income tax: the slip never becomes Paid and is never declared | payroll analysis, plan 4.4 |
+| R9 | An annex that becomes empty keeps its old file on re-export; the explanation workbook is not rebuilt | [`action_export`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L198) |
+| R14 | Exported rows are not locked on the server; `write` guards only a company change | [rs_form30_declaration.py:174](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L174) |
+| R15 | The treaty allowance is drawn read-then-create (two runs can draw the same remainder); usage rows cascade with regenerated rows; usage has no company restriction row | [rs_form30_declaration.py:638-667](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L638) |
+| UI | RS rule lists show the YYYYMM validity with a thousands separator ("202,504" = April 2025) | the integer fields `valid_from` / `valid_to` in `rs_form30_classifier_views.xml` and `account_tax_views.xml` |
+| R6 | Withheld tax is due when the person is paid (Tax Code art. 154); the 15th of next month is the declaration deadline only | rs.ge guidance checked 2026-10-13 |
 
 ## What It Does & Why It Exists
 
@@ -41,7 +61,7 @@ New (month) --> Generate Lines --> review warnings, fix sources, regenerate
 | Export rs.ge Files | Validates each annex that has rows, stores one file per annex (`form30_a_YYYYMM.xml`, `_d_`, `_e_`), sets state `exported` | [`action_export`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L198) |
 | Reset to Draft | Allows regeneration after an amendment | `action_draft` |
 
-Generation reads the database at the click. Late data appears only at the next Generate. Everything runs in one transaction: a refused row rolls back the deletion too.
+Generation reads the database at the click. Late data appears only at the next Generate. Everything runs in one transaction; a row the rs.ge matrix refuses is kept with a blocker instead of rolling back the month.
 
 ### Key Decision Points
 
@@ -110,7 +130,7 @@ Further warnings: no payment matched on the slip's journal entry, and `edited` s
 
 `paid_date` is written with the real bank date by Pay Salaries ([gec_payroll_bank hr_payslip.py:408](../custom_addons/gec_odoo_modules/gec_payroll_bank/models/hr_payslip.py#L408)) and by Register Payment on the payroll entry ([geo_payroll account_payment_register.py:24](../custom_addons/gec_odoo_modules/geo_payroll/models/account_payment_register.py#L24)). Core **Mark as Paid** writes today, but only on slips with no `paid_date` yet ([hr_payslip.py:1062](../enterprise/hr_payroll/models/hr_payslip.py#L1062)).
 
-### Annex A — payment rows ([`_payment_line_vals`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L324))
+### Annex A — payment rows ([`_payment_line_vals`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L328))
 
 One row per `account.payment.withholding.line` of an outbound payment of the company dated in the month, in state `paid` (posted) or `reconciled` (matched with the statement, or all its bills paid; [`_compute_state`](../addons/account/models/account_payment.py#L496)). Draft, canceled and rejected payments stay out, because their withholding lines survive cancellation.
 
@@ -123,13 +143,13 @@ One row per `account.payment.withholding.line` of an outbound payment of the com
 | ID / name / address | contact Tax ID without spaces or a two-letter prefix (`GE01008057135` → `01008057135`); company names split into legal form + name |
 | Category / residency | contact category on the payment date and contact country; missing values warn and block the export |
 
-Warnings: tax without income type, non-percent tax, payment without journal entry (the withholding is not booked), company name without a known legal form. A tax whose Form 30 validity (set by the change wizard) excludes the payment date stops the generation ([`_rs_form30_check_payment_date`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/account_tax.py#L59)).
+Warnings: tax without income type, non-percent tax, payment without journal entry (the withholding is not booked), company name without a known legal form. A tax whose Form 30 validity (set by the change wizard) excludes the payment date is replaced by the version valid on that date, with a warning; with no valid version the row keeps the booked tax and a blocker ([`_rs_form30_version_on`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/account_tax.py#L51)).
 
-**Treaty allowance (col. 12).** A contact can carry **Tax Exempt Under International Agreement**. Each new row draws its withheld tax from that allowance into column 12 and logs the draw in `rs.form30.exempt.usage` ([`_rs_form30_draw_exempt`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L639)). The allowance is per person, shared across companies. Column 12 is a disclosure: it does not reduce cell 57.
+**Treaty allowance (col. 12).** A contact can carry **Tax Exempt Under International Agreement**. Each new row draws its withheld tax from that allowance into column 12 and logs the draw in `rs.form30.exempt.usage` ([`_rs_form30_draw_exempt`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L643)). The allowance is per person, shared across companies. Column 12 is a disclosure: it does not reduce cell 57.
 
 **Manual rows** (`source = manual`) survive regeneration, but the form offers no way to create or edit them: the annex A list is read-only and no `rs.form30.line` action exists. Today they can only come from code or an import.
 
-### Annex E — service rows ([`_service_line_vals`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L368))
+### Annex E — service rows ([`_service_line_vals`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L372))
 
 Same withholding lines, but only those whose contact is flagged individual entrepreneur or small business ([`_rs_form30_pays_own_tax`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/res_partner.py#L61)). Values: ID, names, address, country, the tax's **Form 30 Service Type** (8 portal kinds), base amount in GEL. Export needs ID, service type and a residency with an rs.ge code.
 
@@ -139,8 +159,8 @@ Typed in the grid. Picking a vehicle fills the plate, the vehicle's **rs.ge Engi
 
 ### Validation: matrix at creation, completeness at export
 
-- **Matrix** ([`_check_matrix`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L801), a constraint): category and income type valid in the declaration period, the pair present in the rate matrix, the rate among the pair's allowed rates for the period. A failing line is never stored: Generate Lines aborts as a whole and names every offending payslip or payment. Changing the declaration month re-checks existing lines. The classifiers' `active` flag is not part of the check.
-- **Completeness** ([`_validation_errors`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L818), export only): ID, residency, category, income type and date present; residency has an rs.ge code; a Georgian ID has 9 or 11 digits; the date inside the month; amount positive. All errors are listed at once (first 40).
+- **Matrix** ([`_check_matrix`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L1578), a constraint on manual lines): category and income type valid in the declaration period, the pair present in the rate matrix, the rate among the pair's allowed rates for the period. A failing manual line is never stored. A failing generated line is kept with the blocker "The rs.ge classifier does not allow ..." ([`action_generate`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L421)) and never exported, so one bad row no longer stops Generate Lines. Changing the declaration month re-checks existing manual lines. The classifiers' `active` flag is not part of the check.
+- **Completeness** ([`_validation_errors`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L822), export only): ID, residency, category, income type and date present; residency has an rs.ge code; a Georgian ID has 9 or 11 digits; the date inside the month; amount positive. All errors are listed at once (first 40).
 
 ### Classifiers = data
 
@@ -155,13 +175,13 @@ Typed in the grid. Picking a vehicle fills the plate, the vehicle's **rs.ge Engi
 
 Accounting Administrators edit them under Accounting > Configuration > rs.ge Form 30 (Advanced). A manual edit of a rate rule sets its xmlid to `noupdate`, so later CSV reloads keep it ([rs_form30_classifier.py:91](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_classifier.py#L91)). Country codes load through a data function, because base ships country xmlids as `noupdate` and a CSV row would be skipped on upgrade ([`_rs_form30_load_codes`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/res_country.py#L15)). `tools/generate_classifier_csv.py` rebuilds the CSVs from a new rs.ge workbook.
 
-### Export files ([`_build_xml`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L570))
+### Export files ([`_build_xml`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L574))
 
 Excel 2003 SpreadsheetML, worksheet `data`, one header row, every cell `ss:Type="String"`, dates `DD.MM.YYYY`, decimals with a dot, empty cells written as one space (as the portal's own export does). Annex A has the 14 portal import columns; the portal screen shows 16, because it adds pension and tax. Annex E follows the portal import order, which puts service type and amount before address and residency.
 
 ### Main part (cells 16–69)
 
-[`_summary_values`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L417) derives every cell from the annex rows and the ledger; [`_sync_summary_lines`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L518) stores them at create, Generate and Export.
+[`_summary_values`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L421) derives every cell from the annex rows and the ledger; [`_sync_summary_lines`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L522) stores them at create, Generate and Export.
 
 | Kind | Cells | Refresh |
 |---|---|---|
@@ -169,7 +189,7 @@ Excel 2003 SpreadsheetML, worksheet `data`, one header row, every cell `ss:Type=
 | Proposed (wand) | 57¹, 57², 58, 59, 61, 63, 65–69 | Odoo refreshes the value while it still equals the last proposal (`proposed_value`); a typed value stays. Cell 59 is a checkbox and is always overwritten |
 | Typed | 56¹, 60, 62, 64 | never touched |
 
-Definitions: base of a row = amount − pension − other relief (portal col. 7 − 8 − 9); tax = round(base × rate / 100) (portal col. 12). Routing ([`_main_part_cells`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L740)):
+Definitions: base of a row = amount − pension − other relief (portal col. 7 − 8 − 9); tax = round(base × rate / 100) (portal col. 12). Routing ([`_main_part_cells`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L744)):
 
 | Cells | Rule |
 |---|---|
@@ -206,7 +226,7 @@ Accounting Administrators only, from the tax form's **RS Declaration Rules** tab
 
 - Grids are OWL 3 field widgets extending `X2ManyField` ([rs_form30_grid.js:70](../custom_addons/gec_odoo_modules/gec_income_tax_report/static/src/components/rs_form30_grid/rs_form30_grid.js#L70)): column filters and totals apply to the **current page** (100 rows), column widths auto-fit and drag, warning rows tinted, light and dark theme.
 - `i18n/ka_GE.po` translates 326 strings (form, grids, warnings, wizard). Not translated: the explanation formulas, the workbook, and the work-location field. Warnings are stored in English and translated at display (`warning_display`), so regeneration never changes stored text.
-- Tests: 33 methods in [`test_form30.py`](../custom_addons/gec_odoo_modules/gec_income_tax_report/tests/test_form30.py) (salary, payments, grid) and [`test_tax_configuration.py`](../custom_addons/gec_odoo_modules/gec_income_tax_report/tests/test_tax_configuration.py) (change wizard, category history). On 20: 32 pass, `test_payment_row` fails on `is_company` (see Status). The grid test's `tbody tr` selector also matches the empty-state row, so it passes with zero lines.
+- Tests: 35 methods in [`test_form30.py`](../custom_addons/gec_odoo_modules/gec_income_tax_report/tests/test_form30.py) (salary, payments, grid) and [`test_tax_configuration.py`](../custom_addons/gec_odoo_modules/gec_income_tax_report/tests/test_tax_configuration.py) (change wizard, category history). On 20 all of them pass (see Status). The grid test's `tbody tr` selector also matches the empty-state row, so it passes with zero lines.
 
 ---
 
@@ -218,7 +238,7 @@ Accounting Administrators only, from the tax form's **RS Declaration Rules** tab
 | same | **Individual Entrepreneur** / **Small Business Status** | Moves the contact's withholding rows from annex A to annex E |
 | same | **Tax Exempt Under International Agreement** | Treaty allowance drawn into column 12; **Usage** lists every draw |
 | Contact > Country | standard `country_id` | Residency; a country without rs.ge code blocks the export |
-| Accounting > Configuration > Taxes > a withholding tax | **Form 30 Income Type**, **Form 30 Service Type** | Income type of annex A rows / service kind of annex E rows. Filled on install and update for 18 of the 23 `gec_localization` withholding taxes ([`GE_TAX_INCOME_TYPES`](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/account_tax.py#L4)) where still empty; service type always by hand |
+| Accounting > Configuration > Taxes > a withholding tax | **Form 30 Income Type**, **Form 30 Service Type** | Income type of annex A rows / service kind of annex E rows. Filled on install and update for the `gec_localization` withholding taxes listed in [`data/template/account.tax-ge.csv`](../custom_addons/gec_odoo_modules/gec_income_tax_report/data/template/account.tax-ge.csv) where still empty; service type always by hand |
 | Employees > Configuration > Work Locations | **Form 30 Autonomous Republic** | Feeds 57¹ / 57² with the tax of salary rows at that location |
 | Fleet > Vehicle | **rs.ge Engine Band** | Pre-fills the band of annex D rows |
 | Employee (version) | Identification No, Nationality | Salary row ID; Nationality is the residency fallback |
@@ -280,6 +300,7 @@ Access ([ir.access.csv](../custom_addons/gec_odoo_modules/gec_income_tax_report/
 - **A payment that exists only as a bank statement line** (money sent from internet banking) has no withholding line and gives no row. Partial payments of a bill withhold on a proportional base; each payment gives its own row.
 - **The column layout is hard-coded** (`HEADERS`). Before the first live filing, download the portal sample ("ნიმუში") and compare the 14 columns.
 - **Salary rate is always 20.** The matrix also allows 0, 5, 10 and 12 for employees; such cases need other rows.
+- **The income type is only as right as the tax picked on the bill.** Payment rows copy **Form 30 Income Type** from the withholding line's tax ([rs_form30_declaration.py:363](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L363)); nothing compares it with the bill's account, product or text. The matrix catches only pairs and rates rs.ge never allows: categories 4 and 30 accept both type 7 and type 17 at 20%, so a royalty paid with "WHT 20% - Resident Individual Services" is filed as type 7 without a warning. Payslip rows never read a tax: they are always type 1 ([rs_form30_declaration.py:264](../custom_addons/gec_odoo_modules/gec_income_tax_report/models/rs_form30_declaration.py#L264)).
 - **Annex E sees only withheld payments.** Fees correctly paid without withholding do not reach annex E.
 - **Totals in the grid footer** cover the visible page only; the header totals cover the declaration. `Total Pension 2%` is the employee share only.
 - **An empty declaration usually means the wrong month.** Salary rows follow the payslip's paid date, not its pay period, and New defaults to last month. August slips paid on 5 September belong to the September declaration, so the August declaration generates zero rows. Compare the payslips' **Payment Date** (payslip form, Other Info tab) with the declaration's Month before looking elsewhere.

@@ -2,6 +2,7 @@
 
 > **Module:** none built (plan of 2026-09-21) | **Path:** target to be decided, see [Where it belongs](#where-it-belongs)
 > Verified against Odoo 20 source on 2026-09-24.
+> **Superseded 2026-10-21** by [`vat_declaration_build_plan.md`](vat_declaration_build_plan.md) (full form: annex ა, annex ბ, Part III). Kept for the row-by-row table and Q1-Q8.
 
 Source spec: the accountant's `დღგ დანართი ა.xlsx` (sheets `ა I`, `ა II`, `ა III`) and three portal screenshots. Nothing is written yet.
 

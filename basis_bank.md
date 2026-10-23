@@ -127,6 +127,21 @@ Live Odoo 20 data: `gec20_prod1` has no `GetReport` call yet (API log checked 20
 - **Rejection** ([account_payment.py:490](../custom_addons/gec_odoo_modules/basis_bank/models/account_payment.py#L490)) — a refused payment becomes *Failed* and Odoo *Rejected*, as core's online payment maps a bank rejection; its entry stays, so no bill or payslip is reopened silently. The accountant resets and cancels it, or corrects and resends it.
 - **Maker-checker guards** — editing amount, partner, recipient account, memo, reference or transfer type after approval voids the approval ([account_payment.py:22](../custom_addons/gec_odoo_modules/basis_bank/models/account_payment.py#L22)); changing a batch's payments voids the batch approval ([account_batch_payment.py:105](../custom_addons/gec_odoo_modules/basis_bank/models/account_batch_payment.py#L105)). Payments in *Sending*, *Sent*, *Unknown*, *Not in Bank Report* or *Confirmed* cannot be reset to draft, cancelled or deleted, neither on the payment nor on its journal entry (`gec_bank` [account_payment.py:18](../custom_addons/gec_odoo_modules/gec_bank/models/account_payment.py#L18), [account_move.py](../custom_addons/gec_odoo_modules/gec_bank/models/account_move.py)).
 
+### Guards shared by every bank (gec_bank, 2026-10-10)
+
+- A payment the bank holds (sending, sent, unknown, or confirmed and not yet matched with a bank
+  statement line) cannot be undone from the accounting side: Reverse Entry on its entry
+  ([_reverse_moves](../custom_addons/gec_odoo_modules/gec_bank/models/account_move.py#L17)),
+  unreconciling the bill it pays
+  ([partial ondelete](../custom_addons/gec_odoo_modules/gec_bank/models/account_partial_reconcile.py#L8)),
+  deleting its batch or taking it out of the batch
+  ([_gec_bank_check_not_held](../custom_addons/gec_odoo_modules/gec_bank/models/account_payment.py#L201)).
+  Statement matching and unmatching still work. Once the statement line booked the money, the
+  bill unreconciles like any other.
+- TBC and BOG now refuse a recipient account that is not trusted for outgoing payments, as Basis
+  already did; treasury recipients are paid by code and are exempt
+  ([_gec_bank_check_transfer](../custom_addons/gec_odoo_modules/gec_bank/models/account_payment.py#L329)).
+
 ### Important Fields (only the ones that matter)
 
 - `basisbank_state` on the payment (9 values) — the bank truth, separate from Odoo's `state`. Computed and stored: *Pending* for outbound payments on Basis journals, empty for every other payment; a state the send flow set is kept even if the journal stops being a Basis journal ([account_payment.py:100](../custom_addons/gec_odoo_modules/basis_bank/models/account_payment.py#L100)). Only *Confirmed by Statement* means money moved. The batch has its own 9-value `basisbank_state`.
