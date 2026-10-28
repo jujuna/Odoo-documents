@@ -400,7 +400,7 @@ Standard cost solves this by using a **planned cost** ($50/chair). At the end of
 - Standard valuation: 20 x $50 = $1,000
 - Actual cost: $1,100
 - Variance: $100 unfavorable (you spent more than planned)
-- The variance is posted to a "Price Difference" account
+- The MO uses no Price Difference account: the $100 stays on the Production location's **Cost of Production** account, and only if the MO posts entries at all (perpetual category and that account set; see [`mrp.md`](mrp.md), "What reaches accounting when an MO is done")
 
 **5. Sell 10 chairs at $80 each:**
 - Revenue: $800
@@ -1231,7 +1231,7 @@ Source: [`_post()`](../addons/stock_account/models/account_move.py#L40)
 ### `product.value` -- Price History & Manual Adjustments
 > [`product_value.py`](../addons/stock_account/models/product_value.py)
 
-Tracks manual value updates for products, lots, and individual moves.
+Tracks manual value updates for products, lots, and individual moves. This is the cost history: **Inventory → Reporting → Valuation Adjustments**, shown in developer mode only ([`valuation_adjustments_menu`](../addons/stock_account/views/product_value_views.xml#L80), `base.group_no_one`).
 
 | Field | Type | Purpose |
 |---|---|---|

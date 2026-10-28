@@ -328,7 +328,20 @@ total cost = value of consumed components + work-order cost + Extra Unit Cost ×
 - Work-order cost = duration × hourly cost ([`_cal_cost()`](../addons/mrp/models/mrp_workorder.py#L675)); with **Theoretical time** the expected duration is used. With enterprise `mrp_workorder`, employee time at the **Employee Hourly Cost** is added ([`_cal_cost()`](../enterprise/mrp_workorder/models/mrp_workorder.py#L769)).
 - Only **FIFO and AVCO** products get this computed unit cost: `total × (1 − by-product share) / quantity`. **Standard-price** products keep their standard price; the difference is not written on the move.
 - A FIFO/AVCO by-product receives `total × cost share`; a standard-price by-product keeps its standard price.
-- **Labour entry** ([`_post_labour()`](../addons/mrp_account/models/mrp_production.py#L114)): when the MO is done, for a product with automated valuation and a production location that has a valuation account, one entry debits that account and credits each work center's **Expense Account** (or the product expense account).
+- **Labour entry** ([`_post_labour()`](../addons/mrp_account/models/mrp_production.py#L134)): when the MO is done, for a product with automated valuation and a production location that has a valuation account, one entry debits that account and credits each work center's **Expense Account** (or the product expense account).
+
+### What reaches accounting when an MO is done
+Two conditions decide it, and a new database meets neither: the product's category must be **Perpetual (at invoicing)** (company default: **Periodic (at closing)**), and the **Production** location must have a **Cost of Production** account (empty by default). If either is missing, the MO posts no journal entry: the cost lives only on the stock moves and the MO Overview, and reaches the ledger at the stock closing.
+
+When both are set, each done move posts its own entry ([`_should_create_account_move()`](../addons/stock_account/models/stock_move.py#L766), [`_get_account_move_line_vals()`](../addons/stock_account/models/stock_move.py#L305)), plus the labour entry above:
+
+| Move | Debit | Credit | Amount |
+|---|---|---|---|
+| Components consumed | Cost of Production | Stock Valuation | Component value |
+| Finished product received | Stock Valuation | Cost of Production | Finished move value (standard price, or computed cost for FIFO/AVCO) |
+| Labour (work orders) | Cost of Production | Work center Expense Account | Work-order cost |
+
+For FIFO/AVCO the finished value equals the total, so Cost of Production nets to zero. For standard price the difference between actual and standard stays on the Cost of Production account; no price difference account is used.
 
 Valuation methods, accounts and closing are in [`stock_valuation.md`](stock_valuation.md).
 
