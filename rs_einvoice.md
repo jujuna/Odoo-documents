@@ -146,6 +146,8 @@ Odoo never polls rs.ge by itself unless the refresh crons are enabled — and on
 - **Buyer-side correction import cancels the original bill even in an earlier month**; the seller side reverses with a credit note in that case. Only the lock date stops it.
 - **One message names a menu that does not exist in 20:** "Accounting > Configuration > Currencies" (real path: Accounting › Configuration › Accounting › Currencies).
 - **RS Note is dropped on advance invoices:** the advance variant wins over the note variant.
+- **The rs.ge VAT class follows the Tax Category Code of the line's taxes** (`_rs_line_vat_class`, [account_move_sync.py](../custom_addons/gec_odoo_modules/rs_einvoice/models/account_move_sync.py)): S sends the VAT of the S taxes only, Z/G sends 0 (zero-rated), E/O sends -1 (exempt, out of scope, small-business turnover); a tax without a code is not VAT, so a City Tax line goes as -1. Send is refused while the company has no sale tax with code S. A VAT tax made from scratch has no code; Duplicate keeps it. Changing a code after sending does not mark the invoice as changed (the line hash reads tax ids only).
+- **Keep City Tax on its own line:** on a line with an 18% tax, rs.ge may recompute VAT from the full amount, which then includes the City Tax [Likely: comment in Odoo's l10n_ge_edi].
 
 ---
 

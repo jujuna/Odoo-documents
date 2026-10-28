@@ -374,7 +374,7 @@ What the accountant configures, in order:
 6. **Products.** Not Taxed only for non-supplies; WHT taxes on the purchase taxes of services bought from non-residents or individuals.
 7. **Withholding Tax Base** (Settings > Accounting > Default Accounts, [res_company.py:12](../addons/l10n_account_withholding_tax/models/res_company.py#L12)): optional; set it so the WH Base pair does not land on expense accounts.
 8. **Form 30 Income Type** on the five WHT taxes that have none.
-9. **RS.GE Waybill VAT Type** (`rs_waybill`) on `l10n_ge`'s 0% export and exempt taxes.
+9. **Tax Category Code** (core field of `account_edi_ubl_cii`, on the tax form) on every VAT tax: `gec_localization` sets it on its own and `l10n_ge`'s taxes (S 18%, Z/G zero-rated and export, E/O exempt and out of scope; none on withholding, import and reverse charge). rs_einvoice and rs_waybill read it for the rs.ge VAT class; a VAT tax you create yourself needs it set by hand.
 10. **Treasury Code** 101001000 on the State Treasury contact in databases created before `geo_payroll` set it.
 11. **Tax lock date** every month after filing.
 
@@ -394,7 +394,7 @@ What the accountant configures, in order:
 | `accountant` / `account_reports` (Enterprise) | the Tax Report screen that renders the VAT Report; the report record itself is community data |
 | `geo_payroll`, `gec_payroll_bank`, `basis_bank` | payroll postings on the accounts above, Pay Salaries, treasury transfers |
 | `gec_income_tax_report` | Form 30 from withholding payments |
-| `rs_einvoice`, `rs_waybill` | rs.ge documents; waybill VAT type on taxes |
+| `rs_einvoice`, `rs_waybill` | rs.ge documents; the rs.ge VAT class of a line comes from its taxes' Tax Category Code |
 
 ---
 

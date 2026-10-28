@@ -98,7 +98,7 @@ Each page is a grid drawn by the `gec_vat_grid` widget, laid out like the portal
 Nothing on this page goes to rs.ge: the portal attaches confirmed invoices to the declaration by itself. The page shows
 what Odoo expects the portal's ბ I to hold, so the accountant can compare before filing.
 
-**Which invoices become rows** (`_gec_b1_scan`, [gec_vat_declaration.py:359](../custom_addons/gec_odoo_modules/gec_vat_declaration/models/gec_vat_declaration.py#L359)): customer
+**Which invoices become rows** (`_gec_b1_scan`, [gec_vat_declaration.py:363](../custom_addons/gec_odoo_modules/gec_vat_declaration/models/gec_vat_declaration.py#L363)): customer
 invoices of the company and its same-VAT branches with an rs.ge number and an rs.ge status of confirmed (2), corrected
 original (3) or confirmed correction (8). Cancelled ones are included: when a correction is accepted in the same month,
 rs_einvoice cancels the original in Odoo, but rs.ge keeps listing it as status 3.
@@ -114,7 +114,7 @@ is the month.
 | სერია, ნომერი | the invoice's rs.ge series and number |
 | დასაბეგრი ოპერაციის თვე | invoice date (shown as the first day of the month) |
 | მყიდველის ს/ნ | buyer Tax ID as sent to rs.ge (`rs_einv_buyer_tin`) |
-| დღგ: გადასახდელი / შესამცირებელი | an invoice: its VAT; a correction: its VAT minus the corrected invoice's VAT, an increase on the left, a decrease on the right |
+| დღგ: გადასახდელი / შესამცირებელი | an invoice: its VAT; a correction: its VAT minus the corrected invoice's VAT, an increase on the left, a decrease on the right. VAT counts only tax lines whose tax has Tax Category Code S, the same VAT rs_einvoice sends (`_gec_invoice_vat`); City Tax, Small Business turnover and 0% taxes add nothing |
 | კორექტირებული ფაქტურის სერია, ნომერი | the corrected invoice (corrections only) |
 
 Example (prod1, October 2026): original `ეა-87 0060685` VAT 3,600, correction `ეკ 15610312` to 2,700 → two rows,

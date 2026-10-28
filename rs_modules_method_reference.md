@@ -1400,7 +1400,7 @@ The cron entry-point host for buyer-invoice sync, on its own model so `ir.cron` 
 #### `_cron_rs_recover_stranded_cancellations(self, batch_size=200)` — line 1015
 - **Liveness:** Active — cron target.
 - **Role:** Cron · **Side effects:** Writes-DB (local cancel/reversal, pending flags) / per-row locks / incremental commit / logs. Makes NO rs.ge call.
-- **Purpose:** Completes interrupted local reversals. Finds posted moves durably at status 7 (buyer-confirmed cancellation) with no reversal move and no pending-reversal flag, and re-drives `_rs_auto_cancel_after_rs_cancellation` purely locally — status 7 is already authoritative, so no SOAP is needed and it's safe even while refresh crons are off. A move it can't cancel (e.g. locked period) gets flagged and skipped next run, so it doesn't re-schedule a manual activity every cycle.
+- **Purpose:** Completes interrupted local reversals. Finds posted moves durably at status 7 (buyer-confirmed cancellation) that credit notes do not fully reverse (`payment_state != 'reversed'`) and with no pending-reversal flag, and re-drives `_rs_auto_cancel_after_rs_cancellation` purely locally — status 7 is already authoritative, so no SOAP is needed and it's safe even while refresh crons are off. A move it can't cancel (e.g. locked period) gets flagged and skipped next run, so it doesn't re-schedule a manual activity every cycle.
 
 #### `_cron_vacuum_rs_logs(self)` — line 1081
 - **Liveness:** Active — cron target ("RS E-Invoice: Vacuum Logs").
